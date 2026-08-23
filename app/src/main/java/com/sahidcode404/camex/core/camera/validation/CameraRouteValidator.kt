@@ -11,21 +11,24 @@ import com.sahidcode404.camex.core.camera.topology.CameraSessionTrust
 import com.sahidcode404.camex.core.model.ProbeFailureKind
 
 /**
- * Pure lazy-validation policy. It interprets the selected route's real session outcome; it never
- * opens a camera, enumerates routes, or initiates a speculative probe.
+ * Lazy-validation policy. It interprets the selected profile's real session outcome; it never
+ * opens a camera, enumerates routes, or initiates a speculative probe. Wall-clock attempt time is
+ * diagnostic metadata only and is never used for latency or profile ranking.
  */
 object CameraRouteValidator {
     fun observation(
         route: CameraRoute,
         event: CameraSessionEvent,
+        attemptEpochMs: Long = System.currentTimeMillis(),
     ): CameraRouteTrust? = when (event) {
         is CameraSessionEvent.PreviewVerified -> CameraRouteTrust(
             metadata = CameraMetadataTrust.METADATA_VALID,
             session = CameraSessionTrust.SESSION_VERIFIED,
             raw = route.trust.raw,
+            lastAttemptEpochMs = attemptEpochMs.coerceAtLeast(0L),
         )
 
-        is CameraSessionEvent.PreviewFailed -> failureObservation(route, event)
+        is CameraSessionEvent.PreviewFailed -> failureObservation(route, event, attemptEpochMs)
 
         is CameraSessionEvent.CameraOpened,
         is CameraSessionEvent.SessionConfigured,
@@ -35,6 +38,7 @@ object CameraRouteValidator {
     private fun failureObservation(
         route: CameraRoute,
         event: CameraSessionEvent.PreviewFailed,
+        attemptEpochMs: Long,
     ): CameraRouteTrust? {
         if (event.kind == ProbeFailureKind.PERMISSION_DENIED) return null
         val durability = if (event.structural) {
@@ -59,6 +63,7 @@ object CameraRouteValidator {
                 durability = durability,
                 detail = event.detail,
             ),
+            lastAttemptEpochMs = attemptEpochMs.coerceAtLeast(0L),
         )
     }
 
