@@ -45,9 +45,10 @@ jobs:
       - name: Resolve development build identity
         run: |
           set -euo pipefail
-          DEV_OTA_VERSION_CODE="$((1000000 + GITHUB_RUN_NUMBER))"
-          DEV_OTA_VERSION_NAME="0.2.0-dev.${GITHUB_RUN_NUMBER}"
           commit_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          short_sha="${GITHUB_SHA:0:12}"
+          DEV_OTA_VERSION_CODE="$commit_epoch"
+          DEV_OTA_VERSION_NAME="0.2.0-dev.${commit_epoch}.${short_sha}"
           commit_timestamp="$(date --utc --date="@${commit_epoch}" +%Y-%m-%dT%H:%M:%SZ)"
           changelog="$(git log -1 --pretty=%s "$GITHUB_SHA")"
           echo "DEV_OTA_VERSION_CODE=$DEV_OTA_VERSION_CODE" >> "$GITHUB_ENV"
