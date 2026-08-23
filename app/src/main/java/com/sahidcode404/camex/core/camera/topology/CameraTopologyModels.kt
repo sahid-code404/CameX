@@ -1,6 +1,7 @@
 package com.sahidcode404.camex.core.camera.topology
 
 import com.sahidcode404.camex.core.model.CapabilitySupport
+import com.sahidcode404.camex.core.model.ColorFilterArrangement
 import com.sahidcode404.camex.core.model.FieldOfView
 import com.sahidcode404.camex.core.model.HardwareLevel
 import com.sahidcode404.camex.core.model.LensCapabilities
@@ -181,6 +182,84 @@ data class FullCameraCapabilities(
     val complete: Boolean = false,
 )
 
+/**
+ * One transport/profile route underneath a physical optical lens. IDs identify transport routes,
+ * not pieces of glass, and therefore never participate in stable optical identity.
+ */
+@Serializable
+data class CameraProfile(
+    val profileId: String,
+    val profileFingerprint: String,
+    val discoveredCameraId: String,
+    val openCameraId: String,
+    val streamPhysicalCameraId: String? = null,
+    val logicalParentCameraId: String? = null,
+    val routeKind: CameraRouteKind,
+    val discoverySources: Set<CameraDiscoverySource>,
+    val metadata: MinimalCameraMetadata = MinimalCameraMetadata(),
+    val fullCapabilities: FullCameraCapabilities? = null,
+    val sessionTrust: CameraSessionTrust = CameraSessionTrust.UNKNOWN,
+    val rawTrust: CameraRawTrust = CameraRawTrust.UNKNOWN,
+    val metadataTrust: CameraMetadataTrust = CameraMetadataTrust.DISCOVERED,
+    val failure: CameraRouteFailure? = null,
+    val priority: Int = 0,
+) {
+    val routingKey: String
+        get() = buildString {
+            append(openCameraId)
+            streamPhysicalCameraId?.let { append("/").append(it) }
+        }
+
+    val trust: CameraRouteTrust
+        get() = CameraRouteTrust(metadataTrust, sessionTrust, rawTrust, failure)
+
+    val structurallyRejected: Boolean
+        get() = sessionTrust == CameraSessionTrust.SESSION_REJECTED &&
+            failure?.durability == CameraFailureDurability.STRUCTURAL
+}
+
+/** Metadata used by the authoritative optical grouping engine. */
+@Serializable
+data class OpticalLensSignature(
+    val facing: LensFacing,
+    val focalLengthMm: Double? = null,
+    val sensorPhysicalSize: PhysicalSize? = null,
+    val activeArraySize: Size2D? = null,
+    val pixelArraySize: Size2D? = null,
+    val rawSizes: List<Size2D> = emptyList(),
+    val colorFilterArrangement: ColorFilterArrangement? = null,
+    val sensorOrientationDegrees: Int? = null,
+    val aperture: Double? = null,
+    val diagonalFieldOfViewDegrees: Double? = null,
+)
+
+/**
+ * Physical/optical identity exposed to camera UI and user preferences. The selected transport is a
+ * CameraProfile and can change without creating a new lens button or changing optical identity.
+ */
+@Serializable
+data class CanonicalLens(
+    val canonicalLensId: String,
+    val lensFingerprint: LensFingerprint,
+    val facing: LensFacing,
+    val minimalMetadata: MinimalCameraMetadata,
+    val fullCapabilities: FullCameraCapabilities? = null,
+    val role: PhotographicRole = PhotographicRole.PHOTOGRAPHIC_UNKNOWN,
+    val roleConfidence: RoleConfidence = RoleConfidence.UNKNOWN,
+    val profiles: List<CameraProfile>,
+    val preferredProfileId: String?,
+    val sessionTrust: CameraSessionTrust,
+    val rawTrust: CameraRawTrust,
+) {
+    val preferredProfile: CameraProfile?
+        get() = preferredProfileId?.let { id -> profiles.firstOrNull { it.profileId == id } }
+            ?: profiles.firstOrNull()
+}
+
+/**
+ * Additional profile retained underneath a canonical route. Defaults keep cache decoding and old
+ * unit fixtures source-compatible while Phase 1B persists profile-specific evidence.
+ */
 @Serializable
 data class CameraRouteAlias(
     val discoveredCameraId: String,
@@ -189,11 +268,26 @@ data class CameraRouteAlias(
     val logicalParentCameraId: String? = null,
     val routeKind: CameraRouteKind,
     val sources: Set<CameraDiscoverySource>,
-)
+    val minimalMetadata: MinimalCameraMetadata = MinimalCameraMetadata(),
+    val fullCapabilities: FullCameraCapabilities? = null,
+    val trust: CameraRouteTrust = CameraRouteTrust(),
+) {
+    val profileId: String
+        get() = canonicalRouteId(openCameraId, streamPhysicalCameraId)
 
-/** One immutable canonical route consumed by the runtime and selector. */
+    val profileFingerprint: String
+        get() = cameraProfileFingerprint(
+            discoveredCameraId,
+            openCameraId,
+            streamPhysicalCameraId,
+            routeKind,
+        )
+}
+
+/** One immutable canonical optical lens consumed by runtime and selector. */
 @Serializable
 data class CameraRoute(
+    /** Transport ID of the currently preferred profile; optical identity is lensFingerprint. */
     val canonicalRouteId: String,
     val discoveredCameraId: String,
     val openCameraId: String,
@@ -203,9 +297,11 @@ data class CameraRoute(
     val sources: Set<CameraDiscoverySource>,
     val minimalMetadata: MinimalCameraMetadata,
     val fullCapabilities: FullCameraCapabilities? = null,
+    /** Phase 1B optical fingerprint. Stable metadata fingerprints do not include camera IDs. */
     val lensFingerprint: LensFingerprint? = null,
     val role: PhotographicRole = PhotographicRole.PHOTOGRAPHIC_UNKNOWN,
     val roleConfidence: RoleConfidence = RoleConfidence.UNKNOWN,
+    /** Aggregate lens trust; individual profile trust lives on the primary profile and aliases. */
     val trust: CameraRouteTrust = CameraRouteTrust(),
     val aliases: List<CameraRouteAlias> = emptyList(),
 ) {
@@ -230,7 +326,66 @@ data class CameraRoute(
             trust.metadata != CameraMetadataTrust.BROKEN &&
             trust.metadata != CameraMetadataTrust.METADATA_REJECTED &&
             trust.session != CameraSessionTrust.SESSION_REJECTED
+
+    val profiles: List<CameraProfile>
+        get() = listOf(primaryProfile()) + aliases.map(CameraRouteAlias::toProfile)
+
+    fun toCanonicalLens(): CanonicalLens {
+        val fingerprint = requireNotNull(lensFingerprint) { "Canonical lens requires a fingerprint" }
+        return CanonicalLens(
+            canonicalLensId = "cl2_${fingerprint.value}",
+            lensFingerprint = fingerprint,
+            facing = minimalMetadata.facing,
+            minimalMetadata = minimalMetadata,
+            fullCapabilities = fullCapabilities,
+            role = role,
+            roleConfidence = roleConfidence,
+            profiles = profiles,
+            preferredProfileId = primaryProfile().profileId,
+            sessionTrust = trust.session,
+            rawTrust = trust.raw,
+        )
+    }
+
+    private fun primaryProfile(): CameraProfile = CameraProfile(
+        profileId = canonicalRouteId(openCameraId, streamPhysicalCameraId),
+        profileFingerprint = cameraProfileFingerprint(
+            discoveredCameraId,
+            openCameraId,
+            streamPhysicalCameraId,
+            routeKind,
+        ),
+        discoveredCameraId = discoveredCameraId,
+        openCameraId = openCameraId,
+        streamPhysicalCameraId = streamPhysicalCameraId,
+        logicalParentCameraId = logicalParentCameraId,
+        routeKind = routeKind,
+        discoverySources = sources,
+        metadata = minimalMetadata,
+        fullCapabilities = fullCapabilities,
+        sessionTrust = trust.session,
+        rawTrust = trust.raw,
+        metadataTrust = trust.metadata,
+        failure = trust.failure,
+    )
 }
+
+private fun CameraRouteAlias.toProfile(): CameraProfile = CameraProfile(
+    profileId = profileId,
+    profileFingerprint = profileFingerprint,
+    discoveredCameraId = discoveredCameraId,
+    openCameraId = openCameraId,
+    streamPhysicalCameraId = streamPhysicalCameraId,
+    logicalParentCameraId = logicalParentCameraId,
+    routeKind = routeKind,
+    discoverySources = sources,
+    metadata = minimalMetadata,
+    fullCapabilities = fullCapabilities,
+    sessionTrust = trust.session,
+    rawTrust = trust.raw,
+    metadataTrust = trust.metadata,
+    failure = trust.failure,
+)
 
 @Serializable
 data class LogicalCameraRelationship(
@@ -242,13 +397,19 @@ data class LogicalCameraRelationship(
 data class CameraTopology(
     val schemaVersion: Int = CURRENT_SCHEMA_VERSION,
     val environmentFingerprint: CameraEnvironmentFingerprint,
+    /** One entry per canonical optical lens; transport/profile aliases live under each entry. */
     val routes: List<CameraRoute> = emptyList(),
     val logicalRelationships: List<LogicalCameraRelationship> = emptyList(),
 ) {
+    val canonicalLenses: List<CanonicalLens>
+        get() = routes.mapNotNull { route ->
+            runCatching { route.toCanonicalLens() }.getOrNull()
+        }
+
     companion object {
-        const val CURRENT_SCHEMA_VERSION = 1
-        const val CACHE_SCHEMA_VERSION = 1
-        const val DISCOVERY_SCHEMA_VERSION = 2
+        const val CURRENT_SCHEMA_VERSION = 2
+        const val CACHE_SCHEMA_VERSION = 2
+        const val DISCOVERY_SCHEMA_VERSION = 3
     }
 }
 
@@ -272,7 +433,7 @@ enum class TopologyReconciliationMode {
     /** Cache is the only backend; no live absence may be inferred. */
     CACHE_BOOTSTRAP,
 
-    /** One or more live backends are still running; retain cache-only routes. */
+    /** One or more live backends are still running; retain cache-only profiles. */
     INCREMENTAL,
 
     /** Every requested backend, including any required deep scan, has completed. */
@@ -283,6 +444,20 @@ internal fun canonicalRouteId(openCameraId: String, physicalCameraId: String?): 
     append("cr1_")
     append(openCameraId.length).append(':').append(openCameraId)
     append('|')
+    val physical = physicalCameraId.orEmpty()
+    append(physical.length).append(':').append(physical)
+}
+
+internal fun cameraProfileFingerprint(
+    discoveredCameraId: String,
+    openCameraId: String,
+    physicalCameraId: String?,
+    routeKind: CameraRouteKind,
+): String = buildString {
+    append("cp2_")
+    append(routeKind.ordinal).append('|')
+    append(discoveredCameraId.length).append(':').append(discoveredCameraId).append('|')
+    append(openCameraId.length).append(':').append(openCameraId).append('|')
     val physical = physicalCameraId.orEmpty()
     append(physical.length).append(':').append(physical)
 }
