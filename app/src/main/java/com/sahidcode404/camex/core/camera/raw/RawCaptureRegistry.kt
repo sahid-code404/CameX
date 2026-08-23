@@ -9,6 +9,7 @@ import android.hardware.camera2.CameraMetadata
 import android.media.ImageReader
 import android.os.Handler
 import android.util.Size
+import com.sahidcode404.camex.core.model.LensIdentity
 import com.sahidcode404.camex.core.model.Size2D
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -26,6 +27,16 @@ internal data class PreparedRawOutput(
     val continuousPictureAf: Boolean,
     val transportGeneration: Long,
 )
+
+/**
+ * RAW must use the exact same session-local routing identity as LensDescriptor and CameraProfile.
+ * Transport IDs themselves are not identity, so never invent an alternate string shape here.
+ */
+internal fun rawSessionRoutingKey(openCameraId: String, physicalCameraId: String?): String =
+    LensIdentity(
+        publicCameraId = openCameraId,
+        physicalCameraId = physicalCameraId?.takeIf(String::isNotBlank),
+    ).routingKey
 
 /**
  * Coordinates the extra RAW surface and one-shot capture on the session owned by
@@ -80,7 +91,7 @@ object RawCaptureRegistry : RawCaptureController {
         handler: Handler,
     ): PreparedRawOutput? {
         val manager = cameraManager ?: return null
-        val route = routingKey(device.id, physicalCameraId)
+        val route = rawSessionRoutingKey(device.id, physicalCameraId)
         val characteristicsId = physicalCameraId ?: device.id
         val inspected = inspect(manager, characteristicsId, route)
         mutableState.value = RawCaptureState(
@@ -431,9 +442,6 @@ object RawCaptureRegistry : RawCaptureController {
             this == RawFailureKind.RAW_SIZE_UNAVAILABLE ||
             this == RawFailureKind.SESSION_CONFIGURATION ||
             this == RawFailureKind.CAPTURE_REQUEST_REJECTED
-
-    private fun routingKey(openCameraId: String, physicalCameraId: String?): String =
-        if (physicalCameraId.isNullOrBlank()) openCameraId else "$openCameraId/$physicalCameraId"
 
     private fun area(size: Size): Long = size.width.toLong() * size.height.toLong()
 
