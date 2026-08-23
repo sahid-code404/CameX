@@ -18,6 +18,8 @@ data class ActiveCameraSelection(
     val canonicalLensId: String? = null,
     val activeProfileRoutingKey: String,
     val activeProfileFingerprint: String? = null,
+    /** Last exact descriptor that actually produced a verified frame. */
+    val activeProfileDescriptor: LensDescriptor? = null,
     val facing: LensFacing = LensFacing.UNKNOWN,
     val selectionGeneration: Long,
     val sessionState: CameraSessionState,
@@ -180,6 +182,7 @@ class ActiveCameraSelectionTracker {
                 },
             activeProfileRoutingKey = routingKey,
             activeProfileFingerprint = resolution?.profile?.profileFingerprint,
+            activeProfileDescriptor = resolution?.exactSessionDescriptor,
             facing = resolution?.facing ?: LensFacing.UNKNOWN,
             selectionGeneration = resolvedGeneration,
             sessionState = sessionState,
@@ -211,6 +214,8 @@ class ActiveCameraSelectionTracker {
             canonicalLensId = resolution.canonicalLensId ?: current.canonicalLensId,
             activeProfileFingerprint = resolution.profile?.profileFingerprint
                 ?: current.activeProfileFingerprint,
+            activeProfileDescriptor = resolution.exactSessionDescriptor
+                ?: current.activeProfileDescriptor,
             facing = resolution.facing.takeIf { it != LensFacing.UNKNOWN } ?: current.facing,
             sessionState = sessionState,
             verified = isPreviewingSameProfile(sessionState, current.activeProfileRoutingKey),
