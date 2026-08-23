@@ -33,6 +33,10 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
+import com.sahidcode404.camex.core.camera.raw.RawCaptureRegistry
+import com.sahidcode404.camex.core.camera.raw.RawCaptureState
+import com.sahidcode404.camex.core.camera.raw.RawCompatibilityReportJson
+import com.sahidcode404.camex.core.model.Size2D
 import com.sahidcode404.camex.core.update.UpdateState
 import com.sahidcode404.camex.feature.camera.CameraScreen
 import com.sahidcode404.camex.feature.diagnostics.DiagnosticField
@@ -86,6 +90,7 @@ private fun CameraApplication(
     val context = LocalContext.current
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val updateState by updateViewModel.uiState.collectAsStateWithLifecycle()
+    val rawState by RawCaptureRegistry.rawCaptureState.collectAsStateWithLifecycle()
     var screen by rememberSaveable { mutableStateOf(AppScreen.CAMERA) }
     var pendingReport by remember { mutableStateOf<String?>(null) }
     var permissionRequested by rememberSaveable { mutableStateOf(false) }
@@ -134,6 +139,7 @@ private fun CameraApplication(
     when (screen) {
         AppScreen.CAMERA -> CameraScreen(
             state = state.camera,
+            rawState = rawState,
             previewContent = { CameraPreview(viewModel) },
             permissionPermanentlyDenied = !state.camera.permissionGranted &&
                 permissionRequested &&
@@ -153,6 +159,9 @@ private fun CameraApplication(
             },
             onSelectLens = viewModel::selectLens,
             onSwitchFacing = viewModel::switchFacing,
+            onCapture = {
+                activity.lifecycleScope.launch { RawCaptureRegistry.captureCurrent() }
+            },
             onOpenLensSettings = { screen = AppScreen.LENS_SETTINGS },
             onOpenDiagnostics = { screen = AppScreen.DIAGNOSTICS },
             onRetry = viewModel::rescanCameras,
@@ -176,13 +185,19 @@ private fun CameraApplication(
                     updateState.installed.signingCertificateSha256 ?: "Unavailable",
                 ),
             ),
+            rawSummary = rawDiagnosticsFields(rawState),
             onBack = { screen = AppScreen.CAMERA },
             onNormalRescan = viewModel::rescanCameras,
             onDeepRescan = viewModel::deepRescanCameras,
             onResetDiscoveryCache = viewModel::resetDiscoveryCache,
             onOpenUpdates = { screen = AppScreen.UPDATES },
             onExport = {
-                val report = runCatching(viewModel::compatibilityReportJson).getOrNull()
+                val report = runCatching {
+                    RawCompatibilityReportJson.append(
+                        viewModel.compatibilityReportJson(),
+                        rawState,
+                    )
+                }.getOrNull()
                 if (report == null) {
                     Toast.makeText(context, "Could not create compatibility report", Toast.LENGTH_LONG)
                         .show()
@@ -233,6 +248,36 @@ private fun CameraApplication(
         )
     }
 }
+
+private fun rawDiagnosticsFields(state: RawCaptureState): List<DiagnosticField> {
+    val diagnostics = state.diagnostics
+    val context = diagnostics.context
+    return listOf(
+        DiagnosticField("State", state.phase.name),
+        DiagnosticField("rawSupported", diagnostics.rawSupported.name),
+        DiagnosticField("availableRawSizes", diagnostics.availableRawSizes.joinToString(::formatSize).ifBlank { "None" }),
+        DiagnosticField("selectedRawSize", diagnostics.selectedRawSize?.let(::formatSize) ?: "None"),
+        DiagnosticField("canonicalFingerprint", context?.canonicalFingerprint ?: "None"),
+        DiagnosticField("profileFingerprint", context?.profileFingerprint ?: "None"),
+        DiagnosticField("openCameraId", context?.openCameraId ?: "None"),
+        DiagnosticField("physicalTarget", context?.streamPhysicalCameraId ?: "None"),
+        DiagnosticField("selectionGeneration", context?.selectionGeneration?.toString() ?: "None"),
+        DiagnosticField("captureToken", context?.captureToken?.toString() ?: "None"),
+        DiagnosticField("rawTimestamp", diagnostics.rawTimestamp?.toString() ?: "None"),
+        DiagnosticField("resultTimestamp", diagnostics.resultTimestamp?.toString() ?: "None"),
+        DiagnosticField("exposureTime", diagnostics.exposureTimeNs?.let { "$it ns" } ?: "None"),
+        DiagnosticField("ISO", diagnostics.iso?.toString() ?: "None"),
+        DiagnosticField("DNG width", diagnostics.dngWidth?.toString() ?: "None"),
+        DiagnosticField("DNG height", diagnostics.dngHeight?.toString() ?: "None"),
+        DiagnosticField("DNG bytes", diagnostics.dngBytes?.toString() ?: "None"),
+        DiagnosticField("MediaStore URI", diagnostics.mediaStoreUri ?: "None"),
+        DiagnosticField("captureDuration", diagnostics.captureDurationMs?.let { "$it ms" } ?: "None"),
+        DiagnosticField("writeDuration", diagnostics.writeDurationMs?.let { "$it ms" } ?: "None"),
+        DiagnosticField("lastRawError", diagnostics.lastRawError ?: "None"),
+    )
+}
+
+private fun formatSize(size: Size2D): String = "${size.width}×${size.height}"
 
 @Composable
 private fun CameraPreview(viewModel: CameraViewModel) {
