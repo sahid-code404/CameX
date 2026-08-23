@@ -1,3 +1,4 @@
+import java.util.Base64
 import java.util.Properties
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
@@ -25,6 +26,14 @@ val taggedVersionName = providers.gradleProperty("cameraVersionName")
     .orNull
     ?.trim()
     ?.takeIf(String::isNotEmpty)
+val devOtaVersionCode = providers.gradleProperty("devOtaVersionCode")
+    .orNull
+    ?.toIntOrNull()
+    ?.takeIf { it in 1 until Int.MAX_VALUE }
+val devOtaVersionName = providers.gradleProperty("devOtaVersionName")
+    .orNull
+    ?.trim()
+    ?.takeIf(String::isNotEmpty)
 
 val keystorePropertiesFile = rootProject.file("keystore.properties")
 val keystoreProperties = Properties().apply {
@@ -34,6 +43,22 @@ val keystoreProperties = Properties().apply {
 }
 val releaseSigningReady = listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
     .all { !keystoreProperties.getProperty(it).isNullOrBlank() }
+
+val devOtaKeystoreBase64File = rootProject.file("tools/dev-signing/camex-dev.jks.b64")
+val devOtaKeystoreFile = layout.buildDirectory.file("dev-signing/camex-dev.jks").get().asFile
+if (devOtaKeystoreBase64File.isFile) {
+    val encoded = devOtaKeystoreBase64File.readText().filterNot(Char::isWhitespace)
+    val decoded = Base64.getDecoder().decode(encoded)
+    devOtaKeystoreFile.parentFile.mkdirs()
+    if (!devOtaKeystoreFile.isFile || !devOtaKeystoreFile.readBytes().contentEquals(decoded)) {
+        devOtaKeystoreFile.writeBytes(decoded)
+    }
+}
+val devOtaSigningReady = devOtaKeystoreFile.isFile && devOtaKeystoreFile.length() > 0L
+
+val devOtaStorePassword = "camex-dev-only-2026"
+val devOtaKeyAlias = "camex-dev"
+val devOtaKeyPassword = "camex-dev-only-2026"
 
 fun String.asBuildConfigLiteral(): String =
     "\"${replace("\\", "\\\\").replace("\"", "\\\"")}\""
@@ -48,8 +73,9 @@ android {
         applicationId = "com.sahidcode404.camex"
         minSdk = 23
         targetSdk = 37
-        versionCode = taggedVersionCode ?: (10_000 + ciRunNumber)
-        versionName = taggedVersionName
+        versionCode = devOtaVersionCode ?: taggedVersionCode ?: (10_000 + ciRunNumber)
+        versionName = devOtaVersionName
+            ?: taggedVersionName
             ?: if (ciRunNumber == 0) "0.1.0-dev" else "0.1.0-dev.$ciRunNumber"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -60,6 +86,7 @@ android {
             "BUILD_TIMESTAMP_UTC",
             buildTimestampUtc.asBuildConfigLiteral(),
         )
+        buildConfigField("String", "OTA_CHANNEL", "stable".asBuildConfigLiteral())
 
         ndk {
             abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
@@ -73,6 +100,15 @@ android {
     }
 
     signingConfigs {
+        create("devOta") {
+            check(devOtaSigningReady) {
+                "Development OTA keystore is missing. Expected tools/dev-signing/camex-dev.jks.b64"
+            }
+            storeFile = devOtaKeystoreFile
+            storePassword = devOtaStorePassword
+            keyAlias = devOtaKeyAlias
+            keyPassword = devOtaKeyPassword
+        }
         create("stableRelease") {
             if (releaseSigningReady) {
                 storeFile = file(keystoreProperties.getProperty("storeFile"))
@@ -85,6 +121,13 @@ android {
 
     buildTypes {
         getByName("debug")
+        create("devOta") {
+            initWith(getByName("debug"))
+            signingConfig = signingConfigs.getByName("devOta")
+            isDebuggable = true
+            matchingFallbacks += listOf("debug")
+            buildConfigField("String", "OTA_CHANNEL", "development".asBuildConfigLiteral())
+        }
         getByName("release") {
             isMinifyEnabled = false
             if (releaseSigningReady) {
