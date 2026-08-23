@@ -17,9 +17,9 @@ import kotlin.math.atan
 import kotlin.math.hypot
 
 /**
- * Pure deterministic reconciliation. It never opens cameras and never treats absent metadata as a
- * rejection. Exact routes merge freely; cross-route aliases merge only when they name the same
- * hardware camera and carry a strong matching optical signature.
+ * Authoritative Phase 1B canonicalization engine. Exact transport observations merge first; then
+ * confidence-based optical grouping turns vendor aliases into profiles under one physical lens.
+ * It is pure, deterministic, metadata-only, and never opens a camera.
  */
 object CameraTopologyResolver {
     fun resolve(
@@ -47,63 +47,53 @@ object CameraTopologyResolver {
             -> liveCandidates + cachedCandidates
         }
 
-        val exactRoutes = candidates
+        val exactProfiles = candidates
             .groupBy(Candidate::routeKey)
             .toSortedMap()
             .values
-            .map { mergeExactRoute(it, environmentFingerprint) }
+            .map { mergeExactProfile(it, environmentFingerprint) }
+            .sortedWith(profileRouteComparator)
 
-        val canonicalRoutes = mergeStrongAliases(exactRoutes, environmentFingerprint)
-            .sortedWith(routeComparator)
+        val canonicalLenses = groupOpticalLenses(exactProfiles, environmentFingerprint)
+            .sortedWith(canonicalRouteComparator)
         return CameraTopology(
             environmentFingerprint = environmentFingerprint,
-            routes = canonicalRoutes,
-            logicalRelationships = relationships(canonicalRoutes),
+            routes = canonicalLenses,
+            logicalRelationships = relationships(canonicalLenses),
         )
     }
 
+    /** Cache entries are canonical lenses; reconciliation expands them back into profile evidence. */
     private fun CameraTopology?.orEmptyCandidates(): List<Candidate> = this?.routes.orEmpty()
         .flatMap { route ->
-            val primary = Candidate(
-                sourceSet = route.sources + CameraDiscoverySource.CACHE,
-                discoveredCameraId = route.discoveredCameraId,
-                openCameraId = route.openCameraId,
-                streamPhysicalCameraId = route.streamPhysicalCameraId,
-                logicalParentCameraId = route.logicalParentCameraId,
-                routeKind = route.routeKind,
-                minimalMetadata = route.minimalMetadata.normalized(),
-                fullCapabilities = route.fullCapabilities,
-                lensFingerprint = route.lensFingerprint,
-                trust = route.trust,
-            )
-            listOf(primary) + route.aliases.mapNotNull { alias ->
+            route.profiles.mapNotNull { profile ->
                 normalizeCandidate(
-                    sourceSet = alias.sources + CameraDiscoverySource.CACHE,
-                    discoveredCameraId = alias.discoveredCameraId,
-                    openCameraId = alias.openCameraId,
-                    streamPhysicalCameraId = alias.streamPhysicalCameraId,
-                    logicalParentCameraId = alias.logicalParentCameraId,
-                    routeKind = alias.routeKind,
-                    minimalMetadata = route.minimalMetadata,
-                    fullCapabilities = route.fullCapabilities,
+                    sourceSet = profile.discoverySources + CameraDiscoverySource.CACHE,
+                    discoveredCameraId = profile.discoveredCameraId,
+                    openCameraId = profile.openCameraId,
+                    streamPhysicalCameraId = profile.streamPhysicalCameraId,
+                    logicalParentCameraId = profile.logicalParentCameraId,
+                    routeKind = profile.routeKind,
+                    minimalMetadata = profile.metadata,
+                    fullCapabilities = profile.fullCapabilities,
                     lensFingerprint = route.lensFingerprint,
-                    trust = route.trust,
+                    trust = profile.trust,
                 )
             }
         }
 
     private fun normalizeEvidence(evidence: CameraRouteEvidence): Candidate? = normalizeCandidate(
-            sourceSet = setOf(evidence.source),
-            discoveredCameraId = evidence.discoveredCameraId,
-            openCameraId = evidence.openCameraId,
-            streamPhysicalCameraId = evidence.streamPhysicalCameraId,
-            logicalParentCameraId = evidence.logicalParentCameraId,
-            routeKind = evidence.routeKind,
-            minimalMetadata = evidence.minimalMetadata,
-            fullCapabilities = evidence.fullCapabilities,
-            lensFingerprint = evidence.lensFingerprint,
-            trust = evidence.trust,
-        )
+        sourceSet = setOf(evidence.source),
+        discoveredCameraId = evidence.discoveredCameraId,
+        openCameraId = evidence.openCameraId,
+        streamPhysicalCameraId = evidence.streamPhysicalCameraId,
+        logicalParentCameraId = evidence.logicalParentCameraId,
+        routeKind = evidence.routeKind,
+        minimalMetadata = evidence.minimalMetadata,
+        fullCapabilities = evidence.fullCapabilities,
+        lensFingerprint = evidence.lensFingerprint,
+        trust = evidence.trust,
+    )
 
     private fun normalizeCandidate(
         sourceSet: Set<CameraDiscoverySource>,
@@ -137,7 +127,8 @@ object CameraTopologyResolver {
         )
     }
 
-    private fun mergeExactRoute(
+    /** Merge Java/NDK/cache observations that name the exact same transport route. */
+    private fun mergeExactProfile(
         candidates: List<Candidate>,
         environment: CameraEnvironmentFingerprint,
     ): CameraRoute {
@@ -145,10 +136,8 @@ object CameraTopologyResolver {
         val address = candidates.minWith(candidateAddressComparator)
         val metadata = mergeMetadata(candidates.map(Candidate::minimalMetadata))
         val full = chooseFullCapabilities(candidates.mapNotNull(Candidate::fullCapabilities))
-        val trust = mergeTrust(candidates.map(Candidate::trust), metadata)
+        val trust = mergeExactTrust(candidates.map(Candidate::trust), metadata)
         val role = classify(metadata, trust)
-        val fingerprint = chooseFingerprint(candidates.mapNotNull(Candidate::lensFingerprint))
-            ?: generateFingerprint(address, metadata, full, environment)
         return CameraRoute(
             canonicalRouteId = address.routeKey,
             discoveredCameraId = address.discoveredCameraId,
@@ -161,76 +150,131 @@ object CameraTopologyResolver {
             },
             minimalMetadata = metadata,
             fullCapabilities = full,
-            lensFingerprint = fingerprint,
+            // This is replaced by an optical fingerprint after grouping. It remains useful as a
+            // deterministic fallback if metadata is too sparse for stable optical identity.
+            lensFingerprint = chooseFingerprint(candidates.mapNotNull(Candidate::lensFingerprint))
+                ?: generateFallbackFingerprint(address, environment),
             role = role.first,
             roleConfidence = role.second,
             trust = trust,
         )
     }
 
-    private fun mergeStrongAliases(
-        routes: List<CameraRoute>,
+    /**
+     * Build clique-safe optical groups. A candidate must strongly match at least one member and may
+     * not conflict with any existing member. Ambiguous/probable matches remain separate lenses and
+     * are visible in diagnostics rather than being dangerously collapsed.
+     */
+    private fun groupOpticalLenses(
+        profiles: List<CameraRoute>,
         environment: CameraEnvironmentFingerprint,
     ): List<CameraRoute> {
-        if (routes.size < 2) return routes
-        val byAliasKey = routes.groupBy { route ->
-            val hardwareId = route.streamPhysicalCameraId ?: route.discoveredCameraId
-            val signature = strongOpticalSignature(route.minimalMetadata)
-            if (hardwareId.isBlank() || signature == null) {
-                "unique:${route.canonicalRouteId}"
-            } else {
-                "hardware:${hardwareId.length}:$hardwareId|$signature"
+        if (profiles.isEmpty()) return emptyList()
+        val groups = mutableListOf<MutableList<CameraRoute>>()
+        profiles.forEach { profile ->
+            val eligible = groups.mapIndexedNotNull { index, group ->
+                val comparisons = group.map { member -> OpticalLensMatcher.compare(member, profile) }
+                if (comparisons.any { it.match == OpticalLensMatch.CONFLICT }) return@mapIndexedNotNull null
+                val strongest = comparisons.maxOfOrNull(OpticalLensComparison::score) ?: Int.MIN_VALUE
+                if (comparisons.none { it.match == OpticalLensMatch.STRONG_MATCH }) null
+                else index to strongest
             }
+            val target = eligible
+                .sortedWith(compareByDescending<Pair<Int, Int>> { it.second }.thenBy { it.first })
+                .firstOrNull()
+                ?.first
+            if (target == null) groups += mutableListOf(profile) else groups[target] += profile
         }
-        return byAliasKey.toSortedMap().values.map { aliases ->
-            if (aliases.size == 1) aliases.single() else mergeAliasRoutes(aliases, environment)
-        }
+        return groups.map { group -> canonicalizeGroup(group, environment) }
     }
 
-    private fun mergeAliasRoutes(
+    private fun canonicalizeGroup(
         routes: List<CameraRoute>,
         environment: CameraEnvironmentFingerprint,
     ): CameraRoute {
-        val candidates = routes.map { route ->
-            Candidate(
-                sourceSet = route.sources,
-                discoveredCameraId = route.discoveredCameraId,
-                openCameraId = route.openCameraId,
-                streamPhysicalCameraId = route.streamPhysicalCameraId,
-                logicalParentCameraId = route.logicalParentCameraId,
-                routeKind = route.routeKind,
-                minimalMetadata = route.minimalMetadata,
-                fullCapabilities = route.fullCapabilities,
-                lensFingerprint = route.lensFingerprint,
-                trust = route.trust,
-            )
-        }
-        val merged = mergeExactRoute(candidates, environment)
-        val primaryKey = merged.canonicalRouteId
-        val aliases = routes
-            .flatMap { route ->
-                listOf(route.asAlias()) + route.aliases
-            }
-            .distinctBy { alias -> canonicalRouteId(alias.openCameraId, alias.streamPhysicalCameraId) }
-            .filterNot { alias ->
-                canonicalRouteId(alias.openCameraId, alias.streamPhysicalCameraId) == primaryKey
-            }
-            .sortedWith(compareBy(
-                { routeKindRank(it.routeKind) },
-                CameraRouteAlias::openCameraId,
-                { it.streamPhysicalCameraId.orEmpty() },
-            ))
-        return merged.copy(aliases = aliases)
+        require(routes.isNotEmpty())
+        val allProfiles = routes.flatMap(CameraRoute::profiles)
+        val preferred = CameraProfileSelector.select(allProfiles)
+            ?: allProfiles.minBy(CameraProfile::profileFingerprint)
+        val metadata = mergeMetadata(allProfiles.map(CameraProfile::metadata))
+        val full = chooseFullCapabilities(allProfiles.mapNotNull(CameraProfile::fullCapabilities))
+        val preferredTrust = preferred.trust
+        val role = classify(metadata, aggregateLensMetadataTrust(allProfiles, metadata))
+        val opticalFingerprint = generateOpticalFingerprint(
+            metadata = metadata,
+            full = full,
+            environment = environment,
+            fallbackProfile = preferred,
+        )
+        return CameraRoute(
+            canonicalRouteId = preferred.profileId,
+            discoveredCameraId = preferred.discoveredCameraId,
+            openCameraId = preferred.openCameraId,
+            streamPhysicalCameraId = preferred.streamPhysicalCameraId,
+            logicalParentCameraId = preferred.logicalParentCameraId,
+            routeKind = preferred.routeKind,
+            sources = preferred.discoverySources,
+            minimalMetadata = metadata,
+            fullCapabilities = full ?: preferred.fullCapabilities,
+            lensFingerprint = opticalFingerprint,
+            role = role.first,
+            roleConfidence = role.second,
+            // Runtime usability tracks the preferred profile. If that profile is structurally
+            // rejected CameraProfileSelector promotes another profile before this reaches the UI.
+            trust = preferredTrust,
+            aliases = allProfiles
+                .filterNot { it.profileId == preferred.profileId }
+                .distinctBy(CameraProfile::profileId)
+                .sortedWith(compareBy<CameraProfile>(
+                    { routeKindRank(it.routeKind) },
+                    CameraProfile::profileFingerprint,
+                ))
+                .map(CameraProfile::toAlias),
+        )
     }
 
-    private fun CameraRoute.asAlias() = CameraRouteAlias(
-        discoveredCameraId = discoveredCameraId,
-        openCameraId = openCameraId,
-        streamPhysicalCameraId = streamPhysicalCameraId,
-        logicalParentCameraId = logicalParentCameraId,
-        routeKind = routeKind,
-        sources = sources,
-    )
+    private fun aggregateLensMetadataTrust(
+        profiles: List<CameraProfile>,
+        metadata: MinimalCameraMetadata,
+    ): CameraRouteTrust {
+        val metadataTrust = when {
+            metadata.systemCameraAdvertised == CapabilitySupport.SUPPORTED -> CameraMetadataTrust.SYSTEM_ONLY
+            profiles.any { it.metadataTrust == CameraMetadataTrust.METADATA_VALID } ||
+                metadata.hasPhotographicEvidenceForClassification -> CameraMetadataTrust.METADATA_VALID
+            profiles.all { it.metadataTrust == CameraMetadataTrust.ACCESS_DENIED } -> CameraMetadataTrust.ACCESS_DENIED
+            profiles.all { it.metadataTrust == CameraMetadataTrust.SYSTEM_ONLY } -> CameraMetadataTrust.SYSTEM_ONLY
+            profiles.all { it.metadataTrust == CameraMetadataTrust.BROKEN } -> CameraMetadataTrust.BROKEN
+            profiles.any { it.metadataTrust == CameraMetadataTrust.DISCOVERED } -> CameraMetadataTrust.DISCOVERED
+            else -> CameraMetadataTrust.UNKNOWN
+        }
+        val session = when {
+            profiles.any { it.sessionTrust == CameraSessionTrust.SESSION_VERIFIED } ->
+                CameraSessionTrust.SESSION_VERIFIED
+            profiles.isNotEmpty() && profiles.all { it.structurallyRejected } ->
+                CameraSessionTrust.SESSION_REJECTED
+            profiles.any { it.sessionTrust == CameraSessionTrust.TRANSIENT_FAILURE } ->
+                CameraSessionTrust.TRANSIENT_FAILURE
+            else -> CameraSessionTrust.UNKNOWN
+        }
+        val raw = when {
+            profiles.any { it.rawTrust == CameraRawTrust.RAW_VERIFIED } -> CameraRawTrust.RAW_VERIFIED
+            profiles.isNotEmpty() && profiles.all {
+                it.rawTrust == CameraRawTrust.RAW_REJECTED || it.rawTrust == CameraRawTrust.NOT_ADVERTISED
+            } -> CameraRawTrust.RAW_REJECTED
+            profiles.any { it.rawTrust == CameraRawTrust.TRANSIENT_FAILURE } -> CameraRawTrust.TRANSIENT_FAILURE
+            profiles.all { it.rawTrust == CameraRawTrust.NOT_ADVERTISED } -> CameraRawTrust.NOT_ADVERTISED
+            else -> CameraRawTrust.UNKNOWN
+        }
+        val failure = if (session == CameraSessionTrust.SESSION_REJECTED) {
+            profiles.mapNotNull(CameraProfile::failure)
+                .filter { it.durability == CameraFailureDurability.STRUCTURAL }
+                .sortedWith(compareBy(CameraRouteFailure::kind, { it.detail.orEmpty() }))
+                .firstOrNull()
+        } else {
+            null
+        }
+        return CameraRouteTrust(metadataTrust, session, raw, failure)
+    }
 
     private fun mergeMetadata(values: List<MinimalCameraMetadata>): MinimalCameraMetadata {
         val focalLengths = values.flatMap(MinimalCameraMetadata::focalLengthsMm)
@@ -240,11 +284,9 @@ object CameraTopologyResolver {
         val rawFormats = values.flatMapTo(mutableSetOf(), MinimalCameraMetadata::rawFormats)
             .filterTo(sortedSetOf(compareBy(StreamFormat::ordinal))) { it.isRawLike }
         val rawSizes = values.flatMap(MinimalCameraMetadata::rawSizes).validDistinctSizes()
-        val privatePreviewSizes = values
-            .flatMap(MinimalCameraMetadata::privatePreviewSizes)
+        val privatePreviewSizes = values.flatMap(MinimalCameraMetadata::privatePreviewSizes)
             .validDistinctSizes()
-        val yuvPreviewSizes = values
-            .flatMap(MinimalCameraMetadata::yuvPreviewSizes)
+        val yuvPreviewSizes = values.flatMap(MinimalCameraMetadata::yuvPreviewSizes)
             .validDistinctSizes()
         val physical = chooseVoted(values.mapNotNull { it.sensorPhysicalSize?.takeIf(PhysicalSize::isValid) }) {
             "${decimal(it.widthMm)}x${decimal(it.heightMm)}"
@@ -256,24 +298,21 @@ object CameraTopologyResolver {
             "${it.width}x${it.height}"
         }
         val orientation = chooseVoted(
-            values.mapNotNull {
-                it.sensorOrientationDegrees?.takeIf { degrees -> degrees in 0..359 }
-            },
+            values.mapNotNull { it.sensorOrientationDegrees?.takeIf { degrees -> degrees in 0..359 } },
             Int::toString,
         )
         val facing = chooseEnum(values.map(MinimalCameraMetadata::facing), LensFacing.UNKNOWN)
         val hardware = chooseEnum(values.map(MinimalCameraMetadata::hardwareLevel), HardwareLevel.UNKNOWN)
         val providedFov = chooseVoted(
-            values.mapNotNull { it.approximateFieldOfView?.takeIf { fov -> fov.isSane } },
+            values.mapNotNull { it.approximateFieldOfView?.takeIf(FieldOfView::isSane) },
         ) {
             listOf(it.horizontalDegrees, it.verticalDegrees, it.diagonalDegrees, it.focalLengthMm)
                 .joinToString(",", transform = ::decimal)
         }
         val rawDeclared = mergeSupport(values.map(MinimalCameraMetadata::rawStreamActuallyDeclared))
             .promoteWhen(rawFormats.isNotEmpty() || rawSizes.isNotEmpty())
-        val previewDeclared = mergeSupport(
-            values.map(MinimalCameraMetadata::previewStreamActuallyDeclared),
-        ).promoteWhen(privatePreviewSizes.isNotEmpty() || yuvPreviewSizes.isNotEmpty())
+        val previewDeclared = mergeSupport(values.map(MinimalCameraMetadata::previewStreamActuallyDeclared))
+            .promoteWhen(privatePreviewSizes.isNotEmpty() || yuvPreviewSizes.isNotEmpty())
         return MinimalCameraMetadata(
             facing = facing,
             focalLengthsMm = focalLengths,
@@ -283,12 +322,8 @@ object CameraTopologyResolver {
             sensorOrientationDegrees = orientation,
             approximateFieldOfView = providedFov ?: calculateFov(physical, focalLengths.firstOrNull()),
             hardwareLevel = hardware,
-            backwardCompatibleAdvertised = mergeSupport(
-                values.map(MinimalCameraMetadata::backwardCompatibleAdvertised),
-            ),
-            rawCapabilityAdvertised = mergeSupport(
-                values.map(MinimalCameraMetadata::rawCapabilityAdvertised),
-            ),
+            backwardCompatibleAdvertised = mergeSupport(values.map(MinimalCameraMetadata::backwardCompatibleAdvertised)),
+            rawCapabilityAdvertised = mergeSupport(values.map(MinimalCameraMetadata::rawCapabilityAdvertised)),
             rawStreamActuallyDeclared = rawDeclared,
             rawFormats = rawFormats,
             rawSizes = rawSizes,
@@ -299,9 +334,7 @@ object CameraTopologyResolver {
             tofEvidence = mergeSupport(values.map(MinimalCameraMetadata::tofEvidence)),
             infraredEvidence = mergeSupport(values.map(MinimalCameraMetadata::infraredEvidence)),
             monochromeEvidence = mergeSupport(values.map(MinimalCameraMetadata::monochromeEvidence)),
-            systemCameraAdvertised = mergeSupport(
-                values.map(MinimalCameraMetadata::systemCameraAdvertised),
-            ),
+            systemCameraAdvertised = mergeSupport(values.map(MinimalCameraMetadata::systemCameraAdvertised)),
         )
     }
 
@@ -310,7 +343,7 @@ object CameraTopologyResolver {
     private fun chooseFullCapabilities(values: List<FullCameraCapabilities>): FullCameraCapabilities? =
         values.maxWithOrNull(compareBy<FullCameraCapabilities>(
             ::fullCapabilityScore,
-            { fullCapabilityKey(it) },
+            ::fullCapabilityKey,
         ))
 
     private fun fullCapabilityScore(full: FullCameraCapabilities): Int {
@@ -326,6 +359,7 @@ object CameraTopologyResolver {
                 value.isoRange,
                 value.exposureTimeRangeNs,
                 value.minimumFocusDistanceDiopters,
+                value.colorFilterArrangement,
             ).count { it != null }
     }
 
@@ -337,44 +371,34 @@ object CameraTopologyResolver {
             append(value.sensorPhysicalSize).append('|')
             append(value.pixelArraySize).append('|')
             append(value.activeArray).append('|')
+            append(value.colorFilterArrangement).append('|')
             append(value.streamConfigurations.orEmpty().sortedWith(compareBy(
-                { it.format.ordinal },
-                { it.size.width },
-                { it.size.height },
+                { it.format.ordinal }, { it.size.width }, { it.size.height },
             )))
         }
     }
 
-    private fun mergeTrust(
+    private fun mergeExactTrust(
         values: List<CameraRouteTrust>,
         metadata: MinimalCameraMetadata,
     ): CameraRouteTrust {
         val photographicMetadata = metadata.hasPhotographicEvidenceForClassification
         val metadataTrust = when {
-            metadata.systemCameraAdvertised == CapabilitySupport.SUPPORTED ->
-                CameraMetadataTrust.SYSTEM_ONLY
-            values.any { it.metadata == CameraMetadataTrust.METADATA_VALID } ->
-                CameraMetadataTrust.METADATA_VALID
+            metadata.systemCameraAdvertised == CapabilitySupport.SUPPORTED -> CameraMetadataTrust.SYSTEM_ONLY
+            values.any { it.metadata == CameraMetadataTrust.METADATA_VALID } -> CameraMetadataTrust.METADATA_VALID
             photographicMetadata -> CameraMetadataTrust.METADATA_VALID
             values.any { it.metadata == CameraMetadataTrust.BROKEN } -> CameraMetadataTrust.BROKEN
             values.any { it.metadata == CameraMetadataTrust.ACCESS_DENIED } &&
-                values.none { it.metadata == CameraMetadataTrust.DISCOVERED } ->
-                CameraMetadataTrust.ACCESS_DENIED
-            values.any { it.metadata == CameraMetadataTrust.SYSTEM_ONLY } ->
-                CameraMetadataTrust.SYSTEM_ONLY
-            values.any { it.metadata == CameraMetadataTrust.METADATA_REJECTED } ->
-                CameraMetadataTrust.METADATA_REJECTED
-            values.any { it.metadata == CameraMetadataTrust.DISCOVERED } ->
-                CameraMetadataTrust.DISCOVERED
+                values.none { it.metadata == CameraMetadataTrust.DISCOVERED } -> CameraMetadataTrust.ACCESS_DENIED
+            values.any { it.metadata == CameraMetadataTrust.SYSTEM_ONLY } -> CameraMetadataTrust.SYSTEM_ONLY
+            values.any { it.metadata == CameraMetadataTrust.METADATA_REJECTED } -> CameraMetadataTrust.METADATA_REJECTED
+            values.any { it.metadata == CameraMetadataTrust.DISCOVERED } -> CameraMetadataTrust.DISCOVERED
             else -> CameraMetadataTrust.UNKNOWN
         }
         val session = when {
-            values.any { it.session == CameraSessionTrust.SESSION_VERIFIED } ->
-                CameraSessionTrust.SESSION_VERIFIED
-            values.any { it.session == CameraSessionTrust.SESSION_REJECTED } ->
-                CameraSessionTrust.SESSION_REJECTED
-            values.any { it.session == CameraSessionTrust.TRANSIENT_FAILURE } ->
-                CameraSessionTrust.TRANSIENT_FAILURE
+            values.any { it.session == CameraSessionTrust.SESSION_VERIFIED } -> CameraSessionTrust.SESSION_VERIFIED
+            values.any { it.session == CameraSessionTrust.SESSION_REJECTED } -> CameraSessionTrust.SESSION_REJECTED
+            values.any { it.session == CameraSessionTrust.TRANSIENT_FAILURE } -> CameraSessionTrust.TRANSIENT_FAILURE
             else -> CameraSessionTrust.UNKNOWN
         }
         val raw = when {
@@ -383,8 +407,7 @@ object CameraTopologyResolver {
             values.any { it.raw == CameraRawTrust.TRANSIENT_FAILURE } -> CameraRawTrust.TRANSIENT_FAILURE
             values.any { it.raw == CameraRawTrust.NOT_ADVERTISED } -> CameraRawTrust.NOT_ADVERTISED
             metadata.rawCapabilityAdvertised == CapabilitySupport.UNSUPPORTED &&
-                metadata.rawStreamActuallyDeclared == CapabilitySupport.UNSUPPORTED ->
-                CameraRawTrust.NOT_ADVERTISED
+                metadata.rawStreamActuallyDeclared == CapabilitySupport.UNSUPPORTED -> CameraRawTrust.NOT_ADVERTISED
             else -> CameraRawTrust.UNKNOWN
         }
         val failure = values.mapNotNull(CameraRouteTrust::failure)
@@ -416,9 +439,7 @@ object CameraTopologyResolver {
         }
         if (metadata.depthEvidence == CapabilitySupport.SUPPORTED &&
             !metadata.hasPhotographicEvidenceForClassification
-        ) {
-            return PhotographicRole.NON_PHOTO_DEPTH to RoleConfidence.STRONG
-        }
+        ) return PhotographicRole.NON_PHOTO_DEPTH to RoleConfidence.STRONG
         if (metadata.monochromeEvidence == CapabilitySupport.SUPPORTED &&
             metadata.hasPhotographicEvidenceForClassification
         ) return PhotographicRole.PHOTOGRAPHIC_MONO to RoleConfidence.STRONG
@@ -450,71 +471,64 @@ object CameraTopologyResolver {
         }.thenBy(LensFingerprint::value))
         .firstOrNull()
 
-    private fun generateFingerprint(
-        candidate: Candidate,
+    /** Stable optical identity contains no Camera2/vendor ID when sufficient sensor metadata exists. */
+    private fun generateOpticalFingerprint(
         metadata: MinimalCameraMetadata,
         full: FullCameraCapabilities?,
         environment: CameraEnvironmentFingerprint,
+        fallbackProfile: CameraProfile,
     ): LensFingerprint {
-        val optical = stableOpticalParts(metadata, full)
         val stable = metadata.focalLengthsMm.isNotEmpty() &&
             (metadata.sensorPhysicalSize != null || metadata.pixelArraySize != null ||
-                metadata.activeArray != null)
-        val canonical = buildString {
-            append("camera-topology-fingerprint-v2|")
-            append(optical)
-            val hardwareId = candidate.streamPhysicalCameraId ?: candidate.discoveredCameraId
-            append("|hardware=").append(hardwareId)
-            if (!stable) {
-                append("|build=").append(environment.buildFingerprint.trim())
-                append("|open=").append(candidate.openCameraId)
-                append("|physical=").append(candidate.streamPhysicalCameraId.orEmpty())
+                metadata.activeArray != null || metadata.rawSizes.isNotEmpty())
+        val canonical = if (stable) {
+            "optical-lens-v3|${stableOpticalParts(metadata, full)}"
+        } else {
+            buildString {
+                append("optical-fallback-v3|")
+                append(environment.buildFingerprint.trim()).append('|')
+                append(fallbackProfile.profileFingerprint)
             }
         }
         return LensFingerprint(
-            value = (if (stable) "ct2_" else "cf2_") + sha256(canonical),
-            strategy = if (stable) {
-                FingerprintStrategy.STABLE_METADATA
-            } else {
-                FingerprintStrategy.DEVICE_SCOPED_FALLBACK
-            },
+            value = (if (stable) "ol3_" else "of3_") + sha256(canonical),
+            strategy = if (stable) FingerprintStrategy.STABLE_METADATA
+            else FingerprintStrategy.DEVICE_SCOPED_FALLBACK,
         )
     }
 
-    private fun strongOpticalSignature(metadata: MinimalCameraMetadata): String? {
-        if (metadata.focalLengthsMm.isEmpty()) return null
-        if (metadata.sensorPhysicalSize == null && metadata.pixelArraySize == null &&
-            metadata.activeArray == null
-        ) return null
-        if (metadata.rawSizes.isEmpty() && metadata.approximateFieldOfView == null) return null
-        return stableOpticalParts(metadata, null)
-    }
+    private fun generateFallbackFingerprint(
+        candidate: Candidate,
+        environment: CameraEnvironmentFingerprint,
+    ): LensFingerprint = LensFingerprint(
+        value = "pf3_" + sha256(
+            "profile-fallback-v3|${environment.buildFingerprint}|${candidate.routeKey}",
+        ),
+        strategy = FingerprintStrategy.DEVICE_SCOPED_FALLBACK,
+    )
 
     private fun stableOpticalParts(
         metadata: MinimalCameraMetadata,
         full: FullCameraCapabilities?,
     ): String = buildString {
         append("facing=").append(metadata.facing.name)
-        append("|focal=").append(metadata.focalLengthsMm.joinToString(",", transform = ::decimal))
-        append("|physical=").append(metadata.sensorPhysicalSize)
+        append("|focal=").append(metadata.focalLengthsMm.joinToString(",") { quantized(it, 1000.0) })
+        append("|physical=").append(metadata.sensorPhysicalSize?.let {
+            "${quantized(it.widthMm, 1000.0)}x${quantized(it.heightMm, 1000.0)}"
+        })
         append("|pixel=").append(metadata.pixelArraySize)
         append("|active=").append(metadata.activeArray)
-        append("|rawFormats=").append(metadata.rawFormats.sortedBy(StreamFormat::ordinal))
         append("|rawSizes=").append(metadata.rawSizes)
+        append("|orientation=").append(metadata.sensorOrientationDegrees)
         append("|cfa=").append(full?.capabilities?.colorFilterArrangement?.name ?: "?")
     }
 
     private fun relationships(routes: List<CameraRoute>): List<LogicalCameraRelationship> = routes
         .flatMap { route ->
-            buildList {
-                route.logicalParentCameraId?.let { parent ->
-                    route.streamPhysicalCameraId?.let { physical -> add(parent to physical) }
-                }
-                route.aliases.forEach { alias ->
-                    alias.logicalParentCameraId?.let { parent ->
-                        alias.streamPhysicalCameraId?.let { physical -> add(parent to physical) }
-                    }
-                }
+            route.profiles.mapNotNull { profile ->
+                val parent = profile.logicalParentCameraId ?: return@mapNotNull null
+                val physical = profile.streamPhysicalCameraId ?: return@mapNotNull null
+                parent to physical
             }
         }
         .groupBy({ it.first }, { it.second })
@@ -535,14 +549,12 @@ object CameraTopologyResolver {
     }
 
     private val MinimalCameraMetadata.hasPhotographicEvidenceForClassification: Boolean
-        get() = hasCrediblePhotographicEvidence ||
-            rawCapabilityAdvertised == CapabilitySupport.SUPPORTED
+        get() = hasCrediblePhotographicEvidence || rawCapabilityAdvertised == CapabilitySupport.SUPPORTED
 
     private val MinimalCameraMetadata.hasAnyMetadata: Boolean
         get() = facing != LensFacing.UNKNOWN || focalLengthsMm.isNotEmpty() ||
             sensorPhysicalSize != null || activeArray != null || pixelArraySize != null ||
-            sensorOrientationDegrees != null ||
-            hardwareLevel != HardwareLevel.UNKNOWN ||
+            sensorOrientationDegrees != null || hardwareLevel != HardwareLevel.UNKNOWN ||
             listOf(
                 backwardCompatibleAdvertised,
                 rawCapabilityAdvertised,
@@ -564,8 +576,7 @@ object CameraTopologyResolver {
 
     private fun mergeSupport(values: List<CapabilitySupport>): CapabilitySupport = when {
         values.any { it == CapabilitySupport.SUPPORTED } -> CapabilitySupport.SUPPORTED
-        values.isNotEmpty() && values.all { it == CapabilitySupport.UNSUPPORTED } ->
-            CapabilitySupport.UNSUPPORTED
+        values.isNotEmpty() && values.all { it == CapabilitySupport.UNSUPPORTED } -> CapabilitySupport.UNSUPPORTED
         else -> CapabilitySupport.UNKNOWN
     }
 
@@ -604,6 +615,9 @@ object CameraTopologyResolver {
         .stripTrailingZeros()
         .toPlainString()
 
+    private fun quantized(value: Double, scale: Double): String =
+        (kotlin.math.round(value * scale) / scale).toString()
+
     private fun sha256(value: String): String = MessageDigest.getInstance("SHA-256")
         .digest(value.toByteArray(StandardCharsets.UTF_8))
         .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
@@ -624,9 +638,14 @@ object CameraTopologyResolver {
         Candidate::discoveredCameraId,
     )
 
-    private val routeComparator = compareBy<CameraRoute>(
+    private val profileRouteComparator = compareBy<CameraRoute>(
         { it.minimalMetadata.facing.ordinal },
         { routeKindRank(it.routeKind) },
+        CameraRoute::canonicalRouteId,
+    )
+
+    private val canonicalRouteComparator = compareBy<CameraRoute>(
+        { it.minimalMetadata.facing.ordinal },
         { it.minimalMetadata.approximateFieldOfView?.diagonalDegrees ?: Double.NEGATIVE_INFINITY },
         { it.lensFingerprint?.value.orEmpty() },
         CameraRoute::canonicalRouteId,
