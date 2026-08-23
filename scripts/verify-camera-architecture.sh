@@ -129,11 +129,14 @@ readonly PROFILE_SELECTOR=app/src/main/java/com/sahidcode404/camex/core/camera/t
 readonly FAILOVER_CONTROLLER=app/src/main/java/com/sahidcode404/camex/core/camera/runtime/FailoverCameraSessionController.kt
 readonly RUNTIME_COORDINATOR=app/src/main/java/com/sahidcode404/camex/core/camera/runtime/CameraRuntimeCoordinator.kt
 readonly VIEW_MODEL=app/src/main/java/com/sahidcode404/camex/CameraViewModel.kt
+readonly DIAGNOSTICS_SCREEN=app/src/main/java/com/sahidcode404/camex/feature/diagnostics/DiagnosticsScreen.kt
+readonly COMPATIBILITY_REPORT=app/src/main/java/com/sahidcode404/camex/core/model/CompatibilityReport.kt
+readonly COMPATIBILITY_FACTORY=app/src/main/java/com/sahidcode404/camex/core/diagnostics/CompatibilityReportFactory.kt
 
 reject_pattern \
   "numeric Camera2 ID used as a dispatch condition" \
   "(?i)\\b(?:camera|public|physical|logical)[a-z0-9_]*id\\b\\s*(?:===|!==|==|!=|\\.equals\\s*\\()\\s*['\"][0-9]+['\"]|['\"][0-9]+['\"]\\s*(?:===|!==|==|!=)\\s*\\b(?:camera|public|physical|logical)[a-z0-9_]*id\\b|\\bopenCamera\\s*\\(\\s*['\"][0-9]+['\"]" \
-  --glob '*.kt' --glob '*.java' --glob '*.cpp' --glob '*.cc' --glob '*.cxx' --glob '*.h' --glob '*.hpp' \
+  --glob '*.kt' --glob '*.java' --glob '*.cpp' --glob '*.cc' --glob '*.c' --glob '*.cxx' --glob '*.h' --glob '*.hpp' \
   "${PRODUCTION_ROOTS[@]}"
 
 reject_pattern \
@@ -199,10 +202,16 @@ require_pattern "canonical optical lens domain model" '\bdata class CanonicalLen
 require_pattern "camera profile domain model" '\bdata class CameraProfile\b' "${TOPOLOGY_MODELS}"
 require_pattern "optical lens signature" '\bdata class OpticalLensSignature\b' "${TOPOLOGY_MODELS}"
 require_pattern "confidence based optical matcher" '\bobject OpticalLensMatcher\b' "${OPTICAL_MATCHER}"
+require_pattern "route matcher delegates to optical signatures" 'compare\s*\(\s*signature\s*\(\s*left\s*\)\s*,\s*signature\s*\(\s*right\s*\)\s*\)' "${OPTICAL_MATCHER}"
 require_pattern "profile selector" '\bobject CameraProfileSelector\b' "${PROFILE_SELECTOR}"
 require_pattern "bounded profile failover controller" '\bclass FailoverCameraSessionController\b' "${FAILOVER_CONTROLLER}"
+require_pattern "failover resolves exact profile descriptor" '\bprofileForRoutingKey\s*\(\s*lens\.identity\.routingKey\s*\)' "${FAILOVER_CONTROLLER}"
 require_pattern "runtime receives profile descriptors" '\bCameraRoute::profileLensDescriptors\b' "${RUNTIME_COORDINATOR}"
 require_pattern "profile-specific trust update" '\bwithProfileTrust\s*\(' app/src/main
+require_pattern "profile diagnostics UI model" '\bdata class CameraProfileDiagnosticsUiModel\b' "${DIAGNOSTICS_SCREEN}"
+require_pattern "nested canonical lens compatibility report" '\bdata class CanonicalLensCompatibilityReport\b' "${COMPATIBILITY_REPORT}"
+require_pattern "nested camera profile compatibility report" '\bdata class CameraProfileCompatibilityReport\b' "${COMPATIBILITY_REPORT}"
+require_pattern "compatibility export populates canonical lenses" '\bcanonicalLenses\s*=\s*canonicalLensReports\b' "${COMPATIBILITY_FACTORY}"
 require_pattern "cache schema v2" '\bCACHE_SCHEMA_VERSION\s*=\s*2\b' "${TOPOLOGY_MODELS}"
 require_pattern "topology schema v2" '\bCURRENT_SCHEMA_VERSION\s*=\s*2\b' "${TOPOLOGY_MODELS}"
 
