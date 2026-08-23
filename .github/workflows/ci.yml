@@ -79,6 +79,11 @@ jobs:
           ./gradlew --no-daemon --stacktrace testDebugUnitTest \
             --tests 'com.sahidcode404.camex.core.update.*'
 
+      - name: Run Phase 2 RAW regressions
+        run: |
+          ./gradlew --no-daemon --stacktrace testDebugUnitTest \
+            --tests 'com.sahidcode404.camex.core.camera.raw.*'
+
       - name: Run unit tests, lint, native build, and assemble
         run: ./gradlew --no-daemon --stacktrace testDebugUnitTest lintDebug assembleDebug
 
