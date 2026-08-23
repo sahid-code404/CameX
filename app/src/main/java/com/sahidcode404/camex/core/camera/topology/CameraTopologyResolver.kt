@@ -19,8 +19,8 @@ import kotlin.math.round
 
 /**
  * Authoritative Phase 1B canonicalization engine. Transport/profile observations merge by exact
- * routing key first, then strong optical evidence groups those profiles into physical lenses.
- * Camera IDs are never used as optical identity when stable sensor/optical metadata exists.
+ * routing key first, then conservative optical evidence groups those profiles into physical lenses.
+ * Camera IDs are never used as ordinary optical identity.
  */
 object CameraTopologyResolver {
     fun resolve(
@@ -52,12 +52,14 @@ object CameraTopologyResolver {
             .values
             .map { mergeExactProfile(it, environmentFingerprint) }
             .sortedWith(profileRouteComparator)
+        val groupingComparisons = buildGroupingComparisons(exactProfiles)
         val canonicalLenses = groupOpticalLenses(exactProfiles, environmentFingerprint)
             .sortedWith(canonicalRouteComparator)
         return CameraTopology(
             environmentFingerprint = environmentFingerprint,
             routes = canonicalLenses,
             logicalRelationships = relationships(canonicalLenses),
+            groupingComparisons = groupingComparisons,
         )
     }
 
@@ -160,8 +162,9 @@ object CameraTopologyResolver {
     }
 
     /**
-     * A profile may join a group only if it strongly matches at least one member and conflicts with
-     * none. PROBABLE_MATCH remains diagnostics-only so false optical merges stay conservative.
+     * Conservative complete-link clustering. A candidate joins an existing CanonicalLens only when
+     * it STRONG_MATCHes every member already in that group. This explicitly prevents transitive
+     * A↔B, B↔C chains from absorbing C when A↔C is only probable or insufficient.
      */
     private fun groupOpticalLenses(
         profiles: List<CameraRoute>,
@@ -171,15 +174,45 @@ object CameraTopologyResolver {
         profiles.forEach { candidate ->
             val target = groups.mapIndexedNotNull { index, group ->
                 val comparisons = group.map { member -> OpticalLensMatcher.compare(member, candidate) }
-                if (comparisons.any { it.match == OpticalLensMatch.CONFLICT }) return@mapIndexedNotNull null
-                if (comparisons.none { it.match == OpticalLensMatch.STRONG_MATCH }) return@mapIndexedNotNull null
-                index to (comparisons.maxOfOrNull(OpticalLensComparison::score) ?: Int.MIN_VALUE)
+                if (comparisons.isEmpty() ||
+                    comparisons.any { it.match != OpticalLensMatch.STRONG_MATCH }
+                ) return@mapIndexedNotNull null
+                // Prefer the group with the strongest weakest link; this remains deterministic and
+                // avoids a single unusually high pair score masking a marginal relationship.
+                index to comparisons.minOf(OpticalLensComparison::score)
             }.sortedWith(
                 compareByDescending<Pair<Int, Int>> { it.second }.thenBy { it.first },
             ).firstOrNull()?.first
             if (target == null) groups += mutableListOf(candidate) else groups[target] += candidate
         }
         return groups.map { canonicalizeGroup(it, environment) }
+    }
+
+    private fun buildGroupingComparisons(
+        profiles: List<CameraRoute>,
+    ): List<OpticalGroupingComparisonRecord> = buildList {
+        profiles.indices.forEach { leftIndex ->
+            for (rightIndex in leftIndex + 1 until profiles.size) {
+                val leftRoute = profiles[leftIndex]
+                val rightRoute = profiles[rightIndex]
+                val left = leftRoute.profiles.single()
+                val right = rightRoute.profiles.single()
+                val comparison = OpticalLensMatcher.compare(leftRoute, rightRoute)
+                add(
+                    OpticalGroupingComparisonRecord(
+                        leftProfileId = left.profileId,
+                        rightProfileId = right.profileId,
+                        leftProfileFingerprint = left.profileFingerprint,
+                        rightProfileFingerprint = right.profileFingerprint,
+                        match = comparison.match.name,
+                        score = comparison.score,
+                        evidenceFamilies = comparison.evidenceFamilies.map { it.name }.sorted(),
+                        positiveReasons = comparison.positiveReasons,
+                        negativeReasons = comparison.negativeReasons,
+                    ),
+                )
+            }
+        }
     }
 
     private fun canonicalizeGroup(
@@ -434,26 +467,30 @@ object CameraTopologyResolver {
             (metadata.sensorPhysicalSize != null || metadata.pixelArraySize != null ||
                 metadata.activeArray != null)
         val canonical = if (stable) {
-            "optical-lens-v3|${stableOpticalParts(metadata, full)}"
+            "optical-lens-v4|${stableOpticalParts(metadata, full)}"
         } else {
-            "optical-fallback-v3|${environment.buildFingerprint.trim()}|${fallbackProfile.profileFingerprint}"
+            "optical-fallback-v4|${environment.buildFingerprint.trim()}|${fallbackProfile.profileFingerprint}"
         }
         return LensFingerprint(
-            value = (if (stable) "ol3_" else "of3_") + sha256(canonical),
+            value = (if (stable) "ol4_" else "of4_") + sha256(canonical),
             strategy = if (stable) FingerprintStrategy.STABLE_METADATA
             else FingerprintStrategy.DEVICE_SCOPED_FALLBACK,
         )
     }
 
-    /** Tolerant canonical fingerprint: profile-specific crop/binning/RAW variants are not identity. */
+    /**
+     * Canonical fingerprint is intentionally more precise than the grouping tolerance. Profiles are
+     * grouped first; the merged canonical metadata then gets one stable key. Separate ambiguous
+     * groups must not collide merely because focal length was rounded too coarsely.
+     */
     private fun stableOpticalParts(
         metadata: MinimalCameraMetadata,
         full: FullCameraCapabilities?,
     ): String = buildString {
         append("facing=").append(metadata.facing.name)
-        append("|focal=").append(metadata.focalLengthsMm.consensus()?.let { quantizeStep(it, 0.2) })
+        append("|focal=").append(metadata.focalLengthsMm.consensus()?.let { quantizeStep(it, 0.05) })
         append("|physical=").append(metadata.sensorPhysicalSize?.let {
-            "${quantizeStep(it.widthMm, 0.05)}x${quantizeStep(it.heightMm, 0.05)}"
+            "${quantizeStep(it.widthMm, 0.02)}x${quantizeStep(it.heightMm, 0.02)}"
         })
         append("|pixel=").append(metadata.pixelArraySize)
         append("|active=").append(metadata.activeArray)
@@ -465,8 +502,8 @@ object CameraTopologyResolver {
         candidate: Candidate,
         environment: CameraEnvironmentFingerprint,
     ): LensFingerprint = LensFingerprint(
-        value = "pf3_" + sha256(
-            "profile-fallback-v3|${environment.buildFingerprint}|${candidate.routeKey}",
+        value = "pf4_" + sha256(
+            "profile-fallback-v4|${environment.buildFingerprint}|${candidate.routeKey}",
         ),
         strategy = FingerprintStrategy.DEVICE_SCOPED_FALLBACK,
     )
