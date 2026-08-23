@@ -195,11 +195,6 @@ reject_pattern \
   '(?i)(?:selectedLens|selected|activeSelection)[^\n]{0,100}\?:\s*LensFacing\.BACK|firstOrNull\s*\(?.{0,80}?\)?\.facing\s*\?:\s*LensFacing\.BACK' \
   "${VIEW_MODEL}"
 
-reject_pattern \
-  "bindPreview changes camera selection" \
-  '(?is)fun\s+bindPreview\s*\([^)]*\)\s*\{.{0,1000}?\b(?:PrimaryLensSelector|selectLens|switchFacing|runtimeCoordinator\.selectLens|controller\.(?:open|switchTo))\b' \
-  --multiline --multiline-dotall "${VIEW_MODEL}"
-
 # Canonical topology owns optical identity. The UI duplicate filter may only use exact routing or
 # physical identity; it must never grow another optical canonicalizer or hide fingerprint collisions.
 reject_pattern \
@@ -251,7 +246,10 @@ require_pattern "runtime publishes active selection" '\bval\s+activeSelection:\s
 require_pattern "profile-specific trust update" '\bwithProfileTrust\s*\(' app/src/main
 require_pattern "canonical fingerprint collision guard" '\bfun\s+CameraTopology\.withUniqueCanonicalFingerprints\s*\(' "${COLLISION_GUARD}"
 require_pattern "topology repository repairs collisions before publish" '\bwithUniqueCanonicalFingerprints\s*\(' "${TOPOLOGY_REPOSITORY}"
-require_pattern "selection-neutral preview bind" 'launchSafely\s*\{\s*controller\.bindPreview\s*\(\s*view\s*\)\s*\}' "${VIEW_MODEL}"
+require_pattern \
+  "selection-neutral preview bind" \
+  '(?s)fun\s+bindPreview\s*\(\s*view:\s*android\.view\.TextureView\s*\)\s*\{\s*launchSafely\s*\{\s*controller\.bindPreview\s*\(\s*view\s*\)\s*\}\s*\}' \
+  --multiline --multiline-dotall "${VIEW_MODEL}"
 require_pattern "canonical last-selection persistence" 'settingsStore\.setLastSelected\s*\(\s*selection\.facing\s*,\s*fingerprint\s*\)' "${VIEW_MODEL}"
 require_pattern "profile diagnostics UI model" '\bdata class CameraProfileDiagnosticsUiModel\b' "${DIAGNOSTICS_SCREEN}"
 require_pattern "nested canonical lens compatibility report" '\bdata class CanonicalLensCompatibilityReport\b' "${COMPATIBILITY_REPORT}"
