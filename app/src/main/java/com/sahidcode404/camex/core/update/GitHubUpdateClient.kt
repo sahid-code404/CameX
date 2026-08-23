@@ -1,6 +1,7 @@
 package com.sahidcode404.camex.core.update
 
 import java.io.File
+import java.io.FileNotFoundException
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
@@ -90,7 +91,15 @@ class GitHubUpdateClient(
     private val json = Json { ignoreUnknownKeys = true }
 
     suspend fun check(installed: InstalledAppInfo): UpdateCheckResult = runCatching {
-        val release = json.decodeFromString<GitHubRelease>(transport.readText(LATEST_RELEASE_URL))
+        val releaseText = try {
+            transport.readText(LATEST_RELEASE_URL)
+        } catch (_: FileNotFoundException) {
+            // GitHub returns HTTP 404 for /releases/latest when the repository has no
+            // published release yet. That is a normal "nothing to update" state, not
+            // an error that should leak a raw URL into the UI.
+            return UpdateCheckResult.UpToDate
+        }
+        val release = json.decodeFromString<GitHubRelease>(releaseText)
         val manifestAsset = release.assets.firstOrNull { it.name == MANIFEST_ASSET_NAME }
             ?: error("release-manifest.json is missing")
         val manifest = json.decodeFromString<ReleaseManifest>(
