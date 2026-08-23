@@ -8,10 +8,12 @@ import com.sahidcode404.camex.core.camera.DefaultCameraSessionController
 import com.sahidcode404.camex.core.camera.diagnostics.CameraStartupMilestone
 import com.sahidcode404.camex.core.camera.discovery.CameraDiscoveryCoordinator
 import com.sahidcode404.camex.core.camera.discovery.CameraDiscoveryTrigger
-import com.sahidcode404.camex.core.camera.validation.CameraRouteValidator
+import com.sahidcode404.camex.core.camera.topology.CameraProfile
 import com.sahidcode404.camex.core.camera.topology.CameraRoute
 import com.sahidcode404.camex.core.camera.topology.CameraTopology
-import com.sahidcode404.camex.core.camera.topology.toLensDescriptor
+import com.sahidcode404.camex.core.camera.topology.profileForRoutingKey
+import com.sahidcode404.camex.core.camera.topology.profileLensDescriptors
+import com.sahidcode404.camex.core.camera.validation.CameraRouteValidator
 import com.sahidcode404.camex.core.logic.LensDuplicateFilter
 import com.sahidcode404.camex.core.logic.PrimaryLensSelector
 import com.sahidcode404.camex.core.model.FingerprintStrategy
@@ -42,14 +44,17 @@ sealed interface CameraRuntimePhase {
 }
 
 /**
- * Application-camera orchestrator. Discovery owns topology, the controller owns sessions, and this
- * layer is the only place that converts a user/runtime action into both kinds of work.
+ * Application-camera orchestrator. Discovery owns topology and the wrapped session controller owns
+ * all CameraDevice/session work. Phase 1B adds profile failover without adding another camera owner.
  */
 class CameraRuntimeCoordinator(
     context: Context,
     private val scope: CoroutineScope,
     val discovery: CameraDiscoveryCoordinator = CameraDiscoveryCoordinator(context),
-    val session: CameraSessionController = DefaultCameraSessionController(context),
+    val session: CameraSessionController = FailoverCameraSessionController(
+        DefaultCameraSessionController(context),
+        scope,
+    ),
 ) : Closeable {
     private val startMutex = Mutex()
     private val mutablePhase = MutableStateFlow<CameraRuntimePhase>(
@@ -66,11 +71,11 @@ class CameraRuntimeCoordinator(
     init {
         scope.launch {
             topology.collectLatest { value ->
-                val lenses = value.routes.mapIndexed { index, route ->
-                    route.toLensDescriptor().copy(discoveryOrder = index)
-                }
+                // Runtime receives every profile so the failover wrapper can rotate routes. All
+                // profiles belonging to one optical lens share one optical fingerprint.
+                val lenses = value.toProfileLenses()
                 session.updateAvailableLenses(lenses)
-                if (lenses.isNotEmpty()) {
+                if (value.routes.isNotEmpty()) {
                     discovery.startupTrace.mark(CameraStartupMilestone.UI_LENS_LIST_READY)
                 }
             }
@@ -81,7 +86,7 @@ class CameraRuntimeCoordinator(
     suspend fun bootstrapCache(): CameraTopology {
         mutablePhase.value = CameraRuntimePhase.BootstrappingCache
         val topology = discovery.bootstrapCache()
-        session.updateAvailableLenses(topology.toLenses())
+        session.updateAvailableLenses(topology.toProfileLenses())
         mutablePhase.value = CameraRuntimePhase.CacheReady(
             routeCount = topology.routes.size,
             hit = discovery.snapshot.value.cacheHit,
@@ -99,12 +104,12 @@ class CameraRuntimeCoordinator(
         this.oneXReferenceFingerprint = oneXReferenceFingerprint
         val cached = discovery.bootstrapCache()
         session.resume()
-        session.updateAvailableLenses(cached.toLenses())
+        session.updateAvailableLenses(cached.toProfileLenses())
 
         var target = chooseStartupLens(cached)
         if (target == null) {
             val seeded = discovery.seedPrimaryRoute()
-            session.updateAvailableLenses(seeded.toLenses())
+            session.updateAvailableLenses(seeded.toProfileLenses())
             target = chooseStartupLens(seeded)
         }
         target?.let { openPrimary(it) }
@@ -208,7 +213,9 @@ class CameraRuntimeCoordinator(
     }
 
     private fun chooseStartupLens(topology: CameraTopology): LensDescriptor? {
-        val lenses = LensDuplicateFilter.filterForSelector(topology.toLenses())
+        // DuplicateFilter is now only a final safety net. Optical fingerprints group profile
+        // descriptors before this point, so the selector sees one representative per real lens.
+        val lenses = LensDuplicateFilter.filterForSelector(topology.toProfileLenses())
         val preferred = preferredRearFingerprint
         if (!preferred.isNullOrBlank()) {
             lenses.firstOrNull {
@@ -256,13 +263,31 @@ class CameraRuntimeCoordinator(
         }
     }
 
-    private fun routeForRoutingKey(routingKey: String): CameraRoute? =
-        topology.value.routes.firstOrNull {
-            it.toLensDescriptor().identity.routingKey == routingKey
+    /** Reconstruct the exact profile route so trust is persisted per profile, not per optical lens. */
+    private fun routeForRoutingKey(routingKey: String): CameraRoute? = topology.value.routes
+        .asSequence()
+        .mapNotNull { canonical ->
+            canonical.profileForRoutingKey(routingKey)?.toRoute(canonical)
         }
+        .firstOrNull()
 
-    private fun CameraTopology.toLenses(): List<LensDescriptor> = routes.mapIndexed { index, route ->
-        route.toLensDescriptor().copy(discoveryOrder = index)
-    }
+    private fun CameraProfile.toRoute(canonical: CameraRoute): CameraRoute = CameraRoute(
+        canonicalRouteId = profileId,
+        discoveredCameraId = discoveredCameraId,
+        openCameraId = openCameraId,
+        streamPhysicalCameraId = streamPhysicalCameraId,
+        logicalParentCameraId = logicalParentCameraId,
+        routeKind = routeKind,
+        sources = discoverySources,
+        minimalMetadata = metadata,
+        fullCapabilities = fullCapabilities,
+        lensFingerprint = canonical.lensFingerprint,
+        role = canonical.role,
+        roleConfidence = canonical.roleConfidence,
+        trust = trust,
+    )
 
+    private fun CameraTopology.toProfileLenses(): List<LensDescriptor> = routes
+        .flatMap(CameraRoute::profileLensDescriptors)
+        .mapIndexed { index, lens -> lens.copy(discoveryOrder = index) }
 }
