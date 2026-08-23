@@ -51,6 +51,9 @@ object RawCaptureRegistry : RawCaptureController {
     @Volatile
     private var engine: RawCaptureEngine? = null
 
+    @Volatile
+    private var captureOrchestrator: (suspend () -> RawCaptureResult)? = null
+
     fun initialize(context: Context) {
         if (cameraManager != null && engine != null) return
         synchronized(this) {
@@ -61,6 +64,14 @@ object RawCaptureRegistry : RawCaptureController {
                 engine = RawCaptureEngine(manager, RawDngWriter(appContext))
             }
         }
+    }
+
+    fun installCaptureOrchestrator(orchestrator: suspend () -> RawCaptureResult) {
+        captureOrchestrator = orchestrator
+    }
+
+    fun clearCaptureOrchestrator() {
+        captureOrchestrator = null
     }
 
     internal fun prepareOutput(
@@ -209,6 +220,11 @@ object RawCaptureRegistry : RawCaptureController {
     }
 
     suspend fun captureCurrent(): RawCaptureResult {
+        val orchestrator = captureOrchestrator
+        return if (orchestrator != null) orchestrator() else captureCurrentDirect()
+    }
+
+    internal suspend fun captureCurrentDirect(): RawCaptureResult {
         val generation = activeSelectionGeneration.get()
         if (generation == INVALID_GENERATION) {
             val diagnostics = mutableState.value.diagnostics.copy(
