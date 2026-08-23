@@ -56,6 +56,7 @@ class RawDngWriter(context: Context) {
                             creator.writeImage(counted, image)
                         }
                         byteCount = counted.count
+                        check(byteCount > 0L) { "DNG output was empty" }
                     }
                 } ?: error("Could not open MediaStore DNG output")
             },
