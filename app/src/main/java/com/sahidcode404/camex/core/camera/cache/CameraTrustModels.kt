@@ -83,7 +83,10 @@ object CameraTrustCachePolicy {
     private fun isStructurallyValid(cached: CachedCameraTrust): Boolean {
         if (cached.generatedAtEpochMs < 0L) return false
         val routeIds = cached.snapshot.records.map(CameraTrustRecord::canonicalRouteId)
-        return routeIds.none(String::isBlank) && routeIds.distinct().size == routeIds.size
+        if (routeIds.any(String::isBlank) || routeIds.distinct().size != routeIds.size) return false
+        return cached.snapshot.records.all { record ->
+            record.trust.lastAttemptEpochMs?.let { it >= 0L } != false
+        }
     }
 }
 
@@ -103,7 +106,17 @@ object CameraTrustPolicy {
             observation.failure != null -> observation.failure.normalized()
             else -> previous.failure
         }
-        return CameraRouteTrust(metadata, session, raw, failure)
+        val lastAttempt = listOfNotNull(
+            previous.lastAttemptEpochMs?.takeIf { it >= 0L },
+            observation.lastAttemptEpochMs?.takeIf { it >= 0L },
+        ).maxOrNull()
+        return CameraRouteTrust(
+            metadata = metadata,
+            session = session,
+            raw = raw,
+            failure = failure,
+            lastAttemptEpochMs = lastAttempt,
+        )
     }
 
     /** Apply persisted trust to each profile independently; verified profiles become preferred. */
