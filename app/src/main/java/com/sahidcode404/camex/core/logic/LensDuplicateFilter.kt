@@ -12,7 +12,7 @@ data class DuplicateLensGroup(
 
 /**
  * Exact-identity safety net only. Cross-route optical canonicalization belongs exclusively to
- * CameraTopologyResolver; this UI layer must never compare focal/FOV/sensor/stream geometry.
+ * CameraTopologyResolver; this UI layer must never compare optical metadata heuristically.
  */
 object LensDuplicateFilter {
     fun filterForSelector(lenses: List<LensDescriptor>): List<LensDescriptor> =
