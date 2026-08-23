@@ -52,7 +52,7 @@ class DefaultUpdateNetworkClient : UpdateNetworkClient {
     override suspend fun readText(url: String, maxBytes: Int): String = withContext(Dispatchers.IO) {
         val connection = openFollowingRedirects(url, "application/json")
         try {
-            val contentLength = connection.contentLengthLong.takeIf { it >= 0L }
+            val contentLength = connection.declaredContentLength()?.takeIf { it >= 0L }
             if (contentLength != null && contentLength > maxBytes) {
                 throw UpdateException(UpdateFailureCode.INVALID_MANIFEST, "Remote update metadata is too large")
             }
@@ -88,7 +88,7 @@ class DefaultUpdateNetworkClient : UpdateNetworkClient {
         }
         val connection = openFollowingRedirects(url, "application/vnd.android.package-archive")
         try {
-            val total = connection.contentLengthLong.takeIf { it > 0L }
+            val total = connection.declaredContentLength()?.takeIf { it > 0L }
             FileOutputStream(destination).use { output ->
                 connection.inputStream.use { input ->
                     val buffer = ByteArray(64 * 1024)
@@ -111,6 +111,9 @@ class DefaultUpdateNetworkClient : UpdateNetworkClient {
             connection.disconnect()
         }
     }
+
+    private fun HttpURLConnection.declaredContentLength(): Long? =
+        getHeaderField("Content-Length")?.trim()?.toLongOrNull()?.takeIf { it >= 0L }
 
     private fun openFollowingRedirects(initialUrl: String, accept: String): HttpURLConnection {
         var current = UpdateNetworkPolicy.validateUrl(initialUrl)
