@@ -34,6 +34,9 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.sahidcode404.camex.core.camera.raw.RawCapturePhase
+import com.sahidcode404.camex.core.camera.raw.RawCaptureState
+import com.sahidcode404.camex.core.camera.raw.RawSupportState
 
 data class LensButtonUiModel(
     val fingerprint: String,
@@ -57,6 +60,7 @@ data class CameraScreenUiState(
 @Composable
 fun CameraScreen(
     state: CameraScreenUiState,
+    rawState: RawCaptureState,
     previewContent: @Composable () -> Unit,
     permissionPermanentlyDenied: Boolean,
     updateAvailable: Boolean = false,
@@ -64,6 +68,7 @@ fun CameraScreen(
     onOpenAppSettings: () -> Unit,
     onSelectLens: (String) -> Unit,
     onSwitchFacing: () -> Unit,
+    onCapture: () -> Unit,
     onOpenLensSettings: () -> Unit,
     onOpenDiagnostics: () -> Unit,
     onRetry: () -> Unit,
@@ -112,8 +117,11 @@ fun CameraScreen(
             selectedFingerprint = state.selectedFingerprint,
             switchFacingLabel = state.switchFacingLabel,
             switchFacingEnabled = state.switchFacingEnabled,
+            previewVisible = state.previewVisible,
+            rawState = rawState,
             onSelectLens = onSelectLens,
             onSwitchFacing = onSwitchFacing,
+            onCapture = onCapture,
             modifier = Modifier.align(Alignment.BottomCenter),
         )
     }
@@ -179,8 +187,7 @@ private fun PermissionPrompt(
                 text = if (permanentlyDenied) {
                     "Camera permission is disabled. Open app settings to enable discovery and preview."
                 } else {
-                    "Camera permission is required for discovery and preview. CameX never captures " +
-                        "or saves a photo during Phase 1."
+                    "Camera permission is required for discovery, preview, and RAW capture."
                 },
                 color = Color.White,
                 textAlign = TextAlign.Center,
@@ -221,10 +228,18 @@ private fun CameraBottomControls(
     selectedFingerprint: String?,
     switchFacingLabel: String,
     switchFacingEnabled: Boolean,
+    previewVisible: Boolean,
+    rawState: RawCaptureState,
     onSelectLens: (String) -> Unit,
     onSwitchFacing: () -> Unit,
+    onCapture: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val captureEnabled = previewVisible &&
+        rawState.capability.canAttempt &&
+        rawState.capability.sessionReady &&
+        !rawState.inProgress
+
     Column(
         modifier = modifier
             .fillMaxWidth()
@@ -254,7 +269,7 @@ private fun CameraBottomControls(
                         )
                         .border(1.dp, Color.White.copy(alpha = 0.5f), CircleShape)
                         .clickable(
-                            enabled = lens.enabled,
+                            enabled = lens.enabled && !rawState.inProgress,
                             role = Role.Button,
                             onClick = { onSelectLens(lens.fingerprint) },
                         )
@@ -284,29 +299,65 @@ private fun CameraBottomControls(
                 modifier = Modifier
                     .size(76.dp)
                     .border(5.dp, Color.White, CircleShape)
-                    .semantics { contentDescription = "Capture unavailable in Phase 1" },
+                    .clickable(
+                        enabled = captureEnabled,
+                        role = Role.Button,
+                        onClick = onCapture,
+                    )
+                    .semantics {
+                        contentDescription = if (captureEnabled) {
+                            "Capture one RAW DNG"
+                        } else {
+                            "RAW capture unavailable"
+                        }
+                    },
                 contentAlignment = Alignment.Center,
             ) {
                 Box(
                     Modifier
                         .size(58.dp)
-                        .background(Color.White.copy(alpha = 0.35f), CircleShape),
+                        .background(
+                            Color.White.copy(alpha = if (captureEnabled) 1f else 0.35f),
+                            CircleShape,
+                        ),
                 )
             }
             TextButton(
-                enabled = switchFacingEnabled,
+                enabled = switchFacingEnabled && !rawState.inProgress,
                 onClick = onSwitchFacing,
             ) {
                 Text(
                     text = switchFacingLabel,
-                    color = if (switchFacingEnabled) Color.White else Color.White.copy(alpha = 0.45f),
+                    color = if (switchFacingEnabled && !rawState.inProgress) {
+                        Color.White
+                    } else {
+                        Color.White.copy(alpha = 0.45f)
+                    },
                 )
             }
         }
         Text(
-            text = "Capture arrives in Phase 2",
-            color = Color.White.copy(alpha = 0.55f),
+            text = rawStatusText(rawState),
+            color = Color.White.copy(alpha = 0.72f),
             style = MaterialTheme.typography.labelSmall,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(horizontal = 24.dp, vertical = 2.dp),
         )
+    }
+}
+
+private fun rawStatusText(state: RawCaptureState): String = when (state.phase) {
+    RawCapturePhase.CAPTURING -> "Capturing RAW sensor frame…"
+    RawCapturePhase.SAVING -> "Saving DNG…"
+    RawCapturePhase.SAVED -> "DNG saved"
+    RawCapturePhase.FAILED -> state.diagnostics.lastRawError ?: "RAW capture failed"
+    RawCapturePhase.IDLE -> when {
+        state.capability.sessionReady -> state.capability.selectedSize?.let {
+            "RAW DNG · ${it.width}×${it.height}"
+        } ?: "RAW ready"
+        state.capability.support == RawSupportState.UNSUPPORTED -> "RAW unsupported on this profile"
+        state.capability.support == RawSupportState.UNKNOWN ->
+            state.capability.detail ?: "RAW availability unknown"
+        else -> state.capability.detail ?: "RAW session unavailable"
     }
 }
