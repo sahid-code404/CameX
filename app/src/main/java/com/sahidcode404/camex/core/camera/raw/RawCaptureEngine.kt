@@ -12,7 +12,6 @@ import android.media.Image
 import android.media.ImageReader
 import android.os.Handler
 import android.os.SystemClock
-import com.sahidcode404.camex.core.model.LensDescriptor
 import com.sahidcode404.camex.core.model.Size2D
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.TimeoutCancellationException
@@ -22,8 +21,12 @@ internal data class ActiveRawSession(
     val device: CameraDevice,
     val session: CameraCaptureSession,
     val imageReader: ImageReader,
-    val lens: LensDescriptor,
+    val routingKey: String,
+    val openCameraId: String,
+    val physicalCameraId: String?,
     val rawSize: Size2D,
+    val availableRawSizes: List<Size2D>,
+    val continuousPictureAf: Boolean,
     val transportGeneration: Long,
     val callbackHandler: Handler,
 )
@@ -60,15 +63,14 @@ internal class RawCaptureEngine(
         active.imageReader.setOnImageAvailableListener({ reader ->
             while (true) {
                 val image = runCatching { reader.acquireNextImage() }.getOrNull() ?: break
-                val pair = pairer.offerImage(image.timestamp, image)
-                if (pair != null) completePair(pair)
+                pairer.offerImage(image.timestamp, image)?.let(::completePair)
             }
         }, active.callbackHandler)
 
         val request = active.device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
             addTarget(active.imageReader.surface)
             set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-            if (active.lens.capabilities.afModes.orEmpty().contains("CONTINUOUS_PICTURE")) {
+            if (active.continuousPictureAf) {
                 set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
             }
         }.build()
@@ -113,20 +115,6 @@ internal class RawCaptureEngine(
             active.session.capture(request, callback, active.callbackHandler)
             val pair = withTimeout(timeoutMillis) { completion.await() }
             matchedImage = pair.image
-            if (pair.timestampNs != pair.result.sensorTimestampNs) {
-                return RawCaptureResult.Failed(
-                    reason = "RAW image/result timestamp mismatch",
-                    structural = false,
-                    diagnostics = diagnostics(
-                        context = context,
-                        active = active,
-                        imageTimestamp = pair.timestampNs,
-                        metadata = pair.result,
-                        startedNs = startedNs,
-                        error = "timestamp mismatch",
-                    ),
-                )
-            }
             if (!isStillCurrent()) {
                 return RawCaptureResult.Failed(
                     reason = "Camera selection changed before RAW capture completed",
@@ -151,17 +139,15 @@ internal class RawCaptureEngine(
             )
             onSaving(preWrite)
             val writeStartedNs = SystemClock.elapsedRealtimeNanos()
-            val characteristicsCameraId = active.lens.identity.streamPhysicalCameraId
-                ?: active.lens.identity.openCameraId
+            val characteristicsCameraId = active.physicalCameraId ?: active.openCameraId
             val characteristics = cameraManager.getCameraCharacteristics(characteristicsCameraId)
             val file = dngWriter.write(characteristics, pair.result.result, pair.image)
-            val writeDurationMs = nanosToMillis(SystemClock.elapsedRealtimeNanos() - writeStartedNs)
             val finalDiagnostics = preWrite.copy(
                 dngWidth = file.width,
                 dngHeight = file.height,
                 dngBytes = file.bytes,
                 mediaStoreUri = file.uri,
-                writeDurationMs = writeDurationMs,
+                writeDurationMs = nanosToMillis(SystemClock.elapsedRealtimeNanos() - writeStartedNs),
                 lastRawError = null,
             )
             RawCaptureResult.Saved(file, finalDiagnostics)
@@ -205,11 +191,7 @@ internal class RawCaptureEngine(
     ) = RawCaptureDiagnostics(
         context = context,
         rawSupported = RawSupportState.SUPPORTED,
-        availableRawSizes = active.lens.capabilities
-            .configurations(com.sahidcode404.camex.core.model.StreamFormat.RAW_SENSOR)
-            .filterNot { it.maximumResolution }
-            .map { it.size }
-            .distinct(),
+        availableRawSizes = active.availableRawSizes,
         selectedRawSize = active.rawSize,
         rawTimestamp = imageTimestamp,
         resultTimestamp = metadata?.sensorTimestampNs,
