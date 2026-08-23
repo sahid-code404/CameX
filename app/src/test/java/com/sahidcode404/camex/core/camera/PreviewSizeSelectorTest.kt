@@ -63,8 +63,7 @@ class PreviewSizeSelectorTest {
 
     @Test
     fun autoFpsUsesHighestReportedNormalPreviewRange() {
-        assertEquals(
-            60.0,
+        val target = requireNotNull(
             PreviewFpsSelector.preferredTargetFps(
                 listOf(
                     FpsRange(15, 30),
@@ -74,8 +73,8 @@ class PreviewSizeSelectorTest {
                     FpsRange(60, 60),
                 ),
             ),
-            0.0,
         )
+        assertEquals(60.0, target, 0.0)
         assertNull(PreviewFpsSelector.preferredTargetFps(emptyList()))
     }
 
