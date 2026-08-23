@@ -32,7 +32,8 @@ class RawDngWriter(context: Context) {
             )
         }
 
-        val displayName = "IMG_${FILE_TIME_FORMAT.get().format(Date(nowEpochMs))}.dng"
+        val formatter = requireNotNull(FILE_TIME_FORMAT.get())
+        val displayName = "IMG_${formatter.format(Date(nowEpochMs))}.dng"
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
             put(MediaStore.MediaColumns.MIME_TYPE, DNG_MIME_TYPE)
