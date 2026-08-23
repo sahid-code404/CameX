@@ -1,0 +1,72 @@
+name: Phase 1 CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - "phase/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Test, lint, native, and APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CAMEX_GIT_SHA: ${{ github.sha }}
+      CI: "true"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@0723195856401067f7a2779048b490ace7a47d7c # v5
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+          dependency-graph: disabled
+
+      - name: Install pinned Android SDK, NDK, and CMake
+        run: ./scripts/install-android-sdk.sh
+
+      - name: Set reproducible build metadata
+        run: |
+          commit_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          commit_timestamp="$(date --utc --date="@${commit_epoch}" +%Y-%m-%dT%H:%M:%SZ)"
+          echo "CAMEX_BUILD_TIMESTAMP_UTC=${commit_timestamp}" >> "$GITHUB_ENV"
+
+      - name: Verify Gradle environment
+        run: ./gradlew --version
+
+      - name: Run unit tests, lint, native build, and assemble
+        run: ./gradlew --no-daemon --stacktrace testDebugUnitTest lintDebug assembleDebug
+
+      - name: Show Android lint findings
+        run: cat app/build/reports/lint-results-debug.txt
+
+      - name: Check and package development APK
+        run: ./scripts/package-dev-apk.sh app/build/outputs/apk/debug/app-debug.apk artifacts "$GITHUB_SHA"
+
+      - name: Upload CI development APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Camera-ci-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
