@@ -163,21 +163,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          apk_src="$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' -type f | head -n1)"
-          [[ -n "$apk_src" && -f "$apk_src" ]] || { echo 'Release APK was not produced.' >&2; exit 1; }
+          mapfile -t release_apks < <(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' -type f -print)
+          ((${#release_apks[@]} == 1)) || { echo 'Expected exactly one release APK.' >&2; exit 1; }
+          apk_src="${release_apks[0]}"
           build_tools="$ANDROID_HOME/build-tools/37.0.0"
           "$build_tools/apksigner" verify --verbose --print-certs "$apk_src" > "$RUNNER_TEMP/apksigner.txt"
-          signer_sha="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/apksigner.txt" | head -n1 | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+          signer_sha="$(awk -F': ' '/^Signer #1 certificate SHA-256 digest: / {gsub(":", "", $2); print tolower($2); exit}' "$RUNNER_TEMP/apksigner.txt")"
           [[ "$signer_sha" =~ ^[0-9a-f]{64}$ ]] || { echo 'Could not derive final APK signer SHA-256.' >&2; exit 1; }
           badging="$("$build_tools/aapt2" dump badging "$apk_src")"
-          package_name="$(printf '%s\n' "$badging" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n1)"
-          version_code="$(printf '%s\n' "$badging" | sed -n "s/^package:.* versionCode='\([^']*\)'.*/\1/p" | head -n1)"
-          version_name="$(printf '%s\n' "$badging" | sed -n "s/^package:.* versionName='\([^']*\)'.*/\1/p" | head -n1)"
+          package_name="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" <<<"$badging" | head -n1)"
+          version_code="$(sed -n "s/^package:.* versionCode='\([^']*\)'.*/\1/p" <<<"$badging" | head -n1)"
+          version_name="$(sed -n "s/^package:.* versionName='\([^']*\)'.*/\1/p" <<<"$badging" | head -n1)"
           [[ "$package_name" == 'com.sahidcode404.camex' ]] || { echo 'Release APK package mismatch.' >&2; exit 1; }
           [[ "$version_code" == "$CAMERA_VERSION_CODE" ]] || { echo 'Release APK versionCode mismatch.' >&2; exit 1; }
           [[ "$version_name" == "$CAMERA_VERSION_NAME" ]] || { echo 'Release APK versionName mismatch.' >&2; exit 1; }
+          apk_listing="$(unzip -Z1 "$apk_src")"
           for abi in armeabi-v7a arm64-v8a x86 x86_64; do
-            unzip -l "$apk_src" | grep -q "lib/${abi}/libcamex_native.so" || { echo "Missing native ABI: ${abi}" >&2; exit 1; }
+            grep -Fxq "lib/${abi}/libcamex_native.so" <<<"$apk_listing" || { echo "Missing native ABI: ${abi}" >&2; exit 1; }
           done
           echo "RELEASE_APK_SOURCE=$apk_src" >> "$GITHUB_ENV"
           echo "RELEASE_SIGNER_SHA256=$signer_sha" >> "$GITHUB_ENV"
