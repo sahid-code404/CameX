@@ -60,7 +60,10 @@ jobs:
         run: |
           commit_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
           commit_timestamp="$(date --utc --date="@${commit_epoch}" +%Y-%m-%dT%H:%M:%SZ)"
+          short_sha="${GITHUB_SHA:0:12}"
           echo "CAMEX_BUILD_TIMESTAMP_UTC=${commit_timestamp}" >> "$GITHUB_ENV"
+          echo "DEV_OTA_VERSION_CODE=${commit_epoch}" >> "$GITHUB_ENV"
+          echo "DEV_OTA_VERSION_NAME=0.2.0-dev.${commit_epoch}.${short_sha}" >> "$GITHUB_ENV"
 
       - name: Verify Gradle environment
         run: ./gradlew --version
@@ -87,6 +90,24 @@ jobs:
       - name: Run unit tests, lint, native build, and assemble
         run: ./gradlew --no-daemon --stacktrace testDebugUnitTest lintDebug assembleDebug
 
+      - name: Verify fixed-signer development OTA build
+        run: |
+          ./gradlew --no-daemon --stacktrace :app:assembleDevOta \
+            -PdevOtaVersionCode="$DEV_OTA_VERSION_CODE" \
+            -PdevOtaVersionName="$DEV_OTA_VERSION_NAME"
+          APK="$(find app/build/outputs/apk/devOta -name '*.apk' -type f | head -n 1)"
+          test -f "$APK"
+          "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --verbose --print-certs "$APK" > artifacts-dev-ota-cert.txt
+          CERT_SHA="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' artifacts-dev-ota-cert.txt | head -n 1 | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+          test "$CERT_SHA" = "445538e26dd5ad46a026eeca5265fd32d1231dc8863b2383c15a5d55a3285640"
+          mkdir -p artifacts-dev-ota
+          install -m 0644 "$APK" artifacts-dev-ota/Camera-dev-bootstrap.apk
+          (
+            cd artifacts-dev-ota
+            sha256sum Camera-dev-bootstrap.apk > SHA256SUMS.txt
+            sha256sum --check SHA256SUMS.txt
+          )
+
       - name: Show Android lint findings
         run: cat app/build/reports/lint-results-debug.txt
 
@@ -98,5 +119,13 @@ jobs:
         with:
           name: Camera-ci-${{ github.sha }}
           path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload fixed-signer dev OTA bootstrap APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Camera-dev-ota-ci-${{ github.sha }}
+          path: artifacts-dev-ota/
           if-no-files-found: error
           retention-days: 14
