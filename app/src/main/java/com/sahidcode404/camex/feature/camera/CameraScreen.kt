@@ -269,7 +269,7 @@ private fun CameraBottomControls(
                         )
                         .border(1.dp, Color.White.copy(alpha = 0.5f), CircleShape)
                         .clickable(
-                            enabled = lens.enabled && !rawState.inProgress,
+                            enabled = lens.enabled,
                             role = Role.Button,
                             onClick = { onSelectLens(lens.fingerprint) },
                         )
@@ -323,16 +323,12 @@ private fun CameraBottomControls(
                 )
             }
             TextButton(
-                enabled = switchFacingEnabled && !rawState.inProgress,
+                enabled = switchFacingEnabled,
                 onClick = onSwitchFacing,
             ) {
                 Text(
                     text = switchFacingLabel,
-                    color = if (switchFacingEnabled && !rawState.inProgress) {
-                        Color.White
-                    } else {
-                        Color.White.copy(alpha = 0.45f)
-                    },
+                    color = if (switchFacingEnabled) Color.White else Color.White.copy(alpha = 0.45f),
                 )
             }
         }
