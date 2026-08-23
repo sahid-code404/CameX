@@ -22,10 +22,13 @@ import com.sahidcode404.camex.core.camera.topology.CameraTopology
 import com.sahidcode404.camex.core.camera.topology.toLensDescriptor
 import com.sahidcode404.camex.core.diagnostics.CompatibilityReportFactory
 import com.sahidcode404.camex.core.diagnostics.PlatformDiagnostics
+import com.sahidcode404.camex.core.logic.CompatibilityReportJson
 import com.sahidcode404.camex.core.logic.LensDuplicateFilter
 import com.sahidcode404.camex.core.logic.LensMath
 import com.sahidcode404.camex.core.logic.LensPreferenceOrdering
 import com.sahidcode404.camex.core.logic.PrimaryLensSelector
+import com.sahidcode404.camex.core.model.ActiveCameraSelectionReport
+import com.sahidcode404.camex.core.model.CameraUiSelectionReport
 import com.sahidcode404.camex.core.model.LensCategory
 import com.sahidcode404.camex.core.model.LensDescriptor
 import com.sahidcode404.camex.core.model.LensFacing
@@ -266,12 +269,46 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun compatibilityReportJson(): String {
         val runtime = currentRuntime()
-        return CompatibilityReportFactory.encode(
+        val preferences = settings.value
+        val selector = selectorLenses(runtime, preferences, includeHidden = false)
+        val projection = CameraSelectionPolicy.project(
+            selectorLenses = selector,
+            activeSelection = runtime.activeSelection,
+            sessionState = runtime.sessionState,
+        )
+        val base = CompatibilityReportFactory.create(
             context = appContext,
             topology = runtime.topology,
             discovery = runtime.discovery,
             startupTrace = runtime.startupTrace,
-            lenses = selectorLenses(runtime, settings.value, includeHidden = false),
+            lenses = selector,
+        )
+        val active = runtime.activeSelection
+        return CompatibilityReportJson.encode(
+            base.copy(
+                activeSelection = active?.let {
+                    ActiveCameraSelectionReport(
+                        activeProfileRoutingKey = it.activeProfileRoutingKey,
+                        activeProfileFingerprint = it.activeProfileFingerprint,
+                        canonicalLensFingerprint = it.canonicalLensFingerprint,
+                        canonicalLensId = it.canonicalLensId,
+                        activeProfileFacing = it.activeProfileDescriptor?.facing ?: LensFacing.UNKNOWN,
+                        canonicalFacing = it.facing,
+                        selectionGeneration = it.selectionGeneration,
+                        sessionState = it.sessionState.javaClass.simpleName,
+                        verified = it.verified,
+                    )
+                },
+                cameraUi = CameraUiSelectionReport(
+                    normalVisibleFrontCount = selector.count { it.facing == LensFacing.FRONT },
+                    normalVisibleRearCount = selector.count { it.facing == LensFacing.BACK },
+                    cameraUiFacing = projection.activeFacing,
+                    cameraUiLensCount = projection.lenses.size,
+                    selectedCanonicalFingerprint = projection.selectedFingerprint,
+                    switchFacingTarget = projection.switchTarget,
+                    switchFacingEnabled = projection.switchEnabled,
+                ),
+            ),
         )
     }
 
