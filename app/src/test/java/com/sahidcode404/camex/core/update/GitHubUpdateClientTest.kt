@@ -17,6 +17,8 @@ class GitHubUpdateClientTest {
     private val signer = "a".repeat(64)
     private val manifestUrl = "https://github.com/sahid-code404/CameX/releases/download/v0.1.2/release-manifest.json"
     private val apkUrl = "https://github.com/sahid-code404/CameX/releases/download/v0.1.2/Camera-0.1.2.apk"
+    private val devManifestUrl = "https://github.com/sahid-code404/CameX/releases/download/dev-latest/dev-manifest.json"
+    private val devApkUrl = "https://github.com/sahid-code404/CameX/releases/download/dev-latest/Camera-dev.apk"
 
     @Test
     fun `manifest parses and newer version is available`() = runTest {
@@ -27,6 +29,29 @@ class GitHubUpdateClientTest {
         assertTrue(result.update.apkUrl == apkUrl)
         assertTrue(result.update.manifest.versionName == "0.1.2")
         assertTrue(result.update.manifest.apkAssetName == "Camera-0.1.2.apk")
+    }
+
+    @Test
+    fun `development channel reads rolling dev latest assets`() = runTest {
+        val releaseJson = """{"assets":[{"name":"dev-manifest.json","browser_download_url":"$devManifestUrl"},{"name":"Camera-dev.apk","browser_download_url":"$devApkUrl"}]}"""
+        val manifestJson = """{"schema":1,"versionCode":1000296,"versionName":"0.2.0-dev.296","minSdk":23,"apkAssetName":"Camera-dev.apk","sha256":"${"b".repeat(64)}","signingCertSha256":"$signer","gitSha":"abcdef123456","buildTimestamp":"2026-08-24T00:00:00Z","changelog":"dev build","mandatory":false}"""
+        val transport = FakeTransport(
+            mapOf(
+                GitHubUpdateClient.DEVELOPMENT_RELEASE_URL to releaseJson,
+                devManifestUrl to manifestJson,
+            ),
+        )
+        val client = GitHubUpdateClient(
+            temporaryFolder.root,
+            transport = transport,
+            channel = UpdateChannel.DEVELOPMENT,
+        )
+        val result = client.check(installed(versionCode = 1000295))
+        assertTrue(result is UpdateCheckResult.Available)
+        result as UpdateCheckResult.Available
+        assertTrue(result.update.apkUrl == devApkUrl)
+        assertTrue(result.update.manifest.gitSha == "abcdef123456")
+        assertTrue(result.update.manifest.apkAssetName == "Camera-dev.apk")
     }
 
     @Test
