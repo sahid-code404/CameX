@@ -12,6 +12,7 @@ import com.sahidcode404.camex.core.camera.topology.CameraTopologyResolver
 import com.sahidcode404.camex.core.camera.topology.TopologyReconciliationMode
 import com.sahidcode404.camex.core.camera.topology.profile
 import com.sahidcode404.camex.core.camera.topology.withProfileTrust
+import com.sahidcode404.camex.core.camera.topology.withUniqueCanonicalFingerprints
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -47,7 +48,7 @@ class CameraTopologyRepository(
             evidence = emptyList(),
             cachedTopology = cached,
             mode = TopologyReconciliationMode.CACHE_BOOTSTRAP,
-        ).withTrust(trust)
+        ).publishableWithTrust(trust)
         mutableTopology.value = resolved
         resolved
     }
@@ -93,7 +94,7 @@ class CameraTopologyRepository(
                     CameraTrustPolicy.merge(profile.trust, observation),
                 )
             },
-        )
+        ).withUniqueCanonicalFingerprints()
         mutableTopology.value
     }
 
@@ -102,7 +103,7 @@ class CameraTopologyRepository(
         topology: CameraTopology,
         trust: CameraTrustSnapshot,
     ) = updateMutex.withLock {
-        bootstrapCache = topology
+        bootstrapCache = topology.withUniqueCanonicalFingerprints()
         trustSnapshot = trust
     }
 
@@ -127,13 +128,18 @@ class CameraTopologyRepository(
             evidence = liveEvidence.values,
             cachedTopology = bootstrapCache,
             mode = mode,
-        ).withTrust(trustSnapshot)
+        ).publishableWithTrust(trustSnapshot)
         mutableTopology.value = resolved
         return resolved
     }
 
-    private fun CameraTopology.withTrust(snapshot: CameraTrustSnapshot?): CameraTopology =
-        snapshot?.let { CameraTrustPolicy.apply(it, this) } ?: this
+    /** Collision repair precedes trust application so old ambiguous trust cannot attach to a new lens. */
+    private fun CameraTopology.publishableWithTrust(
+        snapshot: CameraTrustSnapshot?,
+    ): CameraTopology {
+        val unique = withUniqueCanonicalFingerprints()
+        return snapshot?.let { CameraTrustPolicy.apply(it, unique) } ?: unique
+    }
 
     private fun emptyTopology() = CameraTopology(environmentFingerprint = environmentFingerprint)
 
