@@ -8,6 +8,7 @@ import com.sahidcode404.camex.core.update.ApkInstaller
 import com.sahidcode404.camex.core.update.ApkVerifier
 import com.sahidcode404.camex.core.update.GitHubUpdateClient
 import com.sahidcode404.camex.core.update.InstalledAppInfoReader
+import com.sahidcode404.camex.core.update.UpdateAutoChecker
 import com.sahidcode404.camex.core.update.UpdateCheckResult
 import com.sahidcode404.camex.core.update.UpdateException
 import com.sahidcode404.camex.core.update.UpdateState
@@ -21,11 +22,12 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
-/** Manual OTA only. Constructing this ViewModel performs no network request. */
+/** Simple GitHub Release OTA, including the same 12-hour open-time auto-check as Universal_Camera. */
 class UpdateViewModel(application: Application) : AndroidViewModel(application) {
     private val appContext = application.applicationContext
     private val installed = InstalledAppInfoReader.read(appContext)
     private val client = GitHubUpdateClient(appContext.cacheDir)
+    private val autoChecker = UpdateAutoChecker(appContext, client, installed)
     private val verifier = ApkVerifier(AndroidApkInspector(appContext), installed)
     private val mutableState = MutableStateFlow(
         UpdateUiState(
@@ -41,6 +43,23 @@ class UpdateViewModel(application: Application) : AndroidViewModel(application) 
     fun refreshInstallPermission() {
         mutableState.update {
             it.copy(installPermissionGranted = ApkInstaller.canRequestInstalls(appContext))
+        }
+    }
+
+    /**
+     * Mirrors Universal_Camera: when the app opens, check only if 12 hours have elapsed.
+     * Only an available update is surfaced; background up-to-date/failure results stay quiet.
+     */
+    fun checkForUpdatesIfDue() {
+        if (operationJob?.isActive == true) return
+        operationJob = viewModelScope.launch {
+            when (val result = autoChecker.checkIfDue()) {
+                is UpdateCheckResult.Available -> {
+                    readyApk = null
+                    mutableState.update { it.copy(updateState = UpdateState.Available(result.update)) }
+                }
+                else -> Unit
+            }
         }
     }
 
