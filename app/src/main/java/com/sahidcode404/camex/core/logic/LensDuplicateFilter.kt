@@ -1,6 +1,5 @@
 package com.sahidcode404.camex.core.logic
 
-import com.sahidcode404.camex.core.model.FingerprintStrategy
 import com.sahidcode404.camex.core.model.LensDescriptor
 import com.sahidcode404.camex.core.model.LensFacing
 import com.sahidcode404.camex.core.model.LensUsability
@@ -11,8 +10,9 @@ data class DuplicateLensGroup(
 )
 
 /**
- * Exact-identity safety net only. Cross-route optical canonicalization belongs exclusively to
- * CameraTopologyResolver; this UI layer must never compare optical metadata heuristically.
+ * Exact routing/physical-identity safety net only. Cross-route optical canonicalization belongs
+ * exclusively to CameraTopologyResolver. A duplicated stable fingerprint between distinct routes is
+ * a topology invariant failure and must remain visible rather than being silently hidden here.
  */
 object LensDuplicateFilter {
     fun filterForSelector(lenses: List<LensDescriptor>): List<LensDescriptor> =
@@ -62,14 +62,6 @@ object LensDuplicateFilter {
             left.facing != right.facing
         ) return false
         if (left.identity.routingKey == right.identity.routingKey) return true
-
-        val leftFingerprint = left.fingerprint
-        val rightFingerprint = right.fingerprint
-        if (leftFingerprint != null && rightFingerprint != null &&
-            leftFingerprint.strategy == FingerprintStrategy.STABLE_METADATA &&
-            rightFingerprint.strategy == FingerprintStrategy.STABLE_METADATA &&
-            leftFingerprint.value == rightFingerprint.value
-        ) return true
 
         val leftPhysical = left.identity.physicalCameraId?.takeIf(String::isNotBlank)
         val rightPhysical = right.identity.physicalCameraId?.takeIf(String::isNotBlank)
