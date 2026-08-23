@@ -151,7 +151,7 @@ class FailoverCameraSessionControllerTest {
                 selectedRoutingKey = key,
                 lastError = null,
             )
-            when (outcomes[lens.identity.openCameraId]?.removeFirstOrNull() ?: Outcome.SUCCESS) {
+            when (outcomes[lens.identity.openCameraId]?.pollFirst() ?: Outcome.SUCCESS) {
                 Outcome.SUCCESS -> {
                     mutableState.value = CameraSessionState.Previewing(key, Size2D(1920, 1080))
                     events.emit(CameraSessionEvent.PreviewVerified(key))
