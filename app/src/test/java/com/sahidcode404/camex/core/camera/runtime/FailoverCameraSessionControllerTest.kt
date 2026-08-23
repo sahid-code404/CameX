@@ -16,6 +16,7 @@ import com.sahidcode404.camex.core.model.LensUsability
 import com.sahidcode404.camex.core.model.ProbeFailureKind
 import com.sahidcode404.camex.core.model.Size2D
 import java.util.ArrayDeque
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -27,6 +28,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class FailoverCameraSessionControllerTest {
     @Test
     fun `structural failures attempt each profile once until sibling succeeds`() = runTest {
@@ -112,6 +114,52 @@ class FailoverCameraSessionControllerTest {
         assertFalse(delegate.openedIds.takeLast(2) == listOf("b", "a") && delegate.openedIds.size > 3)
     }
 
+    @Test
+    fun `fresh canonical selection opens preferred profile first`() = runTest {
+        val delegate = FakeSessionController(
+            outcomes = mapOf("b" to ArrayDeque(listOf(Outcome.SUCCESS))),
+        )
+        val controller = FailoverCameraSessionController(delegate, backgroundScope)
+        val rejectedAlias = profile("a")
+        val preferred = profile("b", pixelWidth = 4000)
+        controller.updateAvailableLenses(listOf(preferred, rejectedAlias))
+        advanceUntilIdle()
+
+        val canonicalDescriptor = preferred.copy(
+            capabilities = preferred.capabilities.copy(pixelArraySize = Size2D(8000, 6000)),
+        )
+        controller.open(canonicalDescriptor)
+        advanceUntilIdle()
+
+        assertEquals(listOf("b"), delegate.openedIds)
+        assertEquals(4000, delegate.openedLenses.single().capabilities.pixelArraySize?.width)
+    }
+
+    @Test
+    fun `verified preview terminates attempt and stale structural event cannot trigger failover`() = runTest {
+        val delegate = FakeSessionController(
+            outcomes = mapOf(
+                "a" to ArrayDeque(listOf(Outcome.SUCCESS, Outcome.SUCCESS)),
+                "b" to ArrayDeque(listOf(Outcome.SUCCESS)),
+            ),
+        )
+        val controller = FailoverCameraSessionController(delegate, backgroundScope)
+        val profiles = listOf(profile("a"), profile("b"))
+        controller.updateAvailableLenses(profiles)
+        advanceUntilIdle()
+
+        controller.open(profiles.first())
+        advanceUntilIdle()
+        controller.open(profiles.first())
+        advanceUntilIdle()
+
+        delegate.emitStaleStructuralFailure(profiles.first())
+        advanceUntilIdle()
+
+        assertEquals(listOf("a", "a"), delegate.openedIds)
+        assertTrue(controller.state.value is CameraSessionState.Previewing)
+    }
+
     private fun profile(id: String, pixelWidth: Int = 4000): LensDescriptor = LensDescriptor(
         identity = LensIdentity(publicCameraId = id),
         facing = LensFacing.BACK,
@@ -176,6 +224,17 @@ class FailoverCameraSessionControllerTest {
         override suspend fun resume() = Unit
         override fun close() {
             mutableState.value = CameraSessionState.Closed
+        }
+
+        suspend fun emitStaleStructuralFailure(lens: LensDescriptor) {
+            events.emit(
+                CameraSessionEvent.PreviewFailed(
+                    routingKey = lens.identity.routingKey,
+                    kind = ProbeFailureKind.SESSION_CONFIGURATION,
+                    structural = true,
+                    detail = "stale synthetic failure",
+                ),
+            )
         }
 
         private suspend fun fail(
