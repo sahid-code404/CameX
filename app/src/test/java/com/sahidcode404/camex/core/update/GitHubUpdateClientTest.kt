@@ -1,6 +1,7 @@
 package com.sahidcode404.camex.core.update
 
 import java.io.File
+import java.io.FileNotFoundException
 import java.io.IOException
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertFalse
@@ -26,6 +27,23 @@ class GitHubUpdateClientTest {
         assertTrue(result.update.apkUrl == apkUrl)
         assertTrue(result.update.manifest.versionName == "0.1.2")
         assertTrue(result.update.manifest.apkAssetName == "Camera-0.1.2.apk")
+    }
+
+    @Test
+    fun `repository with no published release is up to date`() = runTest {
+        val transport = object : UpdateTransport {
+            override suspend fun readText(url: String): String {
+                throw FileNotFoundException(url)
+            }
+
+            override suspend fun download(
+                url: String,
+                destination: File,
+                onProgress: suspend (Long, Long?) -> Unit,
+            ) = error("download not expected")
+        }
+        val result = GitHubUpdateClient(temporaryFolder.root, transport).check(installed())
+        assertTrue(result is UpdateCheckResult.UpToDate)
     }
 
     @Test
