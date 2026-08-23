@@ -21,7 +21,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -42,10 +42,10 @@ class FailoverCameraSessionControllerTest {
         val controller = FailoverCameraSessionController(delegate, backgroundScope)
         val profiles = listOf(profile("a"), profile("b"), profile("c"))
         controller.updateAvailableLenses(profiles)
-        advanceUntilIdle()
+        runCurrent()
 
         controller.open(profiles.first())
-        advanceUntilIdle()
+        runCurrent()
 
         assertEquals(listOf("a", "b", "c"), delegate.openedIds)
         assertEquals(3, delegate.openedIds.distinct().size)
@@ -61,10 +61,10 @@ class FailoverCameraSessionControllerTest {
         val controller = FailoverCameraSessionController(delegate, backgroundScope)
         val profiles = listOf(profile("a"), profile("b"), profile("c"))
         controller.updateAvailableLenses(profiles)
-        advanceUntilIdle()
+        runCurrent()
 
         controller.open(profiles.first())
-        advanceUntilIdle()
+        runCurrent()
 
         assertEquals(listOf("a"), delegate.openedIds)
         assertTrue(controller.state.value is CameraSessionState.ErrorRecoverable)
@@ -78,13 +78,13 @@ class FailoverCameraSessionControllerTest {
         val controller = FailoverCameraSessionController(delegate, backgroundScope)
         val exactProfile = profile("preferred", pixelWidth = 4000)
         controller.updateAvailableLenses(listOf(exactProfile))
-        advanceUntilIdle()
+        runCurrent()
 
         val canonicalDescriptor = exactProfile.copy(
             capabilities = exactProfile.capabilities.copy(pixelArraySize = Size2D(8000, 6000)),
         )
         controller.open(canonicalDescriptor)
-        advanceUntilIdle()
+        runCurrent()
 
         assertEquals(4000, delegate.openedLenses.single().capabilities.pixelArraySize?.width)
     }
@@ -100,15 +100,15 @@ class FailoverCameraSessionControllerTest {
         val controller = FailoverCameraSessionController(delegate, backgroundScope)
         val profiles = listOf(profile("a"), profile("b"))
         controller.updateAvailableLenses(profiles)
-        advanceUntilIdle()
+        runCurrent()
 
         controller.open(profiles.first())
-        advanceUntilIdle()
+        runCurrent()
         assertEquals(listOf("a", "b"), delegate.openedIds)
         assertTrue(controller.state.value is CameraSessionState.ErrorRecoverable)
 
         controller.open(profiles.first())
-        advanceUntilIdle()
+        runCurrent()
         assertEquals(listOf("a", "b", "a"), delegate.openedIds)
         assertTrue(controller.state.value is CameraSessionState.Previewing)
         assertFalse(delegate.openedIds.takeLast(2) == listOf("b", "a") && delegate.openedIds.size > 3)
@@ -123,13 +123,13 @@ class FailoverCameraSessionControllerTest {
         val rejectedAlias = profile("a")
         val preferred = profile("b", pixelWidth = 4000)
         controller.updateAvailableLenses(listOf(preferred, rejectedAlias))
-        advanceUntilIdle()
+        runCurrent()
 
         val canonicalDescriptor = preferred.copy(
             capabilities = preferred.capabilities.copy(pixelArraySize = Size2D(8000, 6000)),
         )
         controller.open(canonicalDescriptor)
-        advanceUntilIdle()
+        runCurrent()
 
         assertEquals(listOf("b"), delegate.openedIds)
         assertEquals(4000, delegate.openedLenses.single().capabilities.pixelArraySize?.width)
@@ -146,15 +146,15 @@ class FailoverCameraSessionControllerTest {
         val controller = FailoverCameraSessionController(delegate, backgroundScope)
         val profiles = listOf(profile("a"), profile("b"))
         controller.updateAvailableLenses(profiles)
-        advanceUntilIdle()
+        runCurrent()
 
         controller.open(profiles.first())
-        advanceUntilIdle()
+        runCurrent()
         controller.open(profiles.first())
-        advanceUntilIdle()
+        runCurrent()
 
         delegate.emitStaleStructuralFailure(profiles.first())
-        advanceUntilIdle()
+        runCurrent()
 
         assertEquals(listOf("a", "a"), delegate.openedIds)
         assertTrue(controller.state.value is CameraSessionState.Previewing)
