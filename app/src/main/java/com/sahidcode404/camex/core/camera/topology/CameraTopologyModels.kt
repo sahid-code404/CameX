@@ -234,6 +234,20 @@ data class OpticalLensSignature(
     val diagonalFieldOfViewDegrees: Double? = null,
 )
 
+/** Persisted pairwise reasoning so hardware reports can explain both merges and non-merges. */
+@Serializable
+data class OpticalGroupingComparisonRecord(
+    val leftProfileId: String,
+    val rightProfileId: String,
+    val leftProfileFingerprint: String,
+    val rightProfileFingerprint: String,
+    val match: String,
+    val score: Int,
+    val evidenceFamilies: List<String> = emptyList(),
+    val positiveReasons: List<String> = emptyList(),
+    val negativeReasons: List<String> = emptyList(),
+)
+
 @Serializable
 data class CanonicalLens(
     val canonicalLensId: String,
@@ -334,7 +348,7 @@ data class CameraRoute(
     fun toCanonicalLens(): CanonicalLens {
         val fingerprint = requireNotNull(lensFingerprint) { "Canonical lens requires a fingerprint" }
         return CanonicalLens(
-            canonicalLensId = "cl2_${fingerprint.value}",
+            canonicalLensId = "cl3_${fingerprint.value}",
             lensFingerprint = fingerprint,
             facing = minimalMetadata.facing,
             minimalMetadata = minimalMetadata,
@@ -402,6 +416,7 @@ data class CameraTopology(
     val environmentFingerprint: CameraEnvironmentFingerprint,
     val routes: List<CameraRoute> = emptyList(),
     val logicalRelationships: List<LogicalCameraRelationship> = emptyList(),
+    val groupingComparisons: List<OpticalGroupingComparisonRecord> = emptyList(),
 ) {
     val canonicalLenses: List<CanonicalLens>
         get() = routes.mapNotNull { route ->
@@ -409,8 +424,10 @@ data class CameraTopology(
         }
 
     companion object {
-        const val CURRENT_SCHEMA_VERSION = 2
-        const val CACHE_SCHEMA_VERSION = 2
+        // v3 invalidates the over-merged Phase 1B topology/fingerprint cache. A corrected build must
+        // rediscover rather than boot a stale single-Wide canonical topology.
+        const val CURRENT_SCHEMA_VERSION = 3
+        const val CACHE_SCHEMA_VERSION = 3
         const val DISCOVERY_SCHEMA_VERSION = 3
     }
 }
