@@ -28,13 +28,14 @@ readonly MANIFEST=app/src/main/AndroidManifest.xml
 readonly CAMERA_VM=app/src/main/java/com/sahidcode404/camex/CameraViewModel.kt
 readonly MAIN_ACTIVITY=app/src/main/java/com/sahidcode404/camex/MainActivity.kt
 readonly CLIENT=app/src/main/java/com/sahidcode404/camex/core/update/GitHubUpdateClient.kt
+readonly AUTO_CHECKER=app/src/main/java/com/sahidcode404/camex/core/update/UpdateAutoChecker.kt
 readonly VERIFIER=app/src/main/java/com/sahidcode404/camex/core/update/ApkVerifier.kt
 readonly INSTALLER=app/src/main/java/com/sahidcode404/camex/core/update/ApkInstaller.kt
 readonly MODELS=app/src/main/java/com/sahidcode404/camex/core/update/UpdateModels.kt
 readonly UPDATE_VM=app/src/main/java/com/sahidcode404/camex/feature/update/UpdateViewModel.kt
 readonly RELEASE_WORKFLOW=.github/workflows/release.yml
 
-for file in "$CLIENT" "$VERIFIER" "$INSTALLER" "$MODELS" "$UPDATE_VM" "$RELEASE_WORKFLOW"; do
+for file in "$CLIENT" "$AUTO_CHECKER" "$VERIFIER" "$INSTALLER" "$MODELS" "$UPDATE_VM" "$RELEASE_WORKFLOW"; do
   [[ -f "$file" ]] || { echo "OTA requirement missing: $file" >&2; failures=$((failures + 1)); }
 done
 
@@ -75,6 +76,10 @@ require_literal "FileProvider installer" 'FileProvider.getUriForFile' "$INSTALLE
 require_literal "Android installer intent" 'Intent.ACTION_VIEW' "$INSTALLER"
 require_literal "unknown-source check" 'canRequestPackageInstalls()' "$INSTALLER"
 require_literal "manual update action" 'fun checkForUpdates()' "$UPDATE_VM"
+require_literal "automatic due update action" 'fun checkForUpdatesIfDue()' "$UPDATE_VM"
+require_literal "12-hour automatic checker" '12L * 60L * 60L * 1000L' "$AUTO_CHECKER"
+require_literal "automatic check persistence" 'last_check_ms' "$AUTO_CHECKER"
+require_literal "automatic check on app open" 'updateViewModel.checkForUpdatesIfDue()' "$MAIN_ACTIVITY"
 
 require_literal "tag push trigger" "tags: [ 'v*' ]" "$RELEASE_WORKFLOW"
 require_literal "release contents permission" 'contents: write' "$RELEASE_WORKFLOW"
@@ -102,12 +107,6 @@ reject_literal "extra checksum release asset" 'SHA256SUMS.txt' "$RELEASE_WORKFLO
 
 if grep -Eq '\b(UpdateRepository|UpdateDownloader|HttpURLConnection|checkForUpdates|ApkInstaller)\b' "$CAMERA_VM"; then
   echo 'OTA simplification violation: CameraViewModel depends on OTA code' >&2
-  failures=$((failures + 1))
-fi
-
-startup_block="$(perl -0777 -ne 'while(/override\s+fun\s+(?:onCreate|onStart)\b.*?\{(.*?)\n\s*\}/sg){print $1,"\n"}' "$MAIN_ACTIVITY")"
-if grep -Eq '\bcheckForUpdates\b|releases/latest|HttpURLConnection' <<<"$startup_block"; then
-  echo 'OTA simplification violation: update network request entered startup callbacks' >&2
   failures=$((failures + 1))
 fi
 
