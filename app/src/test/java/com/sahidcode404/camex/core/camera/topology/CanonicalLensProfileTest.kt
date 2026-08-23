@@ -39,7 +39,7 @@ class CanonicalLensProfileTest {
         assertEquals(3, lens.profiles.size)
         assertEquals(1, topology.canonicalLenses.size)
         assertEquals(3, topology.canonicalLenses.single().profiles.size)
-        assertTrue(lens.lensFingerprint?.value.orEmpty().startsWith("ol3_"))
+        assertTrue(lens.lensFingerprint?.value.orEmpty().startsWith("ol4_"))
     }
 
     @Test
