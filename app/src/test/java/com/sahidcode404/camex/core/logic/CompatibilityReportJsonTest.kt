@@ -25,12 +25,14 @@ import com.sahidcode404.camex.core.model.LensCapabilities
 import com.sahidcode404.camex.core.model.LensFingerprint
 import com.sahidcode404.camex.core.model.LensProbeResult
 import com.sahidcode404.camex.core.model.LogicalRelationshipReport
+import com.sahidcode404.camex.core.model.OpticalGroupingComparisonReport
 import com.sahidcode404.camex.core.model.PhysicalSize
 import com.sahidcode404.camex.core.model.ProbeOutcome
 import com.sahidcode404.camex.core.model.ProbeReportEntry
 import com.sahidcode404.camex.core.model.ProbeStage
 import com.sahidcode404.camex.core.model.ProbeStageResult
 import com.sahidcode404.camex.core.model.RouteTrustReport
+import com.sahidcode404.camex.core.model.SensorRect
 import com.sahidcode404.camex.core.model.Size2D
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -50,6 +52,16 @@ class CompatibilityReportJsonTest {
             durability = "STRUCTURAL",
             detail = "synthetic alias failure",
         )
+        val grouping = OpticalGroupingComparisonReport(
+            leftProfileId = "profile-a",
+            rightProfileId = "profile-b",
+            leftProfileFingerprint = "cp2_a",
+            rightProfileFingerprint = "cp2_b",
+            match = "STRONG_MATCH",
+            score = 93,
+            evidenceFamilies = listOf("GEOMETRY", "OPTICAL", "SENSOR"),
+            positiveReasons = listOf("focal length strongly agrees", "RAW dimensions agree"),
+        )
         val report = CompatibilityReport(
             generatedAtUtc = "2026-08-23T12:00:00Z",
             device = DeviceReport(
@@ -66,8 +78,8 @@ class CompatibilityReportJsonTest {
             ),
             environment = CameraEnvironmentReport(
                 stableKey = "ce1_sha256digest",
-                cacheSchemaVersion = 2,
-                topologySchemaVersion = 2,
+                cacheSchemaVersion = 3,
+                topologySchemaVersion = 3,
                 discoverySchemaVersion = 3,
                 apiLevel = 37,
                 advertisedTopologySignature = "ca1_topologydigest",
@@ -118,14 +130,14 @@ class CompatibilityReportJsonTest {
                 ),
             ),
             canonicalTopology = CanonicalTopologyReport(
-                schemaVersion = 2,
+                schemaVersion = 3,
                 routeCount = 1,
-                canonicalRouteIds = listOf("cl2_${fingerprint.value}"),
+                canonicalRouteIds = listOf("cl3_${fingerprint.value}"),
                 profileCount = 2,
             ),
             canonicalLenses = listOf(
                 CanonicalLensCompatibilityReport(
-                    canonicalLensId = "cl2_${fingerprint.value}",
+                    canonicalLensId = "cl3_${fingerprint.value}",
                     opticalFingerprint = fingerprint,
                     facing = lens.facing,
                     role = "PHOTOGRAPHIC_WIDE",
@@ -161,6 +173,16 @@ class CompatibilityReportJsonTest {
                             previewVerified = true,
                             rawAdvertised = "SUPPORTED",
                             rawStreamActuallyDeclared = "SUPPORTED",
+                            assignedCanonicalLensId = "cl3_${fingerprint.value}",
+                            focalLengthsMm = listOf(4.72),
+                            sensorPhysicalSize = PhysicalSize(7.2, 5.4),
+                            pixelArraySize = Size2D(4000, 3000),
+                            activeArray = SensorRect(0, 0, 4000, 3000),
+                            rawDimensions = listOf(Size2D(4000, 3000)),
+                            colorFilterArrangement = "RGGB",
+                            sensorOrientationDegrees = 90,
+                            apertures = listOf(1.8),
+                            groupingComparisons = listOf(grouping),
                         ),
                         CameraProfileCompatibilityReport(
                             profileId = "profile-b",
@@ -181,10 +203,13 @@ class CompatibilityReportJsonTest {
                             previewVerified = false,
                             rawAdvertised = "UNKNOWN",
                             rawStreamActuallyDeclared = "UNKNOWN",
+                            assignedCanonicalLensId = "cl3_${fingerprint.value}",
+                            groupingComparisons = listOf(grouping),
                         ),
                     ),
                 ),
             ),
+            opticalGrouping = listOf(grouping),
             cameras = listOf(
                 CameraCompatibilityEntry(
                     identity = lens.identity,
@@ -259,11 +284,15 @@ class CompatibilityReportJsonTest {
         val decoded = CompatibilityReportJson.decode(withFutureField)
 
         assertEquals(report, decoded)
-        assertTrue(encoded.contains("\"schemaVersion\": 3"))
+        assertTrue(encoded.contains("\"schemaVersion\": 4"))
         assertTrue(encoded.contains("\"canonicalLenses\""))
         assertTrue(encoded.contains("\"profiles\""))
         assertTrue(encoded.contains("\"profileFingerprint\": \"cp2_a\""))
         assertTrue(encoded.contains("\"groupingConfidence\": \"STRONG_MATCH\""))
+        assertTrue(encoded.contains("\"opticalGrouping\""))
+        assertTrue(encoded.contains("\"evidenceFamilies\""))
+        assertTrue(encoded.contains("\"assignedCanonicalLensId\""))
+        assertTrue(encoded.contains("\"rawDimensions\""))
         assertTrue(encoded.contains("\"startupTrace\""))
         assertTrue(encoded.contains("\"canonicalTopology\""))
         assertTrue(encoded.contains("\"rawStreamActuallyDeclared\": \"SUPPORTED\""))
@@ -280,6 +309,7 @@ class CompatibilityReportJsonTest {
         assertEquals(1, decoded.schemaVersion)
         assertTrue(decoded.canonicalTopology.canonicalRouteIds.isEmpty())
         assertTrue(decoded.canonicalLenses.isEmpty())
+        assertTrue(decoded.opticalGrouping.isEmpty())
         assertTrue(decoded.startupTrace.offsetsNs.isEmpty())
         assertEquals("NOT_STARTED", decoded.javaDiscovery.status)
     }
