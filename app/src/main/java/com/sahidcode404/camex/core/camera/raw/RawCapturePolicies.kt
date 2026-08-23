@@ -2,6 +2,7 @@ package com.sahidcode404.camex.core.camera.raw
 
 import com.sahidcode404.camex.core.camera.topology.CameraProfile
 import com.sahidcode404.camex.core.camera.topology.CameraProfileSelector
+import com.sahidcode404.camex.core.camera.topology.CameraRawTrust
 import com.sahidcode404.camex.core.camera.topology.CameraRoute
 import com.sahidcode404.camex.core.model.LensFingerprint
 import com.sahidcode404.camex.core.model.StreamFormat
@@ -18,6 +19,10 @@ object RawProfileFailoverPolicy {
             ?: return emptyList()
         return CameraProfileSelector.ordered(route.profiles)
             .filterNot { it.profileFingerprint in attemptedProfileFingerprints }
+            .filterNot {
+                it.rawTrust == CameraRawTrust.RAW_REJECTED ||
+                    it.rawTrust == CameraRawTrust.NOT_ADVERTISED
+            }
             .filter(::hasRawPotential)
     }
 
