@@ -1,6 +1,7 @@
 package com.sahidcode404.camex.core.camera.topology
 
 import com.sahidcode404.camex.core.model.CapabilitySupport
+import com.sahidcode404.camex.core.model.LensIdentity
 
 /** Evidence-based transport selection for one canonical optical lens. */
 object CameraProfileSelector {
@@ -122,11 +123,18 @@ object CanonicalLensTrustAggregator {
     }
 }
 
+/** Exact routing key emitted by LensDescriptor/CameraSessionController for this profile. */
+fun CameraProfile.sessionRoutingKey(): String = LensIdentity(
+    publicCameraId = openCameraId,
+    physicalCameraId = streamPhysicalCameraId,
+    logicalParentCameraId = logicalParentCameraId,
+).routingKey
+
 fun CameraRoute.profile(profileId: String): CameraProfile? =
     profiles.firstOrNull { it.profileId == profileId }
 
 fun CameraRoute.profileForRoutingKey(routingKey: String): CameraProfile? =
-    profiles.firstOrNull { it.routingKey == routingKey }
+    profiles.firstOrNull { it.sessionRoutingKey() == routingKey }
 
 /** Change preferred transport only; optical metadata/fingerprint and aggregate lens trust remain. */
 fun CameraRoute.promoteProfile(profileId: String): CameraRoute {
