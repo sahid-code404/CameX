@@ -63,10 +63,12 @@ data class DiagnosticsUiState(
 @Composable
 fun DiagnosticsScreen(
     state: DiagnosticsUiState,
+    otaSummary: List<DiagnosticField>,
     onBack: () -> Unit,
     onNormalRescan: () -> Unit,
     onDeepRescan: () -> Unit,
     onResetDiscoveryCache: () -> Unit,
+    onOpenUpdates: () -> Unit,
     onExport: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -104,6 +106,12 @@ fun DiagnosticsScreen(
                             Text("Export JSON")
                         }
                         Button(
+                            onClick = onOpenUpdates,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("Updates")
+                        }
+                        Button(
                             onClick = onNormalRescan,
                             modifier = Modifier.fillMaxWidth(),
                         ) {
@@ -128,6 +136,9 @@ fun DiagnosticsScreen(
 
             if (state.buildSummary.isNotEmpty()) {
                 item { DiagnosticSection("App and device", state.buildSummary) }
+            }
+            if (otaSummary.isNotEmpty()) {
+                item { DiagnosticSection("Development OTA", otaSummary) }
             }
             if (state.nativeSummary.isNotEmpty()) {
                 item { DiagnosticSection("Native foundation", state.nativeSummary) }
