@@ -1,64 +1,65 @@
 # CameX GitHub OTA updates
 
-## Design
+## Scope
 
-CameX uses one simple GitHub Release OTA path:
+CameX uses the same simple GitHub Release OTA shape as `sahid-code404/Universal_Camera`:
 
-`vX.Y.Z tag → GitHub Actions → signed APK + release-manifest.json → GitHub Release → Camera checks /releases/latest → verify → Android installer`
+`git tag vX.Y.Z → git push origin vX.Y.Z → GitHub Actions → signed APK + release-manifest.json → GitHub Release → Camera checks /releases/latest → download → verify → Android installer`
 
-There is one updater, one release workflow, one manifest schema, one application ID, and one stable development signing identity.
-
-Camera startup is not part of this flow. No update network request is made by `CameraViewModel`, camera discovery, canonical lens grouping, profile failover, or preview startup.
+Camera startup is not part of this flow. Phase 1C uses manual update checks only.
 
 ## Release command
 
-Normal releases are created from `main`:
+After Phase 1C is accepted and merged, normal releases are:
 
 ```bash
 git switch main
 git pull
+
 git tag v0.1.1
 git push origin v0.1.1
 ```
 
-The next update is the same:
+Next release:
 
 ```bash
 git tag v0.1.2
 git push origin v0.1.2
 ```
 
-The tag must be exactly `vMAJOR.MINOR.PATCH`. The workflow derives:
+The release workflow derives:
 
-- `versionName`: tag without `v`
-- `versionCode`: `major * 1,000,000 + minor * 1,000 + patch`
+- `versionName`: `${GITHUB_REF_NAME#v}`
+- `versionCode`: `${GITHUB_RUN_NUMBER}`
 
-The workflow refuses a tag whose derived versionCode is not newer than the existing `vX.Y.Z` tags.
+There is no semver versionCode allocator, candidate release flow, manual workflow dispatch, release database, or separate OTA channel.
 
 ## Repository secrets
 
-The release workflow uses exactly these ordinary repository-level GitHub Actions secrets:
+The release workflow uses the same four ordinary repository-level GitHub Actions secrets as `Universal_Camera`:
 
-- `CAMERA_DEV_KEYSTORE_BASE64`
-- `CAMERA_DEV_KEYSTORE_PASSWORD`
-- `CAMERA_DEV_KEY_ALIAS`
-- `CAMERA_DEV_KEY_PASSWORD`
+- `ANDROID_KEYSTORE_BASE64`
+- `ANDROID_KEYSTORE_PASSWORD`
+- `ANDROID_KEY_ALIAS`
+- `ANDROID_KEY_PASSWORD`
 
-No GitHub Environment is required. Never commit a keystore, passwords, or private keys, and never rotate the signing identity for routine updates.
+No GitHub Environment is required. The keystore is decoded only into runner temporary storage and referenced through `keystore.properties` for the release build.
+
+The workflow derives the public signing-certificate SHA-256 from the final signed APK, so no additional certificate secret or metadata-signing key is required.
 
 ## Release assets
 
-For `v0.1.1`, GitHub publishes exactly:
+Every release uploads exactly two OTA assets:
 
-- `Camera-0.1.1.apk`
-- `release-manifest.json`
+1. `Camera-<version>.apk`
+2. `release-manifest.json`
 
 Manifest schema:
 
 ```json
 {
   "schema": 1,
-  "versionCode": 1001,
+  "versionCode": 123,
   "versionName": "0.1.1",
   "minSdk": 23,
   "apkAssetName": "Camera-0.1.1.apk",
@@ -69,19 +70,29 @@ Manifest schema:
 }
 ```
 
-The workflow derives the public signing-certificate SHA-256 from the final APK after signing. No private signing material is placed in the manifest or app.
+`versionCode` is the GitHub Actions release workflow run number for that release.
 
-## App update check
+## Update check
 
 Diagnostics → Updates → Check for updates requests:
 
 `https://api.github.com/repos/sahid-code404/CameX/releases/latest`
 
-The updater finds `release-manifest.json`, parses schema 1, compares `versionCode`, and locates the APK by `manifest.apkAssetName`. Same or older releases are treated as up to date.
+The updater finds `release-manifest.json`, parses schema 1, compares `versionCode`, and locates the APK using `manifest.apkAssetName`.
 
-The APK is downloaded into `cacheDir/updates/` using a temporary `.part` file. It is never written to Photos or Downloads.
+If `manifest.versionCode <= installedVersionCode`, Camera is up to date. Otherwise the release is offered as an available update.
 
-Before installer handoff CameX verifies:
+There is no startup update check, WorkManager job, background polling, or automatic pre-preview OTA work.
+
+## Download and verification
+
+The APK downloads into app-private storage:
+
+`cacheDir/updates/`
+
+A `.part` file is used while the download is incomplete. After verification it is promoted to the final APK filename.
+
+Before Android installer handoff CameX verifies:
 
 - manifest schema is 1
 - candidate versionCode is newer than installed
@@ -89,41 +100,34 @@ Before installer handoff CameX verifies:
 - APK SHA-256 matches the manifest
 - APK package is `com.sahidcode404.camex`
 - APK versionCode matches the manifest
-- manifest signer matches the installed Camera signer
-- downloaded APK signer matches the installed Camera signer
+- downloaded APK signer matches the installed Camera signing certificate
+- manifest signing certificate matches the installed Camera signing certificate
 
-GitHub is transport. The Android application signing certificate is the trust anchor.
+The package/version/signer checks are the one intentional CameX improvement over the reference updater. They remain inside one small `ApkVerifier` rather than a separate OTA security framework.
 
 ## Installer
 
-CameX uses `FileProvider` + `Intent.ACTION_VIEW` with MIME type `application/vnd.android.package-archive` and read-URI permission. Android shows the normal package installer confirmation.
+CameX uses:
 
-On Android 8.0+ the app checks `PackageManager.canRequestPackageInstalls()`. If permission is missing, Updates opens `Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES` for Camera.
+- `FileProvider`
+- `Intent.ACTION_VIEW`
+- MIME type `application/vnd.android.package-archive`
+- `FLAG_GRANT_READ_URI_PERMISSION`
 
-There is no silent installation, root path, Shizuku path, Accessibility installer, hidden API, or PackageInstaller session state machine.
+On Android 8.0+ Camera checks `PackageManager.canRequestPackageInstalls()`. If permission is missing it opens `Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES` for Camera.
 
-## One-time stable base migration
+There is no PackageInstaller session framework and no silent installation path.
 
-A currently installed debug APK may use a different signing certificate. For the first stable OTA base this is acceptable:
+## Phase 1C acceptance boundary
 
-1. Uninstall the old debug Camera once if Android reports a signing conflict.
-2. Install the first stable signed `Camera-<version>.apk` manually.
-3. Do not rotate the signing key afterward.
+Keep PR #2 DRAFT until the real signed update-in-place path succeeds:
 
-All later `v*` releases signed by the same key can update that installation in place.
+1. install a stable-signed base release
+2. publish a later `vX.Y.Z` tag with the same signing key
+3. check from Diagnostics → Updates
+4. download and verify
+5. confirm Android installer handoff
+6. confirm app data survives
+7. confirm Phase 1B camera behavior and warm cached startup remain intact
 
-## Physical Phase 1C acceptance
-
-Example validation:
-
-1. Publish `v0.1.1` and install `Camera-0.1.1.apk` as the stable base.
-2. Use Camera and set lens names/visibility/order, rear 1× reference, and rear/front selections.
-3. Publish `v0.1.2` from the same source line and signing key.
-4. In 0.1.1 open Diagnostics → Updates → Check for updates.
-5. Confirm Camera 0.1.2 is offered.
-6. Download it and wait for verification.
-7. Tap Install update and confirm the Android installer.
-8. Reopen Camera and confirm app data remains intact.
-9. Confirm rear AUX cameras, front/rear switching, and warm cached startup still work.
-
-Keep Phase 1C PR #2 DRAFT until this physical update-in-place test succeeds. Do not start Phase 2 before Phase 1C acceptance.
+Do not start Phase 2 before Phase 1C acceptance.
