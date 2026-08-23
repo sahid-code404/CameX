@@ -35,7 +35,7 @@ jobs:
       - name: Verify camera architecture
         run: ./scripts/verify-camera-architecture.sh
 
-      - name: Verify development OTA architecture
+      - name: Verify simple OTA architecture
         run: bash scripts/verify-development-ota.sh
 
       - name: Validate Gradle wrapper
@@ -74,7 +74,7 @@ jobs:
             --tests 'com.sahidcode404.camex.core.logic.LensDuplicateFilterTest' \
             --tests 'com.sahidcode404.camex.core.logic.CompatibilitySelectionReportJsonTest'
 
-      - name: Run Phase 1C development OTA regressions
+      - name: Run Phase 1C OTA regressions
         run: |
           ./gradlew --no-daemon --stacktrace testDebugUnitTest \
             --tests 'com.sahidcode404.camex.core.update.*'
