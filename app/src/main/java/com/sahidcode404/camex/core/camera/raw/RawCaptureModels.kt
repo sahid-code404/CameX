@@ -19,6 +19,19 @@ enum class RawCapturePhase {
     FAILED,
 }
 
+enum class RawFailureKind {
+    CAPABILITY_UNAVAILABLE,
+    RAW_SIZE_UNAVAILABLE,
+    SESSION_CONFIGURATION,
+    CAPTURE_REQUEST_REJECTED,
+    CAPTURE_FAILED,
+    STALE_SELECTION,
+    DUPLICATE_CAPTURE,
+    TIMEOUT,
+    OUTPUT_WRITE,
+    UNKNOWN,
+}
+
 data class RawCapabilityInfo(
     val support: RawSupportState = RawSupportState.UNKNOWN,
     val availableSizes: List<Size2D> = emptyList(),
@@ -136,6 +149,7 @@ sealed interface RawCaptureResult {
         val reason: String,
         val structural: Boolean,
         val diagnostics: RawCaptureDiagnostics,
+        val failureKind: RawFailureKind = RawFailureKind.UNKNOWN,
     ) : RawCaptureResult
 }
 
