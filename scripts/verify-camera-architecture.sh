@@ -127,7 +127,11 @@ readonly TOPOLOGY_RESOLVER=app/src/main/java/com/sahidcode404/camex/core/camera/
 readonly OPTICAL_MATCHER=app/src/main/java/com/sahidcode404/camex/core/camera/topology/OpticalLensMatcher.kt
 readonly PROFILE_SELECTOR=app/src/main/java/com/sahidcode404/camex/core/camera/topology/CameraProfileSelector.kt
 readonly FAILOVER_CONTROLLER=app/src/main/java/com/sahidcode404/camex/core/camera/runtime/FailoverCameraSessionController.kt
+readonly ACTIVE_SELECTION=app/src/main/java/com/sahidcode404/camex/core/camera/runtime/ActiveCameraSelection.kt
+readonly SELECTION_POLICY=app/src/main/java/com/sahidcode404/camex/core/camera/runtime/CameraSelectionPolicy.kt
 readonly RUNTIME_COORDINATOR=app/src/main/java/com/sahidcode404/camex/core/camera/runtime/CameraRuntimeCoordinator.kt
+readonly TOPOLOGY_REPOSITORY=app/src/main/java/com/sahidcode404/camex/core/camera/runtime/CameraTopologyRepository.kt
+readonly COLLISION_GUARD=app/src/main/java/com/sahidcode404/camex/core/camera/topology/CanonicalFingerprintCollisionGuard.kt
 readonly VIEW_MODEL=app/src/main/java/com/sahidcode404/camex/CameraViewModel.kt
 readonly DUPLICATE_FILTER=app/src/main/java/com/sahidcode404/camex/core/logic/LensDuplicateFilter.kt
 readonly DIAGNOSTICS_SCREEN=app/src/main/java/com/sahidcode404/camex/feature/diagnostics/DiagnosticsScreen.kt
@@ -186,11 +190,25 @@ reject_pattern \
   '(?is)fun\s+(?:selectLens|switchFacing)\s*\([^)]*\)\s*\{.{0,1800}?\b(?:normalRescan|deepRescan|reconcile\s*\(|seedPrimaryRoute)\b' \
   --multiline --multiline-dotall "${VIEW_MODEL}"
 
-# Canonical topology owns optical identity. The UI duplicate filter may only use exact identity
-# safety nets; it must never grow a second focal/FOV/geometry based canonicalizer.
+reject_pattern \
+  "active camera defaults to back after failed resolution" \
+  '(?i)(?:selectedLens|selected|activeSelection)[^\n]{0,100}\?:\s*LensFacing\.BACK|firstOrNull\s*\(?.{0,80}?\)?\.facing\s*\?:\s*LensFacing\.BACK' \
+  "${VIEW_MODEL}"
+
+reject_pattern \
+  "bindPreview changes camera selection" \
+  '(?is)fun\s+bindPreview\s*\([^)]*\)\s*\{.{0,1000}?\b(?:PrimaryLensSelector|selectLens|switchFacing|runtimeCoordinator\.selectLens|controller\.(?:open|switchTo))\b' \
+  --multiline --multiline-dotall "${VIEW_MODEL}"
+
+# Canonical topology owns optical identity. The UI duplicate filter may only use exact routing or
+# physical identity; it must never grow another optical canonicalizer or hide fingerprint collisions.
 reject_pattern \
   "second heuristic optical canonicalization in LensDuplicateFilter" \
   '(?i)\b(?:focal|fieldOfView|sensorPhysical|pixelArray|activeArray|rawSize|aperture)\b' \
+  "${DUPLICATE_FILTER}"
+reject_pattern \
+  "stable fingerprint collision hidden by LensDuplicateFilter" \
+  '\bSTABLE_METADATA\b' \
   "${DUPLICATE_FILTER}"
 
 require_pattern "runtime coordinator" '\bclass CameraRuntimeCoordinator\b' app/src/main
@@ -218,13 +236,28 @@ require_pattern "route matcher delegates to optical signatures" 'compare\s*\(\s*
 require_pattern "complete-link optical clustering" 'comparisons\.any\s*\{\s*it\.match\s*!=\s*OpticalLensMatch\.STRONG_MATCH\s*\}' "${TOPOLOGY_RESOLVER}"
 require_pattern "grouping comparisons persisted" '\bgroupingComparisons\s*=\s*groupingComparisons\b' "${TOPOLOGY_RESOLVER}"
 require_pattern "profile selector" '\bobject CameraProfileSelector\b' "${PROFILE_SELECTOR}"
+require_pattern "session-compatible profile routing key" '\bfun\s+CameraProfile\.sessionRoutingKey\s*\(' "${PROFILE_SELECTOR}"
+require_pattern "profile lookup uses session routing key" '\bsessionRoutingKey\s*\(\s*\)\s*==\s*routingKey\b' "${PROFILE_SELECTOR}"
 require_pattern "bounded profile failover controller" '\bclass FailoverCameraSessionController\b' "${FAILOVER_CONTROLLER}"
 require_pattern "failover resolves exact profile descriptor" '\bprofileForRoutingKey\s*\(\s*lens\.identity\.routingKey\s*\)' "${FAILOVER_CONTROLLER}"
+require_pattern "authoritative active camera selection" '\bdata class ActiveCameraSelection\b' "${ACTIVE_SELECTION}"
+require_pattern "canonical profile resolver" '\bobject CanonicalLensResolver\b' "${ACTIVE_SELECTION}"
+require_pattern "verified selection tracker" '\bclass ActiveCameraSelectionTracker\b' "${ACTIVE_SELECTION}"
+require_pattern "stale preview generation route check" 'sessionSnapshot\.selectedRoutingKey\s*!=\s*routingKey' "${ACTIVE_SELECTION}"
+require_pattern "binary rear to front target" 'LensFacing\.BACK\s*->\s*LensFacing\.FRONT' "${SELECTION_POLICY}"
+require_pattern "binary front to rear target" 'LensFacing\.FRONT\s*->\s*LensFacing\.BACK' "${SELECTION_POLICY}"
 require_pattern "runtime receives profile descriptors" '\bCameraRoute::profileLensDescriptors\b' "${RUNTIME_COORDINATOR}"
+require_pattern "runtime publishes active selection" '\bval\s+activeSelection:\s*StateFlow<ActiveCameraSelection\?>' "${RUNTIME_COORDINATOR}"
 require_pattern "profile-specific trust update" '\bwithProfileTrust\s*\(' app/src/main
+require_pattern "canonical fingerprint collision guard" '\bfun\s+CameraTopology\.withUniqueCanonicalFingerprints\s*\(' "${COLLISION_GUARD}"
+require_pattern "topology repository repairs collisions before publish" '\bwithUniqueCanonicalFingerprints\s*\(' "${TOPOLOGY_REPOSITORY}"
+require_pattern "selection-neutral preview bind" 'launchSafely\s*\{\s*controller\.bindPreview\s*\(\s*view\s*\)\s*\}' "${VIEW_MODEL}"
+require_pattern "canonical last-selection persistence" 'settingsStore\.setLastSelected\s*\(\s*selection\.facing\s*,\s*fingerprint\s*\)' "${VIEW_MODEL}"
 require_pattern "profile diagnostics UI model" '\bdata class CameraProfileDiagnosticsUiModel\b' "${DIAGNOSTICS_SCREEN}"
 require_pattern "nested canonical lens compatibility report" '\bdata class CanonicalLensCompatibilityReport\b' "${COMPATIBILITY_REPORT}"
 require_pattern "nested camera profile compatibility report" '\bdata class CameraProfileCompatibilityReport\b' "${COMPATIBILITY_REPORT}"
+require_pattern "active selection compatibility report" '\bdata class ActiveCameraSelectionReport\b' "${COMPATIBILITY_REPORT}"
+require_pattern "camera UI compatibility report" '\bdata class CameraUiSelectionReport\b' "${COMPATIBILITY_REPORT}"
 require_pattern "compatibility export populates canonical lenses" '\bcanonicalLenses\s*=\s*canonicalLensReports\b' "${COMPATIBILITY_FACTORY}"
 require_pattern "cache schema v3" '\bCACHE_SCHEMA_VERSION\s*=\s*3\b' "${TOPOLOGY_MODELS}"
 require_pattern "topology schema v3" '\bCURRENT_SCHEMA_VERSION\s*=\s*3\b' "${TOPOLOGY_MODELS}"
