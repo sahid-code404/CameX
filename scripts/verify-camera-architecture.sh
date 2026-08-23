@@ -165,19 +165,18 @@ reject_pattern \
   '\bLensCategory\s*\.\s*AUXILIARY\b|\bcategory\s*(?:!=|!==)\s*LensCategory\s*\.\s*[A-Z0-9_]*AUXILIARY\b' \
   --glob '*.kt' --glob '*.java' "${KOTLIN_ROOTS[@]}"
 
-# Phase 1B: profile priority must never derive from numeric/vendor camera IDs.
 reject_pattern \
   "camera ID based profile priority" \
   '(?i)(?:discoveredCameraId|openCameraId|streamPhysicalCameraId)[^\n]{0,120}(?:toInt|toLong|priority|score)|(?:priority|score)[^\n]{0,120}(?:discoveredCameraId|openCameraId|streamPhysicalCameraId)' \
   "${PROFILE_SELECTOR}"
 
-# Phase 1B: the stable optical signature must not contain transport identifiers.
+# A stable optical signature is assembled only from metadata. Directly appending a transport field
+# anywhere in that signature builder is forbidden; fallback profile identity is checked separately.
 reject_pattern \
-  "transport ID embedded in stable optical signature" \
-  '(?is)stableOpticalParts\s*\([^)]*\)\s*:\s*String\s*=\s*buildString\s*\{.{0,2200}?\b(?:discoveredCameraId|openCameraId|streamPhysicalCameraId|canonicalRouteId)\b' \
-  --multiline --multiline-dotall "${TOPOLOGY_RESOLVER}"
+  "transport ID appended to optical signature" \
+  'append\s*\([^\n]*(?:discoveredCameraId|openCameraId|streamPhysicalCameraId|canonicalRouteId)' \
+  "${TOPOLOGY_RESOLVER}"
 
-# Lens switching is local session work; it must never trigger a global camera rediscovery.
 reject_pattern \
   "global rediscovery during lens switch" \
   '(?is)fun\s+(?:selectLens|switchFacing)\s*\([^)]*\)\s*\{.{0,1800}?\b(?:normalRescan|deepRescan|reconcile\s*\(|seedPrimaryRoute)\b' \
@@ -196,14 +195,13 @@ require_pattern "physical-topology backend" '\bobject PhysicalCameraTopologyBack
 require_pattern "advertised NDK backend" '\bclass NativeCameraDiscoveryBackend\b' app/src/main
 require_pattern "deep AUX backend" '\bclass DeepAuxDiscoveryBackend\b' app/src/main
 
-# Phase 1B rigid optical-lens/profile architecture.
 require_pattern "canonical optical lens domain model" '\bdata class CanonicalLens\b' "${TOPOLOGY_MODELS}"
 require_pattern "camera profile domain model" '\bdata class CameraProfile\b' "${TOPOLOGY_MODELS}"
 require_pattern "optical lens signature" '\bdata class OpticalLensSignature\b' "${TOPOLOGY_MODELS}"
 require_pattern "confidence based optical matcher" '\bobject OpticalLensMatcher\b' "${OPTICAL_MATCHER}"
 require_pattern "profile selector" '\bobject CameraProfileSelector\b' "${PROFILE_SELECTOR}"
 require_pattern "bounded profile failover controller" '\bclass FailoverCameraSessionController\b' "${FAILOVER_CONTROLLER}"
-require_pattern "runtime receives profile descriptors" '\bprofileLensDescriptors\s*\(' "${RUNTIME_COORDINATOR}"
+require_pattern "runtime receives profile descriptors" '\bCameraRoute::profileLensDescriptors\b' "${RUNTIME_COORDINATOR}"
 require_pattern "profile-specific trust update" '\bwithProfileTrust\s*\(' app/src/main
 require_pattern "cache schema v2" '\bCACHE_SCHEMA_VERSION\s*=\s*2\b' "${TOPOLOGY_MODELS}"
 require_pattern "topology schema v2" '\bCURRENT_SCHEMA_VERSION\s*=\s*2\b' "${TOPOLOGY_MODELS}"
