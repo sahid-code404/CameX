@@ -1,3 +1,4 @@
+import java.util.Properties
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
@@ -16,39 +17,23 @@ val gitSha = providers.environmentVariable("CAMEX_GIT_SHA")
     .getOrElse("unknown")
 val buildTimestampUtc = providers.environmentVariable("CAMEX_BUILD_TIMESTAMP_UTC")
     .getOrElse("unknown")
-val otaVersionCode = providers.environmentVariable("CAMEX_OTA_VERSION_CODE")
+val taggedVersionCode = providers.gradleProperty("cameraVersionCode")
     .orNull
     ?.toIntOrNull()
     ?.takeIf { it in 1 until Int.MAX_VALUE }
-val otaVersionName = providers.environmentVariable("CAMEX_OTA_VERSION_NAME")
+val taggedVersionName = providers.gradleProperty("cameraVersionName")
     .orNull
     ?.trim()
     ?.takeIf(String::isNotEmpty)
-val otaSignerSha256 = providers.environmentVariable("CAMEX_DEV_SIGNING_CERT_SHA256")
-    .orNull
-    ?.trim()
-    ?.takeIf(String::isNotEmpty)
-val devOtaRequested = gradle.startParameter.taskNames.any { task ->
-    task.contains("devOta", ignoreCase = true)
-}
 
-fun requiredDevOtaEnv(name: String): String? {
-    val value = providers.environmentVariable(name).orNull?.takeIf(String::isNotBlank)
-    if (devOtaRequested) require(value != null) { "$name is required for devOta tasks" }
-    return value
-}
-
-val devKeystorePath = requiredDevOtaEnv("CAMEX_DEV_KEYSTORE_PATH")
-val devKeystorePassword = requiredDevOtaEnv("CAMEX_DEV_KEYSTORE_PASSWORD")
-val devKeyAlias = requiredDevOtaEnv("CAMEX_DEV_KEY_ALIAS")
-val devKeyPassword = requiredDevOtaEnv("CAMEX_DEV_KEY_PASSWORD")
-if (devOtaRequested) {
-    require(otaVersionCode != null) { "CAMEX_OTA_VERSION_CODE is required for devOta tasks" }
-    require(otaVersionName != null) { "CAMEX_OTA_VERSION_NAME is required for devOta tasks" }
-    require(otaSignerSha256?.matches(Regex("^[0-9a-fA-F]{64}$")) == true) {
-        "CAMEX_DEV_SIGNING_CERT_SHA256 must be a normalized SHA-256 digest for devOta tasks"
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.isFile) {
+        keystorePropertiesFile.inputStream().use(::load)
     }
 }
+val releaseSigningReady = listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
+    .all { !keystoreProperties.getProperty(it).isNullOrBlank() }
 
 fun String.asBuildConfigLiteral(): String =
     "\"${replace("\\", "\\\\").replace("\"", "\\\"")}\""
@@ -63,8 +48,8 @@ android {
         applicationId = "com.sahidcode404.camex"
         minSdk = 23
         targetSdk = 37
-        versionCode = otaVersionCode ?: (10_000 + ciRunNumber)
-        versionName = otaVersionName
+        versionCode = taggedVersionCode ?: (10_000 + ciRunNumber)
+        versionName = taggedVersionName
             ?: if (ciRunNumber == 0) "0.1.0-dev" else "0.1.0-dev.$ciRunNumber"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -75,9 +60,6 @@ android {
             "BUILD_TIMESTAMP_UTC",
             buildTimestampUtc.asBuildConfigLiteral(),
         )
-        buildConfigField("boolean", "OTA_ENABLED", "false")
-        buildConfigField("String", "OTA_CHANNEL", "none".asBuildConfigLiteral())
-        buildConfigField("String", "OTA_SIGNING_CERT_SHA256", "UNPINNED".asBuildConfigLiteral())
 
         ndk {
             abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
@@ -91,31 +73,23 @@ android {
     }
 
     signingConfigs {
-        create("devOta") {
-            if (devOtaRequested) {
-                storeFile = file(requireNotNull(devKeystorePath))
-                storePassword = requireNotNull(devKeystorePassword)
-                keyAlias = requireNotNull(devKeyAlias)
-                keyPassword = requireNotNull(devKeyPassword)
+        create("stableRelease") {
+            if (releaseSigningReady) {
+                storeFile = file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
             }
         }
     }
 
     buildTypes {
         getByName("debug")
-        create("devOta") {
-            initWith(getByName("debug"))
-            isDebuggable = true
+        getByName("release") {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("devOta")
-            matchingFallbacks += listOf("debug")
-            buildConfigField("boolean", "OTA_ENABLED", "true")
-            buildConfigField("String", "OTA_CHANNEL", "development".asBuildConfigLiteral())
-            buildConfigField(
-                "String",
-                "OTA_SIGNING_CERT_SHA256",
-                (otaSignerSha256 ?: "UNPINNED").lowercase().asBuildConfigLiteral(),
-            )
+            if (releaseSigningReady) {
+                signingConfig = signingConfigs.getByName("stableRelease")
+            }
         }
     }
 

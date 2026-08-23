@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
-import android.os.Build
 import android.provider.Settings
 import android.view.TextureView
 import android.widget.Toast
@@ -56,6 +55,7 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         viewModel.onCameraPermission(hasCameraPermission())
+        updateViewModel.refreshInstallPermission()
     }
 
     override fun onStop() {
@@ -115,9 +115,7 @@ private fun CameraApplication(
             previewContent = { CameraPreview(viewModel) },
             permissionPermanentlyDenied = !state.camera.permissionGranted &&
                 permissionRequested &&
-                !activity.shouldShowRequestPermissionRationale(
-                    Manifest.permission.CAMERA,
-                ),
+                !activity.shouldShowRequestPermissionRationale(Manifest.permission.CAMERA),
             onRequestPermission = {
                 permissionRequested = true
                 permissionLauncher.launch(Manifest.permission.CAMERA)
@@ -150,14 +148,9 @@ private fun CameraApplication(
                 DiagnosticField("Version", updateState.installed.versionName),
                 DiagnosticField("Version code", updateState.installed.versionCode.toString()),
                 DiagnosticField("Git SHA", updateState.installed.gitSha),
-                DiagnosticField("OTA channel", updateState.installed.channel),
                 DiagnosticField(
-                    "Installed signer SHA-256",
-                    updateState.installed.installedSigningCertificateSha256 ?: "Unavailable",
-                ),
-                DiagnosticField(
-                    "Pinned OTA signer SHA-256",
-                    updateState.installed.pinnedSigningCertificateSha256 ?: "Not pinned",
+                    "Signing certificate SHA-256",
+                    updateState.installed.signingCertificateSha256 ?: "Unavailable",
                 ),
             ),
             onBack = { screen = AppScreen.CAMERA },
@@ -181,18 +174,9 @@ private fun CameraApplication(
             state = updateState,
             onBack = { screen = AppScreen.DIAGNOSTICS },
             onCheck = updateViewModel::checkForUpdates,
-            onDownloadAndInstall = updateViewModel::downloadAndInstall,
-            onRetryInstall = updateViewModel::retryInstall,
-            onOpenInstallPermissionSettings = {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startActivity(
-                        Intent(
-                            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                            Uri.parse("package:${context.packageName}"),
-                        ),
-                    )
-                }
-            },
+            onDownload = updateViewModel::downloadUpdate,
+            onInstall = updateViewModel::installUpdate,
+            onOpenInstallPermissionSettings = updateViewModel::openInstallPermissionSettings,
             onResetFailure = updateViewModel::resetFailure,
         )
     }

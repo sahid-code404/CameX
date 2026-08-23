@@ -41,13 +41,13 @@ class ApkVerifier(
     private val inspector: ApkInspector,
     private val installed: InstalledAppInfo,
 ) {
-    suspend fun verify(file: File, manifest: UpdateManifest): ApkInspection = withContext(Dispatchers.IO) {
+    suspend fun verify(file: File, manifest: ReleaseManifest): ApkInspection = withContext(Dispatchers.IO) {
         if (!file.isFile || file.length() <= 0L) {
             throw UpdateException(UpdateFailureCode.STORAGE, "Downloaded APK is missing")
         }
         val actualHash = sha256(file)
         val inspection = inspector.inspect(file)
-        UpdateCandidateValidator.validateDownloaded(
+        UpdateCandidateValidator.validate(
             manifest = manifest,
             installed = installed,
             inspection = inspection,
@@ -55,6 +55,58 @@ class ApkVerifier(
         )
         inspection
     }
+}
+
+object UpdateCandidateValidator {
+    fun validate(
+        manifest: ReleaseManifest,
+        installed: InstalledAppInfo,
+        inspection: ApkInspection,
+        actualSha256: String,
+    ) {
+        if (manifest.schema != UPDATE_MANIFEST_SCHEMA) {
+            fail(UpdateFailureCode.INVALID_MANIFEST, "Unsupported update manifest schema")
+        }
+        if (installed.sdkInt < manifest.minSdk) {
+            fail(UpdateFailureCode.INVALID_MANIFEST, "Update requires Android API ${manifest.minSdk}")
+        }
+        if (manifest.versionCode == installed.versionCode) {
+            fail(UpdateFailureCode.SAME_VERSION, "Update version is the same as installed Camera")
+        }
+        if (manifest.versionCode < installed.versionCode) {
+            fail(UpdateFailureCode.DOWNGRADE, "Update version is older than installed Camera")
+        }
+        if (inspection.packageName != UPDATE_PACKAGE_NAME || inspection.packageName != installed.packageName) {
+            fail(UpdateFailureCode.PACKAGE_MISMATCH, "Downloaded APK package does not match Camera")
+        }
+        if (inspection.versionCode != manifest.versionCode) {
+            fail(UpdateFailureCode.INVALID_MANIFEST, "Downloaded APK versionCode does not match the manifest")
+        }
+        if (!normalizeDigest(actualSha256).equals(normalizeDigest(manifest.sha256), ignoreCase = true)) {
+            fail(UpdateFailureCode.HASH_MISMATCH, "Downloaded APK SHA-256 does not match the manifest")
+        }
+        val installedSigner = installed.signingCertificateSha256
+            ?: fail(UpdateFailureCode.SIGNATURE_MISMATCH, "Installed Camera signer is unavailable")
+        val actualSigner = normalizeDigest(inspection.signingCertificateSha256)
+        val manifestSigner = normalizeDigest(manifest.signingCertSha256)
+        val trustedSigner = normalizeDigest(installedSigner)
+        if (actualSigner != manifestSigner || actualSigner != trustedSigner) {
+            fail(UpdateFailureCode.SIGNATURE_MISMATCH, "Downloaded APK signer does not match installed Camera")
+        }
+    }
+
+    private fun normalizeDigest(value: String): String = value
+        .trim()
+        .replace(":", "")
+        .lowercase()
+        .also { normalized ->
+            if (!normalized.matches(Regex("^[0-9a-f]{64}$"))) {
+                fail(UpdateFailureCode.INVALID_MANIFEST, "Invalid SHA-256 digest")
+            }
+        }
+
+    private fun fail(code: UpdateFailureCode, message: String): Nothing =
+        throw UpdateException(code, message)
 }
 
 object InstalledAppInfoReader {
@@ -69,20 +121,13 @@ object InstalledAppInfoReader {
         }
         val info = @Suppress("DEPRECATION")
         packageManager.getPackageInfo(appContext.packageName, flags)
-        val pinned = BuildConfig.OTA_SIGNING_CERT_SHA256
-            .trim()
-            .takeUnless { it.isBlank() || it.equals("UNPINNED", ignoreCase = true) }
-            ?.let { runCatching { normalizeSha256(it) }.getOrNull() }
         return InstalledAppInfo(
             packageName = appContext.packageName,
             versionCode = info.versionCodeCompat(),
             versionName = info.versionName.orEmpty(),
             gitSha = BuildConfig.GIT_SHA,
-            channel = BuildConfig.OTA_CHANNEL,
-            pinnedSigningCertificateSha256 = pinned,
-            installedSigningCertificateSha256 = info.signerSha256(),
+            signingCertificateSha256 = info.signerSha256(),
             sdkInt = Build.VERSION.SDK_INT,
-            otaEnabled = BuildConfig.OTA_ENABLED,
         )
     }
 }
@@ -90,7 +135,7 @@ object InstalledAppInfoReader {
 fun sha256(file: File): String {
     val digest = MessageDigest.getInstance("SHA-256")
     FileInputStream(file).use { input ->
-        val buffer = ByteArray(64 * 1024)
+        val buffer = ByteArray(128 * 1024)
         while (true) {
             val count = input.read(buffer)
             if (count < 0) break
@@ -100,11 +145,11 @@ fun sha256(file: File): String {
     return digest.digest().joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
 }
 
-private fun PackageInfo.versionCodeCompat(): Int = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-    longVersionCode.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+private fun PackageInfo.versionCodeCompat(): Long = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+    longVersionCode
 } else {
     @Suppress("DEPRECATION")
-    versionCode
+    versionCode.toLong()
 }
 
 private fun PackageInfo.signerSha256(): String? {
