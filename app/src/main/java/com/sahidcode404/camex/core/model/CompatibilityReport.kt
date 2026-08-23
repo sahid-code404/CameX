@@ -22,6 +22,8 @@ data class CompatibilityReport(
     val canonicalTopology: CanonicalTopologyReport = CanonicalTopologyReport(),
     /** Phase 1B authoritative physical-lens → transport-profile representation. */
     val canonicalLenses: List<CanonicalLensCompatibilityReport> = emptyList(),
+    /** Pairwise optical-identity reasoning, including comparisons that deliberately did not merge. */
+    val opticalGrouping: List<OpticalGroupingComparisonReport> = emptyList(),
     /** Legacy flat canonical-lens projection retained for report-reader compatibility. */
     val cameras: List<CameraCompatibilityEntry> = emptyList(),
     val discoveryFailures: List<DiscoveryFailureReport> = emptyList(),
@@ -35,7 +37,7 @@ data class CompatibilityReport(
     val app: AppReport = AppReport(),
 ) {
     companion object {
-        const val CURRENT_SCHEMA_VERSION = 3
+        const val CURRENT_SCHEMA_VERSION = 4
     }
 }
 
@@ -136,6 +138,20 @@ data class CanonicalLensTrustReport(
     val failure: CameraRouteFailureReport? = null,
 )
 
+/** Pairwise decision explaining whether two transport profiles may share optical identity. */
+@Serializable
+data class OpticalGroupingComparisonReport(
+    val leftProfileId: String,
+    val rightProfileId: String,
+    val leftProfileFingerprint: String,
+    val rightProfileFingerprint: String,
+    val match: String,
+    val score: Int,
+    val evidenceFamilies: List<String> = emptyList(),
+    val positiveReasons: List<String> = emptyList(),
+    val negativeReasons: List<String> = emptyList(),
+)
+
 /** Exact Camera2/vendor transport endpoint underneath one CanonicalLens. */
 @Serializable
 data class CameraProfileCompatibilityReport(
@@ -159,6 +175,18 @@ data class CameraProfileCompatibilityReport(
     val previewVerified: Boolean = false,
     val rawAdvertised: String = "UNKNOWN",
     val rawStreamActuallyDeclared: String = "UNKNOWN",
+    /** Canonical assignment and exact per-profile optical/sensor metadata for hardware diagnosis. */
+    val assignedCanonicalLensId: String? = null,
+    val focalLengthsMm: List<Double> = emptyList(),
+    val fieldOfView: FieldOfView? = null,
+    val sensorPhysicalSize: PhysicalSize? = null,
+    val pixelArraySize: Size2D? = null,
+    val activeArray: SensorRect? = null,
+    val rawDimensions: List<Size2D> = emptyList(),
+    val colorFilterArrangement: String? = null,
+    val sensorOrientationDegrees: Int? = null,
+    val apertures: List<Double> = emptyList(),
+    val groupingComparisons: List<OpticalGroupingComparisonReport> = emptyList(),
 )
 
 @Serializable
