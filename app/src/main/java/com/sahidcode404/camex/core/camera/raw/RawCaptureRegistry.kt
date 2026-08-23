@@ -195,18 +195,33 @@ object RawCaptureRegistry : RawCaptureController {
         updateActiveSelectionDetails(null, null, null, null)
     }
 
+    fun publishResult(result: RawCaptureResult) {
+        mutableState.value = when (result) {
+            is RawCaptureResult.Saved -> mutableState.value.copy(
+                phase = RawCapturePhase.SAVED,
+                diagnostics = result.diagnostics,
+            )
+            is RawCaptureResult.Failed -> mutableState.value.copy(
+                phase = RawCapturePhase.FAILED,
+                diagnostics = result.diagnostics,
+            )
+        }
+    }
+
     suspend fun captureCurrent(): RawCaptureResult {
         val generation = activeSelectionGeneration.get()
         if (generation == INVALID_GENERATION) {
             val diagnostics = mutableState.value.diagnostics.copy(
                 lastRawError = "no verified camera selection",
             )
-            return RawCaptureResult.Failed(
+            val failed = RawCaptureResult.Failed(
                 reason = "RAW capture requires a verified preview selection",
                 structural = false,
                 diagnostics = diagnostics,
                 failureKind = RawFailureKind.STALE_SELECTION,
             )
+            publishResult(failed)
+            return failed
         }
         return captureRaw(
             RawCaptureRequest(
@@ -241,16 +256,14 @@ object RawCaptureRegistry : RawCaptureController {
                     RawSupportState.SUPPORTED -> "RAW_SENSOR session is not available for this profile"
                 }
                 val diagnostics = mutableState.value.diagnostics.copy(lastRawError = reason)
-                mutableState.value = mutableState.value.copy(
-                    phase = RawCapturePhase.FAILED,
-                    diagnostics = diagnostics,
-                )
-                return RawCaptureResult.Failed(
+                val failed = RawCaptureResult.Failed(
                     reason = reason,
                     structural = failureKind.mayRotateProfile(),
                     diagnostics = diagnostics,
                     failureKind = failureKind,
                 )
+                publishResult(failed)
+                return failed
             }
 
             if (activeSelectionGeneration.get() != request.selectionGeneration ||
@@ -259,16 +272,14 @@ object RawCaptureRegistry : RawCaptureController {
                 val diagnostics = mutableState.value.diagnostics.copy(
                     lastRawError = "stale selection generation",
                 )
-                mutableState.value = mutableState.value.copy(
-                    phase = RawCapturePhase.FAILED,
-                    diagnostics = diagnostics,
-                )
-                return RawCaptureResult.Failed(
+                val failed = RawCaptureResult.Failed(
                     reason = "Camera selection changed before RAW capture started",
                     structural = false,
                     diagnostics = diagnostics,
                     failureKind = RawFailureKind.STALE_SELECTION,
                 )
+                publishResult(failed)
+                return failed
             }
 
             val context = RawCaptureContext(
@@ -317,16 +328,7 @@ object RawCaptureRegistry : RawCaptureController {
                     )
                 },
             )
-            mutableState.value = when (result) {
-                is RawCaptureResult.Saved -> mutableState.value.copy(
-                    phase = RawCapturePhase.SAVED,
-                    diagnostics = result.diagnostics,
-                )
-                is RawCaptureResult.Failed -> mutableState.value.copy(
-                    phase = RawCapturePhase.FAILED,
-                    diagnostics = result.diagnostics,
-                )
-            }
+            publishResult(result)
             return result
         } finally {
             gate.end()
