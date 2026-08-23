@@ -37,6 +37,7 @@ import com.sahidcode404.camex.core.camera.raw.RawCaptureRegistry
 import com.sahidcode404.camex.core.camera.raw.RawCaptureState
 import com.sahidcode404.camex.core.camera.raw.RawCompatibilityReportJson
 import com.sahidcode404.camex.core.model.Size2D
+import com.sahidcode404.camex.core.update.UpdateChannel
 import com.sahidcode404.camex.core.update.UpdateState
 import com.sahidcode404.camex.feature.camera.CameraScreen
 import com.sahidcode404.camex.feature.diagnostics.DiagnosticField
@@ -66,6 +67,7 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         viewModel.onCameraPermission(hasCameraPermission())
         updateViewModel.refreshInstallPermission()
+        updateViewModel.checkForUpdatesIfDue()
     }
 
     override fun onStop() {
@@ -96,8 +98,6 @@ private fun CameraApplication(
     var permissionRequested by rememberSaveable { mutableStateOf(false) }
     var promptedVersionCode by rememberSaveable { mutableStateOf<Long?>(null) }
     var showUpdatePrompt by rememberSaveable { mutableStateOf(false) }
-
-    LaunchedEffect(Unit) { updateViewModel.checkForUpdatesIfDue() }
 
     val availableUpdate = (updateState.updateState as? UpdateState.Available)?.update
     LaunchedEffect(availableUpdate?.manifest?.versionCode) {
@@ -177,6 +177,7 @@ private fun CameraApplication(
                 DiagnosticField("Version", updateState.installed.versionName),
                 DiagnosticField("Version code", updateState.installed.versionCode.toString()),
                 DiagnosticField("Git SHA", updateState.installed.gitSha),
+                DiagnosticField("OTA channel", updateState.channel.buildConfigValue),
                 DiagnosticField(
                     "Signing certificate SHA-256",
                     updateState.installed.signingCertificateSha256 ?: "Unavailable",
@@ -215,13 +216,34 @@ private fun CameraApplication(
 
     if (showUpdatePrompt && availableUpdate != null && screen == AppScreen.CAMERA) {
         val manifest = availableUpdate.manifest
+        val isDevelopment = updateState.channel == UpdateChannel.DEVELOPMENT
         AlertDialog(
             onDismissRequest = { showUpdatePrompt = false },
-            title = { Text("Camera ${manifest.versionName} is available") },
+            title = {
+                Text(
+                    if (isDevelopment) {
+                        "Development update available"
+                    } else {
+                        "Camera ${manifest.versionName} is available"
+                    },
+                )
+            },
             text = {
                 Text(
-                    manifest.changelog.takeIf { it.isNotBlank() }
-                        ?: "A newer version of Camera is ready to download.",
+                    if (isDevelopment) {
+                        buildString {
+                            append("Build: ${manifest.versionName}")
+                            manifest.gitSha.takeIf { it.isNotBlank() }?.let { sha ->
+                                append("\nCommit: ${sha.take(12)}")
+                            }
+                            manifest.changelog.takeIf { it.isNotBlank() }?.let { changelog ->
+                                append("\n\n$changelog")
+                            }
+                        }
+                    } else {
+                        manifest.changelog.takeIf { it.isNotBlank() }
+                            ?: "A newer version of Camera is ready to download."
+                    },
                 )
             },
             confirmButton = {
