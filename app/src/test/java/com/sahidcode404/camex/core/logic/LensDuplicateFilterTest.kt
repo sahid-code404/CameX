@@ -29,12 +29,13 @@ class LensDuplicateFilterTest {
     }
 
     @Test
-    fun equalStableFingerprintIsStrongDuplicateEvidence() {
+    fun equalStableFingerprintAcrossDistinctCanonicalRoutesStaysVisible() {
         val fingerprint = LensFingerprint("same", FingerprintStrategy.STABLE_METADATA)
         val first = testLens("a").copy(fingerprint = fingerprint)
         val second = testLens("b").copy(fingerprint = fingerprint, capabilities = LensCapabilities())
 
-        assertTrue(LensDuplicateFilter.areDuplicates(first, second))
+        assertFalse(LensDuplicateFilter.areDuplicates(first, second))
+        assertEquals(2, LensDuplicateFilter.filterForSelector(listOf(first, second)).size)
     }
 
     @Test
