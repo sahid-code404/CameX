@@ -26,6 +26,11 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      - name: Verify patch whitespace
+        run: git diff --check origin/main...HEAD
 
       - name: Verify camera architecture
         run: ./scripts/verify-camera-architecture.sh
@@ -56,6 +61,15 @@ jobs:
 
       - name: Verify Gradle environment
         run: ./gradlew --version
+
+      - name: Run Phase 1B camera selection regressions
+        run: |
+          ./gradlew --no-daemon --stacktrace testDebugUnitTest \
+            --tests 'com.sahidcode404.camex.core.camera.runtime.ActiveCameraSelectionTest' \
+            --tests 'com.sahidcode404.camex.core.camera.runtime.CameraSelectionPolicyTest' \
+            --tests 'com.sahidcode404.camex.core.camera.topology.CanonicalFingerprintCollisionGuardTest' \
+            --tests 'com.sahidcode404.camex.core.logic.LensDuplicateFilterTest' \
+            --tests 'com.sahidcode404.camex.core.logic.CompatibilitySelectionReportJsonTest'
 
       - name: Run unit tests, lint, native build, and assemble
         run: ./gradlew --no-daemon --stacktrace testDebugUnitTest lintDebug assembleDebug
