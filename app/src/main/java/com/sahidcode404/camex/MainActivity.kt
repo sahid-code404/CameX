@@ -17,6 +17,7 @@ import androidx.activity.viewModels
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -28,6 +29,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
+import com.sahidcode404.camex.core.update.UpdateState
 import com.sahidcode404.camex.feature.camera.CameraScreen
 import com.sahidcode404.camex.feature.diagnostics.DiagnosticField
 import com.sahidcode404.camex.feature.diagnostics.DiagnosticsScreen
@@ -84,6 +86,11 @@ private fun CameraApplication(
     var pendingReport by remember { mutableStateOf<String?>(null) }
     var permissionRequested by rememberSaveable { mutableStateOf(false) }
 
+    // Match Universal_Camera: on app open, perform the lightweight GitHub check only if 12h elapsed.
+    LaunchedEffect(Unit) {
+        updateViewModel.checkForUpdatesIfDue()
+    }
+
     BackHandler(enabled = screen != AppScreen.CAMERA) {
         screen = if (screen == AppScreen.UPDATES) AppScreen.DIAGNOSTICS else AppScreen.CAMERA
     }
@@ -116,6 +123,7 @@ private fun CameraApplication(
             permissionPermanentlyDenied = !state.camera.permissionGranted &&
                 permissionRequested &&
                 !activity.shouldShowRequestPermissionRationale(Manifest.permission.CAMERA),
+            updateAvailable = updateState.updateState is UpdateState.Available,
             onRequestPermission = {
                 permissionRequested = true
                 permissionLauncher.launch(Manifest.permission.CAMERA)
