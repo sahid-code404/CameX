@@ -217,11 +217,7 @@ private suspend fun CameraDevice.awaitSingleCaptureSession(
             if (continuation.isActive) continuation.resumeWithException(error)
         }
 
-        val callback = object : CameraDevice.StateCallback(), CameraCaptureSession.StateCallback() {
-            override fun onOpened(camera: CameraDevice) = Unit
-            override fun onDisconnected(camera: CameraDevice) = Unit
-            override fun onError(camera: CameraDevice, error: Int) = Unit
-
+        val callback = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
                 configured.set(session)
                 val lease = CaptureSessionLease(session, closedSignal)
