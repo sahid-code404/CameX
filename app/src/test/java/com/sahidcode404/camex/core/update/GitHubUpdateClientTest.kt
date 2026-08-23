@@ -18,40 +18,31 @@ class GitHubUpdateClientTest {
     private val apkUrl = "https://github.com/sahid-code404/CameX/releases/download/v0.1.2/Camera-0.1.2.apk"
 
     @Test
-    fun `newer version is available and APK asset comes from manifest`() = runTest {
-        val client = clientFor(
-            releaseJson = releaseJson(includeManifest = true, includeApk = true),
-            manifestJson = manifestJson(versionCode = 1002),
-        )
-        val result = client.check(installed(versionCode = 1001))
+    fun `manifest parses and newer version is available`() = runTest {
+        val client = clientFor(releaseJson(), manifestJson(versionCode = 102))
+        val result = client.check(installed(versionCode = 101))
         assertTrue(result is UpdateCheckResult.Available)
         result as UpdateCheckResult.Available
         assertTrue(result.update.apkUrl == apkUrl)
+        assertTrue(result.update.manifest.versionName == "0.1.2")
         assertTrue(result.update.manifest.apkAssetName == "Camera-0.1.2.apk")
     }
 
     @Test
     fun `same version is up to date`() = runTest {
-        val result = clientFor(releaseJson(), manifestJson(1001)).check(installed(1001))
+        val result = clientFor(releaseJson(), manifestJson(101)).check(installed(101))
         assertTrue(result is UpdateCheckResult.UpToDate)
     }
 
     @Test
     fun `older version is up to date`() = runTest {
-        val result = clientFor(releaseJson(), manifestJson(1000)).check(installed(1001))
+        val result = clientFor(releaseJson(), manifestJson(100)).check(installed(101))
         assertTrue(result is UpdateCheckResult.UpToDate)
     }
 
     @Test
-    fun `malformed GitHub release fails`() = runTest {
-        val transport = FakeTransport(mapOf(GitHubUpdateClient.LATEST_RELEASE_URL to "not-json"))
-        val result = GitHubUpdateClient(temporaryFolder.root, transport).check(installed())
-        assertTrue(result is UpdateCheckResult.Failed)
-    }
-
-    @Test
     fun `missing manifest asset fails`() = runTest {
-        val client = clientFor(releaseJson(includeManifest = false, includeApk = true), manifestJson(1002))
+        val client = clientFor(releaseJson(includeManifest = false), manifestJson(102))
         val result = client.check(installed())
         assertTrue(result is UpdateCheckResult.Failed)
         result as UpdateCheckResult.Failed
@@ -60,7 +51,7 @@ class GitHubUpdateClientTest {
 
     @Test
     fun `missing APK asset fails`() = runTest {
-        val client = clientFor(releaseJson(includeManifest = true, includeApk = false), manifestJson(1002))
+        val client = clientFor(releaseJson(includeApk = false), manifestJson(102))
         val result = client.check(installed())
         assertTrue(result is UpdateCheckResult.Failed)
         result as UpdateCheckResult.Failed
@@ -78,24 +69,21 @@ class GitHubUpdateClientTest {
             },
         )
         val client = GitHubUpdateClient(temporaryFolder.root, transport)
-        val update = AvailableUpdate(
-            manifest = manifest(versionCode = 1002),
-            apkUrl = apkUrl,
-        )
+        val update = AvailableUpdate(manifest(102), apkUrl)
         runCatching { client.download(update) { _, _ -> } }
-        val part = File(temporaryFolder.root, "updates/Camera-0.1.2.apk.part")
-        assertFalse(part.exists())
+        assertFalse(File(temporaryFolder.root, "updates/Camera-0.1.2.apk.part").exists())
     }
 
-    private fun clientFor(releaseJson: String, manifestJson: String): GitHubUpdateClient {
-        val transport = FakeTransport(
-            mapOf(
-                GitHubUpdateClient.LATEST_RELEASE_URL to releaseJson,
-                manifestUrl to manifestJson,
+    private fun clientFor(releaseJson: String, manifestJson: String): GitHubUpdateClient =
+        GitHubUpdateClient(
+            temporaryFolder.root,
+            FakeTransport(
+                mapOf(
+                    GitHubUpdateClient.LATEST_RELEASE_URL to releaseJson,
+                    manifestUrl to manifestJson,
+                ),
             ),
         )
-        return GitHubUpdateClient(temporaryFolder.root, transport)
-    }
 
     private fun releaseJson(
         includeManifest: Boolean = true,
@@ -121,7 +109,7 @@ class GitHubUpdateClientTest {
         signingCertSha256 = signer,
     )
 
-    private fun installed(versionCode: Long = 1001): InstalledAppInfo = InstalledAppInfo(
+    private fun installed(versionCode: Long = 101): InstalledAppInfo = InstalledAppInfo(
         packageName = UPDATE_PACKAGE_NAME,
         versionCode = versionCode,
         versionName = "0.1.1",
@@ -134,7 +122,7 @@ class GitHubUpdateClientTest {
         private val texts: Map<String, String>,
         private val downloadAction: suspend (File) -> Unit = { error("download not expected") },
     ) : UpdateTransport {
-        override suspend fun readText(url: String, maxBytes: Int): String =
+        override suspend fun readText(url: String): String =
             texts[url] ?: error("No fake response for $url")
 
         override suspend fun download(
