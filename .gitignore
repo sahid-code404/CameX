@@ -1,0 +1,29 @@
+# Gradle and Kotlin
+.gradle/
+.kotlin/
+**/build/
+build/
+
+# Android SDK and IDE-local configuration
+local.properties
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Signing material must never be committed
+*.jks
+*.keystore
+keystore.properties
+
+# Operating-system and editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Local reports and packaged artifacts
+artifacts/
+*.apk
+*.aab
