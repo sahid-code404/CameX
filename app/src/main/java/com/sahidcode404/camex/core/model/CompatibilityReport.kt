@@ -24,6 +24,10 @@ data class CompatibilityReport(
     val canonicalLenses: List<CanonicalLensCompatibilityReport> = emptyList(),
     /** Pairwise optical-identity reasoning, including comparisons that deliberately did not merge. */
     val opticalGrouping: List<OpticalGroupingComparisonReport> = emptyList(),
+    /** Exact verified session/canonical bridge used by the Camera UI. */
+    val activeSelection: ActiveCameraSelectionReport? = null,
+    /** Camera selector projection at export time. */
+    val cameraUi: CameraUiSelectionReport = CameraUiSelectionReport(),
     /** Legacy flat canonical-lens projection retained for report-reader compatibility. */
     val cameras: List<CameraCompatibilityEntry> = emptyList(),
     val discoveryFailures: List<DiscoveryFailureReport> = emptyList(),
@@ -40,6 +44,30 @@ data class CompatibilityReport(
         const val CURRENT_SCHEMA_VERSION = 4
     }
 }
+
+@Serializable
+data class ActiveCameraSelectionReport(
+    val activeProfileRoutingKey: String,
+    val activeProfileFingerprint: String? = null,
+    val canonicalLensFingerprint: LensFingerprint? = null,
+    val canonicalLensId: String? = null,
+    val activeProfileFacing: LensFacing = LensFacing.UNKNOWN,
+    val canonicalFacing: LensFacing = LensFacing.UNKNOWN,
+    val selectionGeneration: Long,
+    val sessionState: String,
+    val verified: Boolean,
+)
+
+@Serializable
+data class CameraUiSelectionReport(
+    val normalVisibleFrontCount: Int = 0,
+    val normalVisibleRearCount: Int = 0,
+    val cameraUiFacing: LensFacing = LensFacing.UNKNOWN,
+    val cameraUiLensCount: Int = 0,
+    val selectedCanonicalFingerprint: String? = null,
+    val switchFacingTarget: LensFacing? = null,
+    val switchFacingEnabled: Boolean = false,
+)
 
 @Serializable
 data class CameraEnvironmentReport(
