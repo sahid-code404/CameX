@@ -20,6 +20,9 @@ data class CompatibilityReport(
     val ndkDiscovery: DiscoveryBackendReport = DiscoveryBackendReport(),
     val deepDiscovery: DiscoveryBackendReport = DiscoveryBackendReport(),
     val canonicalTopology: CanonicalTopologyReport = CanonicalTopologyReport(),
+    /** Phase 1B authoritative physical-lens → transport-profile representation. */
+    val canonicalLenses: List<CanonicalLensCompatibilityReport> = emptyList(),
+    /** Legacy flat canonical-lens projection retained for report-reader compatibility. */
     val cameras: List<CameraCompatibilityEntry> = emptyList(),
     val discoveryFailures: List<DiscoveryFailureReport> = emptyList(),
     val logicalRelationships: List<LogicalRelationshipReport> = emptyList(),
@@ -32,14 +35,10 @@ data class CompatibilityReport(
     val app: AppReport = AppReport(),
 ) {
     companion object {
-        const val CURRENT_SCHEMA_VERSION = 2
+        const val CURRENT_SCHEMA_VERSION = 3
     }
 }
 
-/**
- * Cache-invalidation identity without a raw hardware/build identifier. The stable key is a
- * one-way digest of the complete environment fingerprint used by the camera topology cache.
- */
 @Serializable
 data class CameraEnvironmentReport(
     val stableKey: String,
@@ -102,8 +101,64 @@ data class DiscoveryBackendFailureReport(
 @Serializable
 data class CanonicalTopologyReport(
     val schemaVersion: Int? = null,
+    /** Number of physical/canonical optical lenses, not number of route/profile IDs. */
     val routeCount: Int = 0,
     val canonicalRouteIds: List<String> = emptyList(),
+    val profileCount: Int = 0,
+)
+
+/** Authoritative Phase 1B report entry: one real/credible optical lens. */
+@Serializable
+data class CanonicalLensCompatibilityReport(
+    val canonicalLensId: String,
+    val opticalFingerprint: LensFingerprint? = null,
+    val facing: LensFacing = LensFacing.UNKNOWN,
+    val role: String? = null,
+    val roleConfidence: String? = null,
+    val focalLengthsMm: List<Double> = emptyList(),
+    val fieldOfView: FieldOfView? = null,
+    val sensorPhysicalSize: PhysicalSize? = null,
+    val pixelArraySize: Size2D? = null,
+    val canonicalTrust: CanonicalLensTrustReport = CanonicalLensTrustReport(),
+    val preferredProfileId: String? = null,
+    val profileCount: Int = 0,
+    /** STRONG_MATCH for multi-profile lenses, SINGLE_PROFILE, or MIXED if invariant is violated. */
+    val groupingConfidence: String = "SINGLE_PROFILE",
+    val profiles: List<CameraProfileCompatibilityReport> = emptyList(),
+)
+
+@Serializable
+data class CanonicalLensTrustReport(
+    val metadataTrust: String = "UNKNOWN",
+    val sessionTrust: String = "UNKNOWN",
+    val rawTrust: String = "UNKNOWN",
+    val lastAttemptEpochMs: Long? = null,
+    val failure: CameraRouteFailureReport? = null,
+)
+
+/** Exact Camera2/vendor transport endpoint underneath one CanonicalLens. */
+@Serializable
+data class CameraProfileCompatibilityReport(
+    val profileId: String,
+    val profileFingerprint: String,
+    val preferred: Boolean = false,
+    val ranking: Int,
+    val profileScore: Int,
+    val discoveredCameraId: String,
+    val openCameraId: String,
+    val physicalCameraId: String? = null,
+    val logicalParentCameraId: String? = null,
+    val routeKind: String,
+    val discoverySources: List<String> = emptyList(),
+    val metadataTrust: String,
+    val sessionTrust: String,
+    val rawTrust: String,
+    val lastAttemptEpochMs: Long? = null,
+    val failure: CameraRouteFailureReport? = null,
+    val failureDurability: String? = null,
+    val previewVerified: Boolean = false,
+    val rawAdvertised: String = "UNKNOWN",
+    val rawStreamActuallyDeclared: String = "UNKNOWN",
 )
 
 @Serializable
@@ -142,6 +197,7 @@ data class GraphicsReport(
     val vendor: String? = null,
 )
 
+/** Legacy flat entry: still one canonical lens, never one entry per CameraProfile. */
 @Serializable
 data class CameraCompatibilityEntry(
     val identity: LensIdentity,
