@@ -6,7 +6,7 @@ CameX uses the same simple GitHub Release OTA shape as `sahid-code404/Universal_
 
 `git tag vX.Y.Z → git push origin vX.Y.Z → GitHub Actions → signed APK + release-manifest.json → GitHub Release → Camera checks /releases/latest → download → verify → Android installer`
 
-Camera startup is not part of this flow. Phase 1C uses manual update checks only.
+Like `Universal_Camera`, CameX performs a lightweight update check when Camera opens if the previous automatic check was at least 12 hours ago. The check runs asynchronously and does not wait for camera discovery or preview. Manual checking remains available from Diagnostics → Updates.
 
 ## Release command
 
@@ -74,7 +74,7 @@ Manifest schema:
 
 ## Update check
 
-Diagnostics → Updates → Check for updates requests:
+CameX requests:
 
 `https://api.github.com/repos/sahid-code404/CameX/releases/latest`
 
@@ -82,7 +82,13 @@ The updater finds `release-manifest.json`, parses schema 1, compares `versionCod
 
 If `manifest.versionCode <= installedVersionCode`, Camera is up to date. Otherwise the release is offered as an available update.
 
-There is no startup update check, WorkManager job, background polling, or automatic pre-preview OTA work.
+Automatic behavior matches `Universal_Camera`:
+
+- when Camera opens, `UpdateAutoChecker` checks only if 12 hours have elapsed since `last_check_ms`
+- an available update is surfaced quietly with an update indicator in the Camera UI
+- up-to-date and failed background checks stay quiet
+- Diagnostics → Updates → Check for updates always remains available for an explicit manual check
+- there is no WorkManager job or continuous background polling
 
 ## Download and verification
 
@@ -124,7 +130,7 @@ Keep PR #2 DRAFT until the real signed update-in-place path succeeds:
 
 1. install a stable-signed base release
 2. publish a later `vX.Y.Z` tag with the same signing key
-3. check from Diagnostics → Updates
+3. let the app discover it automatically when the 12-hour check is due, or check manually from Diagnostics → Updates
 4. download and verify
 5. confirm Android installer handoff
 6. confirm app data survives
