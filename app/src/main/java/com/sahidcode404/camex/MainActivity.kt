@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.provider.Settings
 import android.view.TextureView
 import android.widget.Toast
@@ -29,13 +30,17 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import com.sahidcode404.camex.feature.camera.CameraScreen
+import com.sahidcode404.camex.feature.diagnostics.DiagnosticField
 import com.sahidcode404.camex.feature.diagnostics.DiagnosticsScreen
 import com.sahidcode404.camex.feature.lenssettings.LensSettingsScreen
+import com.sahidcode404.camex.feature.update.UpdateScreen
+import com.sahidcode404.camex.feature.update.UpdateViewModel
 import com.sahidcode404.camex.ui.theme.CameraTheme
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private val viewModel: CameraViewModel by viewModels()
+    private val updateViewModel: UpdateViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
@@ -43,7 +48,7 @@ class MainActivity : ComponentActivity() {
         viewModel.onCameraPermission(hasCameraPermission())
         setContent {
             CameraTheme(darkTheme = true) {
-                CameraApplication(viewModel, this@MainActivity)
+                CameraApplication(viewModel, updateViewModel, this@MainActivity)
             }
         }
     }
@@ -64,20 +69,24 @@ class MainActivity : ComponentActivity() {
     ) == PackageManager.PERMISSION_GRANTED
 }
 
-private enum class AppScreen { CAMERA, LENS_SETTINGS, DIAGNOSTICS }
+private enum class AppScreen { CAMERA, LENS_SETTINGS, DIAGNOSTICS, UPDATES }
 
 @Composable
 private fun CameraApplication(
     viewModel: CameraViewModel,
+    updateViewModel: UpdateViewModel,
     activity: ComponentActivity,
 ) {
     val context = LocalContext.current
     val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val updateState by updateViewModel.uiState.collectAsStateWithLifecycle()
     var screen by rememberSaveable { mutableStateOf(AppScreen.CAMERA) }
     var pendingReport by remember { mutableStateOf<String?>(null) }
     var permissionRequested by rememberSaveable { mutableStateOf(false) }
 
-    BackHandler(enabled = screen != AppScreen.CAMERA) { screen = AppScreen.CAMERA }
+    BackHandler(enabled = screen != AppScreen.CAMERA) {
+        screen = if (screen == AppScreen.UPDATES) AppScreen.DIAGNOSTICS else AppScreen.CAMERA
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -137,10 +146,25 @@ private fun CameraApplication(
         )
         AppScreen.DIAGNOSTICS -> DiagnosticsScreen(
             state = state.diagnostics,
+            otaSummary = listOf(
+                DiagnosticField("Version", updateState.installed.versionName),
+                DiagnosticField("Version code", updateState.installed.versionCode.toString()),
+                DiagnosticField("Git SHA", updateState.installed.gitSha),
+                DiagnosticField("OTA channel", updateState.installed.channel),
+                DiagnosticField(
+                    "Installed signer SHA-256",
+                    updateState.installed.installedSigningCertificateSha256 ?: "Unavailable",
+                ),
+                DiagnosticField(
+                    "Pinned OTA signer SHA-256",
+                    updateState.installed.pinnedSigningCertificateSha256 ?: "Not pinned",
+                ),
+            ),
             onBack = { screen = AppScreen.CAMERA },
             onNormalRescan = viewModel::rescanCameras,
             onDeepRescan = viewModel::deepRescanCameras,
             onResetDiscoveryCache = viewModel::resetDiscoveryCache,
+            onOpenUpdates = { screen = AppScreen.UPDATES },
             onExport = {
                 val report = runCatching(viewModel::compatibilityReportJson).getOrNull()
                 if (report == null) {
@@ -152,6 +176,24 @@ private fun CameraApplication(
                     reportLauncher.launch("Camera-compatibility-$shortSha.json")
                 }
             },
+        )
+        AppScreen.UPDATES -> UpdateScreen(
+            state = updateState,
+            onBack = { screen = AppScreen.DIAGNOSTICS },
+            onCheck = updateViewModel::checkForUpdates,
+            onDownloadAndInstall = updateViewModel::downloadAndInstall,
+            onRetryInstall = updateViewModel::retryInstall,
+            onOpenInstallPermissionSettings = {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startActivity(
+                        Intent(
+                            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                            Uri.parse("package:${context.packageName}"),
+                        ),
+                    )
+                }
+            },
+            onResetFailure = updateViewModel::resetFailure,
         )
     }
 }
