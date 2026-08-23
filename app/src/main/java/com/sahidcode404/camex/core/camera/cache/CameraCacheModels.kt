@@ -32,21 +32,19 @@ sealed interface CameraTopologyCacheResult {
     ) : CameraTopologyCacheResult
 }
 
-/** Pure validation/migration policy used by both DataStore and unit tests. */
+/** Pure validation policy used by both DataStore and unit tests. */
 object CameraTopologyCachePolicy {
     fun evaluate(
         cached: CachedCameraTopology?,
         expectedEnvironment: CameraEnvironmentFingerprint,
     ): CameraTopologyCacheResult {
         if (cached == null) return CameraTopologyCacheResult.Miss(CameraCacheMissReason.EMPTY)
-        val migration = migrate(cached) ?: return CameraTopologyCacheResult.Miss(
-            if (cached.cacheSchemaVersion > CameraTopology.CACHE_SCHEMA_VERSION) {
-                CameraCacheMissReason.CACHE_SCHEMA_CHANGED
-            } else {
-                CameraCacheMissReason.CORRUPT
-            },
-        )
-        val value = migration.first
+        if (cached.cacheSchemaVersion != CameraTopology.CACHE_SCHEMA_VERSION) {
+            // Phase 1B changes route-per-lens cache semantics. Never reinterpret an old route cache
+            // as canonical optical lenses; rediscovery is safer than a false optical identity.
+            return CameraTopologyCacheResult.Miss(CameraCacheMissReason.CACHE_SCHEMA_CHANGED)
+        }
+        val value = cached
         if (value.topology.schemaVersion != CameraTopology.CURRENT_SCHEMA_VERSION) {
             return CameraTopologyCacheResult.Miss(CameraCacheMissReason.TOPOLOGY_SCHEMA_CHANGED)
         }
@@ -56,36 +54,27 @@ object CameraTopologyCachePolicy {
         if (!isStructurallyValid(value)) {
             return CameraTopologyCacheResult.Miss(CameraCacheMissReason.CORRUPT)
         }
-        return CameraTopologyCacheResult.Hit(value, migrated = migration.second)
-    }
-
-    private fun migrate(cached: CachedCameraTopology): Pair<CachedCameraTopology, Boolean>? = when {
-        cached.cacheSchemaVersion == CameraTopology.CACHE_SCHEMA_VERSION -> cached to false
-        cached.cacheSchemaVersion == 0 && CameraTopology.CACHE_SCHEMA_VERSION == 1 -> {
-            val environment = cached.environmentFingerprint.copy(
-                cacheSchemaVersion = CameraTopology.CACHE_SCHEMA_VERSION,
-            )
-            cached.copy(
-                cacheSchemaVersion = CameraTopology.CACHE_SCHEMA_VERSION,
-                environmentFingerprint = environment,
-                topology = cached.topology.copy(
-                    schemaVersion = CameraTopology.CURRENT_SCHEMA_VERSION,
-                    environmentFingerprint = environment,
-                ),
-            ) to true
-        }
-        else -> null
+        return CameraTopologyCacheResult.Hit(value, migrated = false)
     }
 
     private fun isStructurallyValid(cached: CachedCameraTopology): Boolean {
         if (cached.generatedAtEpochMs < 0L) return false
-        val routeIds = cached.topology.routes.map { it.canonicalRouteId }
-        if (routeIds.any(String::isBlank) || routeIds.distinct().size != routeIds.size) return false
+        val profileIds = cached.topology.routes.flatMap { route -> route.profiles.map { it.profileId } }
+        if (profileIds.any(String::isBlank) || profileIds.distinct().size != profileIds.size) return false
+        val opticalFingerprints = cached.topology.routes.mapNotNull { it.lensFingerprint?.value }
+        if (opticalFingerprints.any(String::isBlank) ||
+            opticalFingerprints.distinct().size != opticalFingerprints.size
+        ) return false
         return cached.topology.routes.all { route ->
             route.openCameraId.isNotBlank() &&
                 route.discoveredCameraId.isNotBlank() &&
                 route.sources.isNotEmpty() &&
-                route.lensFingerprint?.value?.isNotBlank() != false
+                route.lensFingerprint?.value?.isNotBlank() == true &&
+                route.profiles.all { profile ->
+                    profile.openCameraId.isNotBlank() &&
+                        profile.discoveredCameraId.isNotBlank() &&
+                        profile.discoverySources.isNotEmpty()
+                }
         }
     }
 }
