@@ -31,6 +31,12 @@ import androidx.compose.ui.unit.dp
 
 data class DiagnosticField(val name: String, val value: String)
 
+data class CameraProfileDiagnosticsUiModel(
+    val stableKey: String,
+    val title: String,
+    val fields: List<DiagnosticField>,
+)
+
 data class LensDiagnosticsUiModel(
     val stableKey: String,
     val fingerprint: String,
@@ -39,6 +45,7 @@ data class LensDiagnosticsUiModel(
     val status: String,
     val summary: List<DiagnosticField>,
     val advanced: List<DiagnosticField>,
+    val profiles: List<CameraProfileDiagnosticsUiModel> = emptyList(),
 )
 
 data class DiagnosticsUiState(
@@ -151,6 +158,11 @@ private fun DiagnosticSection(title: String, fields: List<DiagnosticField>) {
     }
 }
 
+/**
+ * One card is one physical/canonical optical lens. Transport aliases are expandable profile rows,
+ * never sibling lens cards, which makes duplicate-ID problems obvious without polluting the normal
+ * camera selector.
+ */
 @Composable
 private fun LensDiagnosticCard(lens: LensDiagnosticsUiModel) {
     var expanded by rememberSaveable(lens.fingerprint) { mutableStateOf(false) }
@@ -161,20 +173,45 @@ private fun LensDiagnosticCard(lens: LensDiagnosticsUiModel) {
                 .padding(16.dp),
         ) {
             Text(lens.title, fontWeight = FontWeight.SemiBold)
+            Text("Canonical optical lens", style = MaterialTheme.typography.labelSmall)
             Text(lens.subtitle, style = MaterialTheme.typography.bodySmall)
             Text(lens.status, color = MaterialTheme.colorScheme.primary)
             lens.summary.forEach { field -> DiagnosticRow(field) }
             if (expanded) {
                 HorizontalDivider(Modifier.padding(vertical = 10.dp))
                 lens.advanced.forEach { field -> DiagnosticRow(field) }
+                HorizontalDivider(Modifier.padding(vertical = 10.dp))
+                Text(
+                    "Camera Profiles (${lens.profiles.size})",
+                    fontWeight = FontWeight.SemiBold,
+                )
+                if (lens.profiles.isEmpty()) {
+                    Text("No transport profiles", style = MaterialTheme.typography.bodySmall)
+                } else {
+                    lens.profiles.forEach { profile ->
+                        ProfileDiagnostics(profile)
+                    }
+                }
             }
             Text(
-                if (expanded) "Hide advanced metadata" else "Show advanced metadata",
+                if (expanded) "Hide profiles and advanced metadata" else "Show camera profiles",
                 modifier = Modifier.padding(top = 10.dp),
                 color = MaterialTheme.colorScheme.primary,
                 style = MaterialTheme.typography.labelLarge,
             )
         }
+    }
+}
+
+@Composable
+private fun ProfileDiagnostics(profile: CameraProfileDiagnosticsUiModel) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 12.dp),
+    ) {
+        Text(profile.title, fontWeight = FontWeight.Medium)
+        profile.fields.forEach { field -> DiagnosticRow(field) }
     }
 }
 
