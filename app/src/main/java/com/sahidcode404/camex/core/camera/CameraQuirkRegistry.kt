@@ -23,8 +23,11 @@ data class CameraOperationPolicy(
     val sessionTimeoutMillis: Long = 4_000L,
     val firstFrameTimeoutMillis: Long = 3_000L,
     val closeSettleTimeoutMillis: Long = 1_000L,
-    val maximumPreviewArea: Long = 4_194_304L,
-    val maximumPreviewLongEdge: Int = 2_560,
+    // A TextureView preview does not benefit from multi-megapixel sensor streams. Keeping the
+    // generic live stream in the 1080p class reduces bandwidth/ISP pressure and avoids low-fps
+    // preview choices while RAW still uses the full selected RAW_SENSOR resolution independently.
+    val maximumPreviewArea: Long = 2_073_600L,
+    val maximumPreviewLongEdge: Int = 1_920,
     val allowPhysicalOutputRouting: Boolean = true,
     val allowRawSessionProbe: Boolean = true,
     val maxAutomaticFailures: Int = 2,
