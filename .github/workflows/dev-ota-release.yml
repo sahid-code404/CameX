@@ -1,0 +1,269 @@
+name: Development OTA Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: "Optional branch, tag, or commit to release; blank uses the dispatched ref"
+        required: false
+        type: string
+      release_notes:
+        description: "Optional development release notes"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: development-ota-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Validate, sign, verify, and publish development OTA
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CI: "true"
+      CAMERA_DEV_KEYSTORE_BASE64: ${{ secrets.CAMERA_DEV_KEYSTORE_BASE64 }}
+      CAMERA_DEV_KEYSTORE_PASSWORD: ${{ secrets.CAMERA_DEV_KEYSTORE_PASSWORD }}
+      CAMERA_DEV_KEY_ALIAS: ${{ secrets.CAMERA_DEV_KEY_ALIAS }}
+      CAMERA_DEV_KEY_PASSWORD: ${{ secrets.CAMERA_DEV_KEY_PASSWORD }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check out exact release source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.release_ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve immutable release commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          resolved_sha="$(git rev-parse HEAD)"
+          commit_epoch="$(git show -s --format=%ct "$resolved_sha")"
+          commit_timestamp="$(date --utc --date="@${commit_epoch}" +%Y-%m-%dT%H:%M:%SZ)"
+          echo "CAMEX_GIT_SHA=${resolved_sha}" >> "$GITHUB_ENV"
+          echo "CAMEX_BUILD_TIMESTAMP_UTC=${commit_timestamp}" >> "$GITHUB_ENV"
+          echo "RELEASE_TARGET_SHA=${resolved_sha}" >> "$GITHUB_ENV"
+
+      - name: Verify patch whitespace
+        run: git diff --check "$(git merge-base origin/main HEAD)"...HEAD
+
+      - name: Verify camera architecture
+        run: ./scripts/verify-camera-architecture.sh
+
+      - name: Validate required signing secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -n "${CAMERA_DEV_KEYSTORE_BASE64:-}" ]] || missing+=(CAMERA_DEV_KEYSTORE_BASE64)
+          [[ -n "${CAMERA_DEV_KEYSTORE_PASSWORD:-}" ]] || missing+=(CAMERA_DEV_KEYSTORE_PASSWORD)
+          [[ -n "${CAMERA_DEV_KEY_ALIAS:-}" ]] || missing+=(CAMERA_DEV_KEY_ALIAS)
+          [[ -n "${CAMERA_DEV_KEY_PASSWORD:-}" ]] || missing+=(CAMERA_DEV_KEY_PASSWORD)
+          if ((${#missing[@]} > 0)); then
+            printf 'Missing required repository secret: %s\n' "${missing[@]}" >&2
+            exit 1
+          fi
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@0723195856401067f7a2779048b490ace7a47d7c # v5
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5
+        with:
+          dependency-graph: disabled
+
+      - name: Install pinned Android SDK, NDK, and CMake
+        run: ./scripts/install-android-sdk.sh
+
+      - name: Decode development keystore and pin public signer
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          keystore="$RUNNER_TEMP/camera-development-ota.jks"
+          cert="$RUNNER_TEMP/camera-development-ota.der"
+          printf '%s' "$CAMERA_DEV_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          keytool -exportcert \
+            -alias "$CAMERA_DEV_KEY_ALIAS" \
+            -keystore "$keystore" \
+            -storepass "$CAMERA_DEV_KEYSTORE_PASSWORD" \
+            -file "$cert" >/dev/null
+          signer_sha="$(sha256sum "$cert" | awk '{print $1}')"
+          [[ "$signer_sha" =~ ^[0-9a-f]{64}$ ]] || { echo 'Could not derive development signer SHA-256.' >&2; exit 1; }
+          echo "CAMEX_DEV_KEYSTORE_PATH=${keystore}" >> "$GITHUB_ENV"
+          echo "CAMEX_DEV_KEYSTORE_PASSWORD=${CAMERA_DEV_KEYSTORE_PASSWORD}" >> "$GITHUB_ENV"
+          echo "CAMEX_DEV_KEY_ALIAS=${CAMERA_DEV_KEY_ALIAS}" >> "$GITHUB_ENV"
+          echo "CAMEX_DEV_KEY_PASSWORD=${CAMERA_DEV_KEY_PASSWORD}" >> "$GITHUB_ENV"
+          echo "CAMEX_DEV_SIGNING_CERT_SHA256=${signer_sha}" >> "$GITHUB_ENV"
+
+      - name: Allocate monotonic development version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_epoch=1704067200
+          version_offset=200000000
+          now_epoch="$(date -u +%s)"
+          timestamp_candidate=$((version_offset + now_epoch - base_epoch))
+          max_historical=0
+          while IFS= read -r tag; do
+            case "$tag" in
+              dev-ota-v[0-9]*)
+                value="${tag#dev-ota-v}"
+                if [[ "$value" =~ ^[0-9]+$ ]] && ((value > max_historical)); then
+                  max_historical="$value"
+                fi
+                ;;
+            esac
+          done < <(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '.[].tag_name')
+          version_code="$timestamp_candidate"
+          if ((version_code <= max_historical)); then
+            version_code=$((max_historical + 1))
+          fi
+          if ((version_code <= 0 || version_code >= 2147483647)); then
+            echo 'Allocated development OTA versionCode is outside Android Int range.' >&2
+            exit 1
+          fi
+          version_name="0.1.0-dev.${version_code}"
+          tag="dev-ota-v${version_code}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo 'Refusing to overwrite an existing development OTA release.' >&2
+            exit 1
+          fi
+          echo "CAMEX_OTA_VERSION_CODE=${version_code}" >> "$GITHUB_ENV"
+          echo "CAMEX_OTA_VERSION_NAME=${version_name}" >> "$GITHUB_ENV"
+          echo "OTA_TAG=${tag}" >> "$GITHUB_ENV"
+          echo "version_code=${version_code}" >> "$GITHUB_OUTPUT"
+          echo "version_name=${version_name}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Run Phase 1B camera regressions
+        run: |
+          ./gradlew --no-daemon --stacktrace testDebugUnitTest \
+            --tests 'com.sahidcode404.camex.core.camera.runtime.ActiveCameraSelectionTest' \
+            --tests 'com.sahidcode404.camex.core.camera.runtime.CameraSelectionPolicyTest' \
+            --tests 'com.sahidcode404.camex.core.camera.topology.CanonicalFingerprintCollisionGuardTest' \
+            --tests 'com.sahidcode404.camex.core.logic.LensDuplicateFilterTest' \
+            --tests 'com.sahidcode404.camex.core.logic.CompatibilitySelectionReportJsonTest'
+
+      - name: Run focused development OTA tests
+        run: |
+          ./gradlew --no-daemon --stacktrace testDebugUnitTest \
+            --tests 'com.sahidcode404.camex.core.update.*'
+
+      - name: Run full unit tests and lint
+        run: ./gradlew --no-daemon --stacktrace testDebugUnitTest lintDebug
+
+      - name: Assemble stable-signed devOta APK and all native ABIs
+        run: ./gradlew --no-daemon --stacktrace assembleDevOta
+
+      - name: Verify signed OTA APK package version signer and native ABIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="app/build/outputs/apk/devOta/app-devOta.apk"
+          [[ -f "$apk" ]] || { echo 'devOta APK was not produced.' >&2; exit 1; }
+          build_tools="$ANDROID_HOME/build-tools/37.0.0"
+          "$build_tools/apksigner" verify --verbose --print-certs "$apk" > "$RUNNER_TEMP/apksigner.txt"
+          signer_sha="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/apksigner.txt" | head -n1 | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+          [[ "$signer_sha" == "$CAMEX_DEV_SIGNING_CERT_SHA256" ]] || { echo 'Final APK signer does not match the expected development signer.' >&2; exit 1; }
+          badging="$("$build_tools/aapt2" dump badging "$apk")"
+          package_name="$(printf '%s\n' "$badging" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n1)"
+          version_code="$(printf '%s\n' "$badging" | sed -n "s/^package:.* versionCode='\([^']*\)'.*/\1/p" | head -n1)"
+          version_name="$(printf '%s\n' "$badging" | sed -n "s/^package:.* versionName='\([^']*\)'.*/\1/p" | head -n1)"
+          [[ "$package_name" == 'com.sahidcode404.camex' ]] || { echo 'Final APK package name mismatch.' >&2; exit 1; }
+          [[ "$version_code" == "$CAMEX_OTA_VERSION_CODE" ]] || { echo 'Final APK versionCode mismatch.' >&2; exit 1; }
+          [[ "$version_name" == "$CAMEX_OTA_VERSION_NAME" ]] || { echo 'Final APK versionName mismatch.' >&2; exit 1; }
+          for abi in armeabi-v7a arm64-v8a x86 x86_64; do
+            unzip -l "$apk" | grep -q "lib/${abi}/libcamex_native.so" || { echo "Missing native ABI: ${abi}" >&2; exit 1; }
+          done
+
+      - name: Construct verified release assets
+        shell: bash
+        env:
+          RELEASE_NOTES_INPUT: ${{ inputs.release_notes }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp app/build/outputs/apk/devOta/app-devOta.apk release/Camera-dev-ota.apk
+          apk_sha="$(sha256sum release/Camera-dev-ota.apk | awk '{print $1}')"
+          apk_size="$(stat -c '%s' release/Camera-dev-ota.apk)"
+          published_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          download_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${OTA_TAG}/Camera-dev-ota.apk"
+          jq -n \
+            --argjson schemaVersion 1 \
+            --arg channel development \
+            --arg packageName com.sahidcode404.camex \
+            --argjson versionCode "$CAMEX_OTA_VERSION_CODE" \
+            --arg versionName "$CAMEX_OTA_VERSION_NAME" \
+            --arg gitSha "$CAMEX_GIT_SHA" \
+            --arg apkName Camera-dev-ota.apk \
+            --arg downloadUrl "$download_url" \
+            --arg sha256 "$apk_sha" \
+            --argjson size "$apk_size" \
+            --arg signer "$CAMEX_DEV_SIGNING_CERT_SHA256" \
+            --argjson minimumSdk 23 \
+            --arg publishedAt "$published_at" \
+            --arg releaseNotes "${RELEASE_NOTES_INPUT:-}" \
+            '{schemaVersion:$schemaVersion,channel:$channel,packageName:$packageName,versionCode:$versionCode,versionName:$versionName,gitSha:$gitSha,apk:{name:$apkName,downloadUrl:$downloadUrl,sha256:$sha256,size:$size,signingCertificateSha256:$signer},minimumSdk:$minimumSdk,publishedAt:$publishedAt,mandatory:false,releaseNotes:$releaseNotes}' \
+            > release/update.json
+          sha256sum release/Camera-dev-ota.apk release/update.json | sed 's#release/##' > release/SHA256SUMS.txt
+          grep -q "$apk_sha  Camera-dev-ota.apk" release/SHA256SUMS.txt
+
+      - name: Create draft prerelease with all verified assets
+        shell: bash
+        env:
+          RELEASE_NOTES_INPUT: ${{ inputs.release_notes }}
+        run: |
+          set -euo pipefail
+          gh release create "$OTA_TAG" \
+            release/Camera-dev-ota.apk \
+            release/update.json \
+            release/SHA256SUMS.txt \
+            --target "$RELEASE_TARGET_SHA" \
+            --title "Camera Development ${CAMEX_OTA_VERSION_NAME}" \
+            --notes "${RELEASE_NOTES_INPUT:-Development OTA build ${CAMEX_OTA_VERSION_NAME}}" \
+            --prerelease \
+            --draft
+
+      - name: Verify draft assets then publish prerelease
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets="$(gh release view "$OTA_TAG" --json assets --jq '.assets[].name' | sort)"
+          expected="$(printf '%s\n' Camera-dev-ota.apk SHA256SUMS.txt update.json | sort)"
+          [[ "$assets" == "$expected" ]] || { echo 'Draft release assets are incomplete; leaving the release unpublished.' >&2; exit 1; }
+          gh release edit "$OTA_TAG" --draft=false --prerelease
+
+      - name: Summarize public release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk_sha="$(sha256sum release/Camera-dev-ota.apk | awk '{print $1}')"
+          {
+            echo '### Development OTA prerelease'
+            echo "- Tag: ${OTA_TAG}"
+            echo "- Version: ${CAMEX_OTA_VERSION_NAME} (${CAMEX_OTA_VERSION_CODE})"
+            echo "- Commit: ${CAMEX_GIT_SHA}"
+            echo "- Signing certificate SHA-256: ${CAMEX_DEV_SIGNING_CERT_SHA256}"
+            echo "- APK SHA-256: ${apk_sha}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean signing material
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$RUNNER_TEMP/camera-development-ota.jks" "$RUNNER_TEMP/camera-development-ota.der"
