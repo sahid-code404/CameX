@@ -10,8 +10,10 @@ import com.sahidcode404.camex.core.camera.CameraSessionController
 import com.sahidcode404.camex.core.camera.CameraSessionState
 import com.sahidcode404.camex.core.camera.diagnostics.CameraStartupTraceSnapshot
 import com.sahidcode404.camex.core.camera.discovery.HybridCameraDiscoverySnapshot
+import com.sahidcode404.camex.core.camera.runtime.ActiveCameraSelection
 import com.sahidcode404.camex.core.camera.runtime.CameraRuntimeCoordinator
 import com.sahidcode404.camex.core.camera.runtime.CameraRuntimePhase
+import com.sahidcode404.camex.core.camera.runtime.CameraSelectionPolicy
 import com.sahidcode404.camex.core.camera.topology.CameraDiscoverySource
 import com.sahidcode404.camex.core.camera.topology.CameraProfileSelector
 import com.sahidcode404.camex.core.camera.topology.CameraRoute
@@ -66,23 +68,34 @@ private data class CameraUiRuntime(
     val topology: CameraTopology,
     val discovery: HybridCameraDiscoverySnapshot,
     val phase: CameraRuntimePhase,
+    val activeSelection: ActiveCameraSelection? = null,
     val startupTrace: CameraStartupTraceSnapshot = CameraStartupTraceSnapshot(),
 ) {
     /** One descriptor per canonical optical lens. Profiles never become normal lens buttons. */
     val lenses: List<LensDescriptor>
-        get() = topology.routes.mapIndexed { index, route ->
-            route.toLensDescriptor().copy(discoveryOrder = index)
+        get() {
+            val canonical = topology.routes.mapIndexed { index, route ->
+                route.toLensDescriptor().copy(discoveryOrder = index)
+            }
+            val active = activeSelection ?: return canonical
+            val fingerprint = active.canonicalLensFingerprint ?: return canonical
+            if (canonical.any { it.fingerprint?.value == fingerprint.value }) return canonical
+            val fallback = active.activeProfileDescriptor ?: return canonical
+            return canonical + fallback.copy(
+                fingerprint = fingerprint,
+                discoveryOrder = canonical.size,
+            )
         }
 
-    /**
-     * The session owns an exact transport profile, so resolve its routing key back to the canonical
-     * optical lens. This keeps UI selection stable when failover changes only the profile.
-     */
+    /** Canonical optical selection derived only from the verified runtime selection model. */
     val selectedLens: LensDescriptor?
-        get() = session.selectedRoutingKey?.let { key ->
-            topology.routes.firstOrNull { route ->
-                route.profiles.any { profile -> profile.routingKey == key }
+        get() {
+            val active = activeSelection ?: return null
+            val fingerprint = active.canonicalLensFingerprint ?: return null
+            return topology.routes.firstOrNull {
+                it.lensFingerprint?.value == fingerprint.value
             }?.toLensDescriptor()
+                ?: active.activeProfileDescriptor?.copy(fingerprint = fingerprint)
         }
 }
 
@@ -109,6 +122,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         runtimeCoordinator.phase,
     ) { sessionState, session, topology, discovery, phase ->
         CameraUiRuntime(sessionState, session, topology, discovery, phase)
+    }.combine(runtimeCoordinator.activeSelection) { runtime, activeSelection ->
+        runtime.copy(activeSelection = activeSelection)
     }.combine(runtimeCoordinator.discovery.startupTrace.snapshot) { runtime, trace ->
         runtime.copy(startupTrace = trace)
     }
@@ -128,15 +143,13 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     init {
         launchSafely { runtimeCoordinator.bootstrapCache() }
         launchSafely {
-            controller.state.collect { state ->
-                if (state is CameraSessionState.Previewing) {
-                    controller.snapshot.value.lenses
-                        .firstOrNull { it.identity.routingKey == state.routingKey }
-                        ?.let { lens ->
-                            lens.fingerprint?.value?.let { fingerprint ->
-                                settingsStore.setLastSelected(lens.facing, fingerprint)
-                            }
-                        }
+            runtimeCoordinator.activeSelection.collect { selection ->
+                if (selection?.verified == true &&
+                    (selection.facing == LensFacing.BACK || selection.facing == LensFacing.FRONT)
+                ) {
+                    selection.canonicalLensFingerprint?.value?.let { fingerprint ->
+                        settingsStore.setLastSelected(selection.facing, fingerprint)
+                    }
                 }
             }
         }
@@ -169,28 +182,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         launchSafely { runtimeCoordinator.resetDiscoveryCache() }
     }
 
+    /** Surface lifecycle never chooses a camera. The controller reuses its exact selected profile. */
     fun bindPreview(view: android.view.TextureView) {
-        launchSafely {
-            val runtime = currentRuntime()
-            val candidates = selectorLenses(runtime, settings.value, includeHidden = false)
-            val selectedKey = runtime.session.selectedRoutingKey
-            val selectedOpticalFingerprint = runtime.selectedLens?.fingerprint?.value
-            val target = candidates.firstOrNull {
-                it.fingerprint?.value == selectedOpticalFingerprint
-            } ?: PrimaryLensSelector.select(candidates, userReference(settings.value))
-                ?: candidates.firstOrNull()
-            if (target == null) {
-                // Compose can create the TextureView while discovery still owns the controller or
-                // while a visibility update is reaching DataStore. Retain the surface binding.
-                if (selectedKey != null) controller.pause()
-                controller.bindPreview(view)
-            } else {
-                // A failover profile has a different routing key but the same optical fingerprint;
-                // never reopen the old preferred profile merely because the TextureView rebound.
-                if (selectedOpticalFingerprint != target.fingerprint?.value) controller.open(target)
-                controller.bindPreview(view)
-            }
-        }
+        launchSafely { controller.bindPreview(view) }
     }
 
     fun unbindPreview() {
@@ -211,58 +205,42 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun switchFacing() {
         val runtime = currentRuntime()
+        val active = runtime.activeSelection?.takeIf { it.verified } ?: return
         val preferences = settings.value
         val lenses = selectorLenses(runtime, preferences, includeHidden = false)
-        val currentFacing = runtime.selectedLens?.facing ?: LensFacing.BACK
-        val targetFacing = nextFacing(lenses, currentFacing) ?: return
-        val lastFingerprint = when (targetFacing) {
-            LensFacing.BACK -> preferences.lastSelectedRearFingerprint
-            LensFacing.FRONT -> preferences.lastSelectedFrontFingerprint
-            else -> null
-        }
-        val candidates = lenses.filter { it.facing == targetFacing }
-        val target = candidates.firstOrNull { it.fingerprint?.value == lastFingerprint }
-            ?: if (targetFacing == LensFacing.BACK) {
-                PrimaryLensSelector.select(candidates, userReference(preferences))
-            } else {
-                candidates.firstOrNull()
-            }
-        target?.let(::openAndRemember)
+        val targetFacing = CameraSelectionPolicy.targetFacing(lenses, active.facing) ?: return
+        CameraSelectionPolicy.chooseSwitchTarget(lenses, targetFacing, preferences)
+            ?.let(::openAndRemember)
     }
 
     fun setLensVisible(fingerprint: String, visible: Boolean) {
         launchSafely {
             settingsStore.setVisible(fingerprint, visible)
             val runtimeSnapshot = currentRuntime()
-            val selectedFingerprint = runtimeSnapshot.selectedLens?.fingerprint?.value
+            val selectedFingerprint = runtimeSnapshot.activeSelection
+                ?.canonicalLensFingerprint
+                ?.value
             val records = settings.value.records.associateBy { it.fingerprint }.toMutableMap()
             records[fingerprint] = (records[fingerprint] ?: LensPreferenceRecord(fingerprint))
                 .copy(visible = visible)
             val nextPreferences = settings.value.copy(records = records.values.toList())
-            if (visible) {
-                val candidates = selectorLenses(
-                    runtimeSnapshot,
-                    nextPreferences,
-                    includeHidden = false,
-                )
-                val target = candidates.firstOrNull {
-                    it.fingerprint?.value == selectedFingerprint
-                } ?: candidates.firstOrNull { it.fingerprint?.value == fingerprint }
+            val candidates = selectorLenses(
+                runtimeSnapshot,
+                nextPreferences,
+                includeHidden = false,
+            )
+            if (visible && selectedFingerprint == null) {
+                candidates.firstOrNull { it.fingerprint?.value == fingerprint }
+                    ?.let { runtimeCoordinator.selectLens(it) }
+                controller.resume()
+            } else if (!visible && selectedFingerprint == fingerprint) {
+                val activeFacing = runtimeSnapshot.activeSelection?.facing
+                val target = candidates.firstOrNull { it.facing == activeFacing }
                     ?: candidates.firstOrNull()
-                target?.let {
-                    controller.switchTo(it)
-                    controller.resume()
-                }
-            } else if (selectedFingerprint == fingerprint) {
-                val target = selectorLenses(
-                    currentRuntime(),
-                    nextPreferences,
-                    includeHidden = false,
-                ).firstOrNull()
                 if (target == null) {
                     controller.pause()
                 } else {
-                    controller.switchTo(target)
+                    runtimeCoordinator.selectLens(target)
                 }
             }
         }
@@ -326,13 +304,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         topology = runtimeCoordinator.topology.value,
         discovery = runtimeCoordinator.discovery.snapshot.value,
         phase = runtimeCoordinator.phase.value,
+        activeSelection = runtimeCoordinator.activeSelection.value,
         startupTrace = runtimeCoordinator.discovery.startupTrace.current(),
     )
 
     private fun openAndRemember(lens: LensDescriptor) {
-        launchSafely {
-            controller.switchTo(lens)
-        }
+        launchSafely { runtimeCoordinator.selectLens(lens) }
     }
 
     private fun launchSafely(block: suspend () -> Unit): Job = viewModelScope.launch {
@@ -356,19 +333,15 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     ): CameraAppUiState {
         val sessionState = runtime.sessionState
         val selector = selectorLenses(runtime, preferences, includeHidden = false)
-        val selected = runtime.selectedLens
-        val activeFacing = selected?.facing ?: selector.firstOrNull()?.facing ?: LensFacing.BACK
-        val facingLenses = selector.filter { lens ->
-            lens.facing == activeFacing || lens.facing == LensFacing.EXTERNAL ||
-                lens.facing == LensFacing.UNKNOWN
-        }
+        val projection = CameraSelectionPolicy.project(
+            selectorLenses = selector,
+            activeSelection = runtime.activeSelection,
+            sessionState = sessionState,
+        )
         val reference = referenceLens(
             selectorLenses(runtime, preferences, includeHidden = true),
             preferences,
         )
-        val selectedIsVisible = selected != null && selector.any {
-            it.fingerprint?.value == selected.fingerprint?.value
-        }
         val records = preferences.records.associateBy { it.fingerprint }
         val cameraState = CameraScreenUiState(
             permissionGranted = permission,
@@ -380,25 +353,25 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     "Starting camera while discovery continues in the background"
                 else -> sessionState.statusText()
             },
-            lenses = facingLenses.map { lens ->
+            lenses = projection.lenses.map { lens ->
                 val fingerprint = lens.fingerprint?.value ?: lens.identity.routingKey
                 LensButtonUiModel(
                     fingerprint = fingerprint,
                     label = displayLabel(lens, records[fingerprint]?.displayName, reference),
                     facing = lens.facing.name,
-                    enabled = lens.usability.isSelectable,
+                    enabled = lens.usability.isSelectable && projection.lensSelectionEnabled,
                 )
             },
-            selectedFingerprint = selected?.fingerprint?.value,
-            activeFacing = activeFacing.name,
-            switchFacingLabel = when (nextFacing(selector, activeFacing)) {
+            selectedFingerprint = projection.selectedFingerprint,
+            activeFacing = projection.activeFacing.name,
+            switchFacingLabel = when (projection.switchTarget) {
                 LensFacing.BACK -> "Rear"
                 LensFacing.FRONT -> "Front"
-                LensFacing.EXTERNAL -> "External"
-                LensFacing.UNKNOWN -> "Other"
-                null -> "Switch"
+                LensFacing.EXTERNAL, LensFacing.UNKNOWN, null -> "Switch"
             },
-            previewVisible = sessionState is CameraSessionState.Previewing && selectedIsVisible,
+            switchFacingEnabled = projection.switchEnabled,
+            previewVisible = sessionState is CameraSessionState.Previewing &&
+                runtime.activeSelection?.activeProfileRoutingKey == sessionState.routingKey,
             recoverableError = (sessionState as? CameraSessionState.ErrorRecoverable)?.error?.detail,
         )
         return CameraAppUiState(
@@ -416,25 +389,6 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         val unique = LensDuplicateFilter.filterForSelector(runtime.lenses)
         return LensPreferenceOrdering.resolve(unique, preferences, includeHidden)
             .map { it.lens }
-    }
-
-    private fun nextFacing(
-        lenses: List<LensDescriptor>,
-        current: LensFacing,
-    ): LensFacing? {
-        val order = listOf(
-            LensFacing.BACK,
-            LensFacing.FRONT,
-            LensFacing.EXTERNAL,
-            LensFacing.UNKNOWN,
-        )
-        val currentIndex = order.indexOf(current).takeIf { it >= 0 } ?: 0
-        return (1..order.size)
-            .asSequence()
-            .map { offset -> order[(currentIndex + offset) % order.size] }
-            .firstOrNull { candidate ->
-                candidate != current && lenses.any { lens -> lens.facing == candidate }
-            }
     }
 
     private fun lensSettingsModels(
@@ -470,6 +424,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         reference: LensDescriptor?,
     ): DiagnosticsUiState {
         val records = preferences.records.associateBy { it.fingerprint }
+        val selector = selectorLenses(runtime, preferences, includeHidden = false)
+        val projection = CameraSelectionPolicy.project(selector, runtime.activeSelection, sessionState)
+        val normalVisibleFrontCount = selector.count { it.facing == LensFacing.FRONT }
+        val normalVisibleRearCount = selector.count { it.facing == LensFacing.BACK }
         return DiagnosticsUiState(
             buildSummary = listOf(
                 DiagnosticField("Version", "${platform.app.versionName} (${platform.app.versionCode})"),
@@ -508,6 +466,26 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 DiagnosticField(
                     "Camera profiles",
                     runtime.topology.routes.sumOf { it.profiles.size }.toString(),
+                ),
+                DiagnosticField("Normal visible front", normalVisibleFrontCount.toString()),
+                DiagnosticField("Normal visible rear", normalVisibleRearCount.toString()),
+                DiagnosticField("Camera UI facing", projection.activeFacing.name),
+                DiagnosticField("Camera UI lens count", projection.lenses.size.toString()),
+                DiagnosticField(
+                    "Active session routing key",
+                    runtime.activeSelection?.activeProfileRoutingKey ?: "None",
+                ),
+                DiagnosticField(
+                    "Active canonical fingerprint",
+                    runtime.activeSelection?.canonicalLensFingerprint?.value ?: "None",
+                ),
+                DiagnosticField(
+                    "Active profile facing",
+                    runtime.activeSelection?.activeProfileDescriptor?.facing?.name ?: "Unknown",
+                ),
+                DiagnosticField(
+                    "Active canonical facing",
+                    runtime.activeSelection?.facing?.name ?: "Unknown",
                 ),
                 DiagnosticField("Initial deep scan", runtime.discovery.initialDeepScanRequired.yesNo()),
                 DiagnosticField("Environment", runtime.topology.environmentFingerprint.stableKey.take(20)),
@@ -705,7 +683,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 DiagnosticField("Number of profiles", profileOrder.size.toString()),
             ),
             advanced = listOf(
-                DiagnosticField("Canonical lens ID", "cl2_$fingerprintValue"),
+                DiagnosticField("Canonical lens ID", "cl3_$fingerprintValue"),
                 DiagnosticField("Category", category.name),
                 DiagnosticField("Pixel array", capabilities.pixelArraySize.sizeText()),
                 DiagnosticField("Hardware", capabilities.hardwareLevel.name),
