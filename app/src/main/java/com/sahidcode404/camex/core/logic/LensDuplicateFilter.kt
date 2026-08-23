@@ -1,8 +1,6 @@
 package com.sahidcode404.camex.core.logic
 
-import com.sahidcode404.camex.core.model.CapabilitySupport
 import com.sahidcode404.camex.core.model.FingerprintStrategy
-import com.sahidcode404.camex.core.model.LensCategory
 import com.sahidcode404.camex.core.model.LensDescriptor
 import com.sahidcode404.camex.core.model.LensFacing
 import com.sahidcode404.camex.core.model.LensUsability
@@ -12,7 +10,10 @@ data class DuplicateLensGroup(
     val members: List<LensDescriptor>,
 )
 
-/** Keeps all nodes available to diagnostics while selecting one representation for the lens UI. */
+/**
+ * Exact-identity safety net only. Cross-route optical canonicalization belongs exclusively to
+ * CameraTopologyResolver; this UI layer must never compare focal/FOV/sensor/stream geometry.
+ */
 object LensDuplicateFilter {
     fun filterForSelector(lenses: List<LensDescriptor>): List<LensDescriptor> =
         group(
@@ -73,16 +74,11 @@ object LensDuplicateFilter {
         val leftPhysical = left.identity.physicalCameraId?.takeIf(String::isNotBlank)
         val rightPhysical = right.identity.physicalCameraId?.takeIf(String::isNotBlank)
         if (leftPhysical != null && leftPhysical == rightPhysical) return true
-        // Canonical topology resolution owns cross-route aliasing. Similar optics alone can still
-        // describe two real sensors, so this UI safety net never performs a second heuristic merge.
         return false
     }
 
     private val representativeComparator = compareBy<LensDescriptor> { usabilityRank(it.usability) }
         .thenBy { if (it.probeResult?.usable == true) 1 else 0 }
-        .thenBy { if (it.capabilities.flags.raw == CapabilitySupport.SUPPORTED) 1 else 0 }
-        .thenBy { metadataCount(it) }
-        .thenBy { it.capabilities.pixelArraySize?.area ?: -1L }
         .thenBy { it.fingerprint?.value.orEmpty() }
         .thenBy { -it.discoveryOrder }
 
@@ -96,17 +92,4 @@ object LensDuplicateFilter {
         LensUsability.UNKNOWN -> 2
         else -> 0
     }
-
-    private fun metadataCount(lens: LensDescriptor): Int = with(lens.capabilities) {
-        listOf(
-            focalLengthsMm,
-            sensorPhysicalSize,
-            pixelArraySize,
-            activeArray,
-            sensorOrientationDegrees,
-            apertures,
-            streamConfigurations,
-        ).count { it != null }
-    }
-
 }
