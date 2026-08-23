@@ -12,6 +12,7 @@ import android.hardware.camera2.CaptureRequest
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.Range
 import android.view.Surface
 import android.view.TextureView
 import com.sahidcode404.camex.core.model.CapabilitySupport
@@ -327,6 +328,7 @@ class DefaultCameraSessionController(
                 if (view.surfaceTextureListener === surfaceListener) {
                     view.surfaceTextureListener = null
                 }
+                TexturePreviewTransform.reset(view)
             }
         }
         boundTextureView = null
@@ -411,6 +413,10 @@ class DefaultCameraSessionController(
                 CameraSessionState.Opening(lens.identity.routingKey)
             }
             val textureState = withContext(mainDispatcher) {
+                // A TextureView retains its previous transform across producer reconfiguration.
+                // Clear that transform before changing buffer geometry so a lens switch can never
+                // briefly combine the old lens matrix with the new lens dimensions.
+                TexturePreviewTransform.reset(view)
                 view.surfaceTexture?.also {
                     it.setDefaultBufferSize(configuration.size.width, configuration.size.height)
                 }?.let { it to it.timestamp }
@@ -449,9 +455,16 @@ class DefaultCameraSessionController(
             )
             frameGate = gate
             pendingTextureFrame.set(gate)
+            val previewFpsRange = PreviewFpsSelector.selectForStream(
+                ranges = lens.capabilities.previewFpsRanges,
+                minimumFrameDurationNanos = configuration.minFrameDurationNs,
+            )
             val request = device.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                 addTarget(surface)
                 set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                previewFpsRange?.let { fps ->
+                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(fps.min, fps.max))
+                }
                 if (lens.capabilities.afModes.orEmpty().contains("CONTINUOUS_PICTURE")) {
                     set(
                         CaptureRequest.CONTROL_AF_MODE,
@@ -567,6 +580,9 @@ class DefaultCameraSessionController(
         activeLens = null
         activePreviewConfiguration = null
         mutableSnapshot.value = mutableSnapshot.value.copy(activePreviewSize = null)
+        boundTextureView?.let { view ->
+            withContext(mainDispatcher) { TexturePreviewTransform.reset(view) }
+        }
     }
 
     private suspend fun handleSurfaceAvailable() = operationMutex.withLock {
@@ -659,6 +675,9 @@ class DefaultCameraSessionController(
                 targetHeight.coerceAtLeast(1),
                 maximumArea = policy.maximumPreviewArea,
                 maximumLongEdge = policy.maximumPreviewLongEdge,
+                preferredMinimumFps = PreviewFpsSelector.preferredTargetFps(
+                    lens.capabilities.previewFpsRanges,
+                ),
             ),
         ) ?: return null
         return candidates.firstOrNull {

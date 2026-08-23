@@ -7,6 +7,10 @@ import kotlin.math.max
 /**
  * TextureView already compensates for sensor mounting orientation. The application transform
  * removes TextureView's non-uniform fill, center-crops uniformly, and compensates display rotation.
+ *
+ * Keep this math aligned with the hardware-validated Phase 1 preview behaviour. Lens switches may
+ * replace the producer buffer geometry, so callers should reset the previous matrix before binding
+ * a new buffer and then apply this transform using the new stream's exact dimensions.
  */
 data class PreviewTransform(
     val scaleX: Float,
@@ -35,13 +39,10 @@ object TexturePreviewTransform {
     }
 
     /**
-     * Corrects TextureView's default non-uniform fill into one uniform center-crop.
+     * Hardware-validated Phase 1 resizable-TextureView transform.
      *
-     * The old transform had several sensor-orientation-specific scale branches. During lens/facing
-     * switches that could leave X and Y derived from different buffer axes and intermittently
-     * stretch the preview. This version first resolves the buffer dimensions as they are presented
-     * to the display, then derives a single center-crop scale. One axis therefore remains exactly
-     * 1x and the other only crops; neither axis can independently distort the image.
+     * Relative rotation determines axis swapping. Only display rotation is applied here because the
+     * TextureView producer transform already accounts for the sensor's mounting orientation.
      */
     fun calculate(
         viewWidth: Int,
@@ -64,28 +65,43 @@ object TexturePreviewTransform {
             frontFacing,
         )
         val axesSwapped = relativeRotation % 180 != 0
-        val displayedBufferWidth = if (axesSwapped) bufferHeight else bufferWidth
-        val displayedBufferHeight = if (axesSwapped) bufferWidth else bufferHeight
+        val sensorNaturalAxes = sensorOrientation % 180 == 0
 
-        val uniformScale = max(
-            viewWidth.toFloat() / displayedBufferWidth.toFloat(),
-            viewHeight.toFloat() / displayedBufferHeight.toFloat(),
-        )
-        val renderedWidth = displayedBufferWidth * uniformScale
-        val renderedHeight = displayedBufferHeight * uniformScale
-        val scaleX = renderedWidth / viewWidth.toFloat()
-        val scaleY = renderedHeight / viewHeight.toFloat()
-        if (!scaleX.isFinite() || !scaleY.isFinite() || scaleX <= 0f || scaleY <= 0f) return null
-
+        val undoScaleX = when {
+            sensorNaturalAxes && !axesSwapped -> viewWidth.toFloat() / bufferHeight
+            sensorNaturalAxes -> viewWidth.toFloat() / bufferWidth
+            axesSwapped -> viewWidth.toFloat() / bufferHeight
+            else -> viewWidth.toFloat() / bufferWidth
+        }
+        val undoScaleY = when {
+            sensorNaturalAxes && !axesSwapped -> viewHeight.toFloat() / bufferWidth
+            sensorNaturalAxes -> viewHeight.toFloat() / bufferHeight
+            axesSwapped -> viewHeight.toFloat() / bufferWidth
+            else -> viewHeight.toFloat() / bufferHeight
+        }
+        if (undoScaleX <= 0f || undoScaleY <= 0f) return null
+        val centerCropScale = max(undoScaleX, undoScaleY)
+        val scaleX: Float
+        val scaleY: Float
+        if (axesSwapped) {
+            scaleX = centerCropScale / undoScaleX
+            scaleY = centerCropScale / undoScaleY
+        } else {
+            scaleX = viewHeight.toFloat() / viewWidth / undoScaleY * centerCropScale
+            scaleY = viewWidth.toFloat() / viewHeight / undoScaleX * centerCropScale
+        }
         return PreviewTransform(
             scaleX = scaleX,
             scaleY = scaleY,
-            // Display.getRotation is counter-clockwise from the user's point of view.
             clockwiseDisplayCompensationDegrees = -displayRotation,
             mirrorHorizontally = mirrorHorizontally,
             pivotX = viewWidth / 2f,
             pivotY = viewHeight / 2f,
         )
+    }
+
+    fun reset(textureView: TextureView) {
+        textureView.setTransform(Matrix())
     }
 
     fun apply(
@@ -97,7 +113,8 @@ object TexturePreviewTransform {
         frontFacing: Boolean,
         mirrorHorizontally: Boolean,
     ) {
-        // Camera preview should match captured sensor orientation. Keep front preview unmirrored.
+        // Saved RAW/DNG frames are sensor-oriented and not selfie-mirrored. Keep the live front
+        // preview unmirrored so preview geometry agrees with the saved image.
         val effectiveMirror = mirrorHorizontally && !frontFacing
         val transform = calculate(
             viewWidth = textureView.width,
@@ -109,9 +126,7 @@ object TexturePreviewTransform {
             frontFacing = frontFacing,
             mirrorHorizontally = effectiveMirror,
         ) ?: run {
-            // Never keep a stale transform from the previous lens/orientation when geometry is not
-            // currently valid. Identity is safer than showing a stretched transform from old data.
-            textureView.setTransform(Matrix())
+            reset(textureView)
             return
         }
         textureView.setTransform(transform.toMatrix())

@@ -1,5 +1,6 @@
 package com.sahidcode404.camex.core.camera
 
+import com.sahidcode404.camex.core.model.FpsRange
 import kotlin.math.abs
 import kotlin.math.ln
 import kotlin.math.max
@@ -8,8 +9,7 @@ import kotlin.math.min
 /**
  * A framework-neutral stream size considered for a live preview.
  *
- * [minimumFrameDurationNanos] is optional because a surprising number of HALs omit it. A value of
- * zero is treated as unknown, not as an infinitely fast stream.
+ * [minimumFrameDurationNanos] is optional because some HALs omit it. Zero is treated as unknown.
  */
 data class PreviewStreamCandidate(
     val width: Int,
@@ -32,19 +32,18 @@ data class PreviewSelectionRequest(
     /** View dimensions expressed in the camera buffer's orientation. */
     val targetWidth: Int,
     val targetHeight: Int,
-    /** A live preview larger than this normally wastes bandwidth without improving the UI. */
-    val maximumArea: Long = 4_194_304L,
-    val maximumLongEdge: Int = 2_560,
-    val preferredMinimumFps: Double = 30.0,
+    /** Optional evidence-backed limits. Generic operation does not impose a device-size cap. */
+    val maximumArea: Long = Long.MAX_VALUE,
+    val maximumLongEdge: Int = Int.MAX_VALUE,
+    /** Preferred live frame rate derived from camera metadata, not a fixed application value. */
+    val preferredMinimumFps: Double? = null,
 )
 
 /**
- * Selects a preview stream without assuming a device, camera ID, or fixed output aspect ratio.
- *
- * The score deliberately makes aspect ratio and frame-rate viability more important than pixel
- * count. It then prefers the smallest stream that covers the view, avoiding sensor-resolution
- * preview streams on high-resolution cameras. If the HAL reports only slow or oversized choices,
- * those remain eligible as a fallback.
+ * Selects a preview stream without assuming a device, camera ID, fixed resolution, or fixed FPS.
+ * Aspect ratio and frame-rate viability win over pixel count. The smallest good stream that covers
+ * the view is preferred, while metadata-reported slow streams are avoided when a faster compatible
+ * stream exists.
  */
 object PreviewSizeSelector {
     fun select(
@@ -67,9 +66,10 @@ object PreviewSizeSelector {
             it.area <= request.maximumArea && it.longEdge <= request.maximumLongEdge
         }
         val pool = withinBudget.ifEmpty { unique }
-        val hasFastCandidate = pool.any {
+        val preferredFps = request.preferredMinimumFps?.takeIf { it.isFinite() && it > 0.0 }
+        val hasFastCandidate = preferredFps != null && pool.any {
             val fps = it.estimatedMaximumFps
-            fps == null || fps >= request.preferredMinimumFps
+            fps == null || fps + FPS_TOLERANCE >= preferredFps
         }
 
         return pool.minWithOrNull(
@@ -80,7 +80,7 @@ object PreviewSizeSelector {
                     targetArea = targetArea,
                     targetLong = targetLong,
                     targetShort = targetShort,
-                    preferredMinimumFps = request.preferredMinimumFps,
+                    preferredMinimumFps = preferredFps,
                     penalizeSlowStreams = hasFastCandidate,
                 )
             }.thenBy { it.area }
@@ -95,10 +95,9 @@ object PreviewSizeSelector {
         targetArea: Long,
         targetLong: Int,
         targetShort: Int,
-        preferredMinimumFps: Double,
+        preferredMinimumFps: Double?,
         penalizeSlowStreams: Boolean,
     ): Double {
-        // Log-space treats 4:3 vs 16:9 in the same way regardless of which is the target.
         val aspectPenalty = abs(ln(candidate.aspectRatio / targetAspect)) * 10_000.0
         val coversTarget = candidate.longEdge >= targetLong && candidate.shortEdge >= targetShort
         val coveragePenalty = if (coversTarget) 0.0 else 800.0
@@ -109,7 +108,10 @@ object PreviewSizeSelector {
         }
         val fps = candidate.estimatedMaximumFps
         val frameRatePenalty = if (
-            penalizeSlowStreams && fps != null && fps < preferredMinimumFps
+            penalizeSlowStreams &&
+            preferredMinimumFps != null &&
+            fps != null &&
+            fps + FPS_TOLERANCE < preferredMinimumFps
         ) {
             2_000.0 + (preferredMinimumFps - fps) * 25.0
         } else {
@@ -117,4 +119,60 @@ object PreviewSizeSelector {
         }
         return aspectPenalty + coveragePenalty + resolutionPenalty + frameRatePenalty
     }
+
+    private const val FPS_TOLERANCE = 0.75
+}
+
+/**
+ * Chooses a live AE FPS range only from ranges reported by the active camera profile.
+ *
+ * Auto mode prefers the range with the highest lower bound, then highest upper bound. This keeps
+ * the preview smooth instead of allowing AE to fall to a much lower frame rate when the camera
+ * explicitly advertises a faster normal-preview range. If the selected stream reports a minimum
+ * frame duration, ranges that exceed that stream are removed first.
+ */
+object PreviewFpsSelector {
+    fun preferredTargetFps(ranges: Collection<FpsRange>?): Double? = valid(ranges)
+        .maxWithOrNull(
+            compareBy<FpsRange> { it.min }
+                .thenBy { it.max }
+                .thenByDescending { it.max - it.min },
+        )
+        ?.max
+        ?.toDouble()
+
+    fun selectForStream(
+        ranges: Collection<FpsRange>?,
+        minimumFrameDurationNanos: Long?,
+    ): FpsRange? {
+        val valid = valid(ranges)
+        if (valid.isEmpty()) return null
+        val estimatedMax = minimumFrameDurationNanos
+            ?.takeIf { it > 0L }
+            ?.let { 1_000_000_000.0 / it.toDouble() }
+        val compatible = if (estimatedMax == null) {
+            valid
+        } else {
+            valid.filter { it.max.toDouble() <= estimatedMax + FPS_TOLERANCE }
+        }
+        val pool = compatible.ifEmpty {
+            if (estimatedMax == null) valid else valid.filter {
+                it.min.toDouble() <= estimatedMax + FPS_TOLERANCE
+            }.ifEmpty { valid }
+        }
+        return pool.maxWithOrNull(
+            compareBy<FpsRange> { it.min }
+                .thenBy { it.max }
+                .thenByDescending { it.max - it.min },
+        )
+    }
+
+    private fun valid(ranges: Collection<FpsRange>?): List<FpsRange> = ranges
+        .orEmpty()
+        .asSequence()
+        .filter { it.isValid && it.max > 0 }
+        .distinct()
+        .toList()
+
+    private const val FPS_TOLERANCE = 0.75
 }
