@@ -2,7 +2,10 @@ name: Signed GitHub Release
 
 on:
   push:
-    tags: [ 'v*' ]
+    tags:
+      - 'v*'
+    branches:
+      - 'ota-release/v*'
 
 permissions:
   contents: write
@@ -13,22 +16,75 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve release version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              RELEASE_TAG="$GITHUB_REF_NAME"
+              ;;
+            refs/heads/ota-release/v*)
+              RELEASE_TAG="${GITHUB_REF#refs/heads/ota-release/}"
+              ;;
+            *)
+              echo "Unsupported release ref: $GITHUB_REF" >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release ref must derive to vMAJOR.MINOR.PATCH." >&2
+            exit 1
+          fi
+
+          VERSION_NAME="${RELEASE_TAG#v}"
+          VERSION_CODE="${GITHUB_RUN_NUMBER}"
+
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            TAG_SHA="$(git ls-remote origin "refs/tags/$RELEASE_TAG" | awk '{print $1}')"
+            EXISTING_ASSETS="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort)"
+            EXPECTED_ASSETS="$(printf '%s\n' "Camera-${VERSION_NAME}.apk" release-manifest.json | sort)"
+
+            if [[ "$TAG_SHA" == "$GITHUB_SHA" && "$EXISTING_ASSETS" == "$EXPECTED_ASSETS" ]]; then
+              echo "Release $RELEASE_TAG already exists for $GITHUB_SHA with the expected assets; nothing to do."
+              echo "SKIP_RELEASE=true" >> "$GITHUB_ENV"
+              exit 0
+            fi
+
+            echo "Release $RELEASE_TAG already exists but does not match this commit/assets; refusing to overwrite it." >&2
+            exit 1
+          fi
+
+          echo "SKIP_RELEASE=false" >> "$GITHUB_ENV"
+
       - uses: actions/setup-java@v5
+        if: env.SKIP_RELEASE != 'true'
         with:
           distribution: temurin
           java-version: '17'
 
       - uses: android-actions/setup-android@v3
+        if: env.SKIP_RELEASE != 'true'
         with:
           cmdline-tools-version: 15859902
           packages: platform-tools
 
       - name: Install Android SDK, NDK, and CMake
+        if: env.SKIP_RELEASE != 'true'
         run: sdkmanager "platforms;android-37.0" "build-tools;37.0.0" "ndk;29.0.14206865" "cmake;4.1.2"
 
       - uses: gradle/actions/setup-gradle@v4
+        if: env.SKIP_RELEASE != 'true'
 
       - name: Restore signing key
+        if: env.SKIP_RELEASE != 'true'
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -48,18 +104,16 @@ jobs:
           EOF
 
       - name: Build release APK
+        if: env.SKIP_RELEASE != 'true'
         run: |
-          VERSION_NAME="${GITHUB_REF_NAME#v}"
-          VERSION_CODE="${GITHUB_RUN_NUMBER}"
           ./gradlew :app:assembleRelease \
             -PcameraVersionName="$VERSION_NAME" \
             -PcameraVersionCode="$VERSION_CODE" \
             --stacktrace
 
       - name: Prepare release assets
+        if: env.SKIP_RELEASE != 'true'
         run: |
-          VERSION_NAME="${GITHUB_REF_NAME#v}"
-          VERSION_CODE="${GITHUB_RUN_NUMBER}"
           APK_SRC="$(find app/build/outputs/apk/release -name '*.apk' -type f | head -n 1)"
           test -f "$APK_SRC"
 
@@ -86,19 +140,20 @@ jobs:
             "apkAssetName": "${APK}",
             "sha256": "${SHA}",
             "signingCertSha256": "${CERT_SHA}",
-            "changelog": "See GitHub release notes for ${GITHUB_REF_NAME}.",
+            "changelog": "See GitHub release notes for ${RELEASE_TAG}.",
             "mandatory": False,
           }
           open("release-manifest.json", "w").write(json.dumps(manifest, indent=2) + "\n")
           PY
 
       - name: Create GitHub Release
+        if: env.SKIP_RELEASE != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION_NAME="${GITHUB_REF_NAME#v}"
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "$RELEASE_TAG" \
             "Camera-${VERSION_NAME}.apk" \
             release-manifest.json \
+            --target "$GITHUB_SHA" \
             --generate-notes \
-            --title "Camera ${GITHUB_REF_NAME}"
+            --title "Camera $RELEASE_TAG"
