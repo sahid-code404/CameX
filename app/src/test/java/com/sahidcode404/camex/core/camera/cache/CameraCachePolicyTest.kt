@@ -52,21 +52,21 @@ class CameraCachePolicyTest {
     }
 
     @Test
-    fun `legacy schema zero envelope migrates deterministically`() {
-        val legacyEnvironment = environment.copy(cacheSchemaVersion = 0)
+    fun `legacy route-per-lens cache is invalidated rather than reinterpreted`() {
+        val legacyEnvironment = environment.copy(cacheSchemaVersion = 1)
         val legacy = cachedTopology().copy(
-            cacheSchemaVersion = 0,
+            cacheSchemaVersion = 1,
             environmentFingerprint = legacyEnvironment,
-            topology = topology(environment = legacyEnvironment).copy(schemaVersion = 0),
+            topology = topology(environment = legacyEnvironment).copy(schemaVersion = 1),
         )
 
         val result = CameraTopologyCachePolicy.evaluate(legacy, environment)
 
-        assertTrue(result is CameraTopologyCacheResult.Hit)
-        result as CameraTopologyCacheResult.Hit
-        assertTrue(result.migrated)
-        assertEquals(CameraTopology.CACHE_SCHEMA_VERSION, result.cached.cacheSchemaVersion)
-        assertEquals(CameraTopology.CURRENT_SCHEMA_VERSION, result.cached.topology.schemaVersion)
+        assertTrue(result is CameraTopologyCacheResult.Miss)
+        assertEquals(
+            CameraCacheMissReason.CACHE_SCHEMA_CHANGED,
+            (result as CameraTopologyCacheResult.Miss).reason,
+        )
     }
 
     @Test
@@ -132,7 +132,7 @@ class CameraCachePolicyTest {
     }
 
     @Test
-    fun `duplicate route IDs make cache corrupt instead of exposing unstable topology`() {
+    fun `duplicate optical fingerprints make cache corrupt instead of exposing unstable topology`() {
         val route = route("0")
         val invalid = cachedTopology().copy(
             topology = topology(routes = listOf(route, route.copy(openCameraId = "1"))),
@@ -186,7 +186,7 @@ class CameraCachePolicyTest {
     }
 
     @Test
-    fun `trust applies only when route and available lens fingerprint agree`() {
+    fun `trust applies only when profile and optical lens fingerprint agree`() {
         val route = route("0")
         val matching = CameraTrustSnapshot(
             environmentFingerprint = environment,
@@ -200,7 +200,7 @@ class CameraCachePolicyTest {
         )
         val mismatch = matching.copy(
             records = matching.records.map {
-                it.copy(lensFingerprint = LensFingerprint("ct1_different", FingerprintStrategy.STABLE_METADATA))
+                it.copy(lensFingerprint = LensFingerprint("different_optical", FingerprintStrategy.STABLE_METADATA))
             },
         )
 
@@ -217,7 +217,7 @@ class CameraCachePolicyTest {
     }
 
     @Test
-    fun `trust reconciliation prunes vanished route and adds new firmware route`() {
+    fun `trust reconciliation prunes vanished profile and adds new profile`() {
         val oldRoute = route("0")
         val vanishedRoute = route("5")
         val previous = CameraTrustSnapshot(
@@ -299,10 +299,11 @@ class CameraCachePolicyTest {
         sources = setOf(CameraDiscoverySource.JAVA_PUBLIC),
         minimalMetadata = MinimalCameraMetadata(
             facing = LensFacing.BACK,
+            focalLengthsMm = listOf(5.0 + id.length),
             backwardCompatibleAdvertised = CapabilitySupport.SUPPORTED,
             previewStreamActuallyDeclared = CapabilitySupport.SUPPORTED,
         ),
-        lensFingerprint = LensFingerprint("ct1_camera_$id", FingerprintStrategy.STABLE_METADATA),
+        lensFingerprint = LensFingerprint("ol3_camera_$id", FingerprintStrategy.STABLE_METADATA),
         role = PhotographicRole.PHOTOGRAPHIC_UNKNOWN,
         roleConfidence = RoleConfidence.MODERATE,
         trust = CameraRouteTrust(metadata = CameraMetadataTrust.METADATA_VALID),
