@@ -59,6 +59,7 @@ fun CameraScreen(
     state: CameraScreenUiState,
     previewContent: @Composable () -> Unit,
     permissionPermanentlyDenied: Boolean,
+    updateAvailable: Boolean = false,
     onRequestPermission: () -> Unit,
     onOpenAppSettings: () -> Unit,
     onSelectLens: (String) -> Unit,
@@ -78,6 +79,7 @@ fun CameraScreen(
         }
 
         CameraTopBar(
+            updateAvailable = updateAvailable,
             onOpenLensSettings = onOpenLensSettings,
             onOpenDiagnostics = onOpenDiagnostics,
             modifier = Modifier.align(Alignment.TopCenter),
@@ -119,6 +121,7 @@ fun CameraScreen(
 
 @Composable
 private fun CameraTopBar(
+    updateAvailable: Boolean,
     onOpenLensSettings: () -> Unit,
     onOpenDiagnostics: () -> Unit,
     modifier: Modifier = Modifier,
@@ -141,7 +144,17 @@ private fun CameraTopBar(
             fontWeight = FontWeight.SemiBold,
         )
         TextButton(onClick = onOpenDiagnostics) {
-            Text("Diagnostics", color = Color.White)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Diagnostics", color = Color.White)
+                if (updateAvailable) {
+                    Spacer(Modifier.size(6.dp))
+                    Box(
+                        Modifier
+                            .size(8.dp)
+                            .background(Color(0xFFA8C7FA), CircleShape),
+                    )
+                }
+            }
         }
     }
 }
