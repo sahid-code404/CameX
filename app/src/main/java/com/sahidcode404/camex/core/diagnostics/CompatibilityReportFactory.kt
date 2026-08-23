@@ -7,10 +7,15 @@ import com.sahidcode404.camex.core.camera.discovery.HybridCameraDiscoverySnapsho
 import com.sahidcode404.camex.core.camera.discovery.nativebackend.NativeDiscoveryFailure
 import com.sahidcode404.camex.core.camera.topology.CameraDiscoverySource
 import com.sahidcode404.camex.core.camera.topology.CameraEnvironmentFingerprint
+import com.sahidcode404.camex.core.camera.topology.CameraProfile
+import com.sahidcode404.camex.core.camera.topology.CameraProfileSelector
 import com.sahidcode404.camex.core.camera.topology.CameraRoute
 import com.sahidcode404.camex.core.camera.topology.CameraRouteAlias
 import com.sahidcode404.camex.core.camera.topology.CameraRouteFailure
+import com.sahidcode404.camex.core.camera.topology.CameraSessionTrust
 import com.sahidcode404.camex.core.camera.topology.CameraTopology
+import com.sahidcode404.camex.core.camera.topology.OpticalLensMatch
+import com.sahidcode404.camex.core.camera.topology.OpticalLensMatcher
 import com.sahidcode404.camex.core.camera.topology.toLensDescriptor
 import com.sahidcode404.camex.core.logic.CompatibilityReportJson
 import com.sahidcode404.camex.core.logic.LensMath
@@ -21,9 +26,12 @@ import com.sahidcode404.camex.core.model.CameraCacheReport
 import com.sahidcode404.camex.core.model.CameraCompatibilityEntry
 import com.sahidcode404.camex.core.model.CameraEnvironmentReport
 import com.sahidcode404.camex.core.model.CameraMetadataEvidenceReport
+import com.sahidcode404.camex.core.model.CameraProfileCompatibilityReport
 import com.sahidcode404.camex.core.model.CameraRouteAliasReport
 import com.sahidcode404.camex.core.model.CameraRouteFailureReport
 import com.sahidcode404.camex.core.model.CameraStartupTraceReport
+import com.sahidcode404.camex.core.model.CanonicalLensCompatibilityReport
+import com.sahidcode404.camex.core.model.CanonicalLensTrustReport
 import com.sahidcode404.camex.core.model.CanonicalTopologyReport
 import com.sahidcode404.camex.core.model.CompatibilityReport
 import com.sahidcode404.camex.core.model.DeviceReport
@@ -43,8 +51,9 @@ import java.util.TimeZone
 
 object CompatibilityReportFactory {
     /**
-     * Topology-first schema-v2 export. This is a read-only projection: it performs no discovery,
-     * probing, validation or camera opens.
+     * Topology-first schema-v3 export. canonicalLenses[].profiles[] is authoritative; the legacy
+     * cameras[] projection is retained only for older engineering report readers. Export remains
+     * read-only and performs no discovery, probing, validation, camera open, or media access.
      */
     fun create(
         context: Context,
@@ -56,20 +65,27 @@ object CompatibilityReportFactory {
         generatedAtUtc: String = nowUtc(),
     ): CompatibilityReport {
         val platform = PlatformDiagnostics.collect(context.applicationContext)
-        val routes = topology.routes.sortedBy(CameraRoute::canonicalRouteId)
-        val lensesByRoute = lenses.associateBy { lens ->
-            RouteKey(lens.identity.openCameraId, lens.identity.streamPhysicalCameraId)
-        }
+        val routes = topology.routes.sortedWith(
+            compareBy<CameraRoute> { it.lensFingerprint?.value.orEmpty() }
+                .thenBy { it.canonicalRouteId },
+        )
+        val lensesByFingerprint = lenses.mapNotNull { lens ->
+            lens.fingerprint?.value?.let { it to lens }
+        }.toMap()
         val entries = routes.map { route ->
-            val lens = lensesByRoute[RouteKey(route.openCameraId, route.streamPhysicalCameraId)]
+            val lens = route.lensFingerprint?.value?.let(lensesByFingerprint::get)
                 ?: route.toLensDescriptor()
             route.toCompatibilityEntry(lens)
         }
+        val canonicalLensReports = routes.map { route ->
+            val lens = route.lensFingerprint?.value?.let(lensesByFingerprint::get)
+                ?: route.toLensDescriptor()
+            route.toCanonicalLensReport(lens)
+        }
         val userVisibleRoutes = routes.mapNotNull { route ->
-            val lens = lensesByRoute[RouteKey(route.openCameraId, route.streamPhysicalCameraId)]
+            val lens = route.lensFingerprint?.value?.let(lensesByFingerprint::get)
             route.canonicalRouteId.takeIf {
-                lens != null && lens.usability.isSelectable &&
-                    lens.category.isNormalSelectorCandidate
+                lens != null && lens.usability.isSelectable && lens.category.isNormalSelectorCandidate
             }
         }
         val hiddenRoutes = routes.map(CameraRoute::canonicalRouteId) - userVisibleRoutes.toSet()
@@ -119,8 +135,12 @@ object CompatibilityReportFactory {
             canonicalTopology = CanonicalTopologyReport(
                 schemaVersion = topology.schemaVersion,
                 routeCount = routes.size,
-                canonicalRouteIds = routes.map(CameraRoute::canonicalRouteId),
+                canonicalRouteIds = routes.map { route ->
+                    "cl2_${route.lensFingerprint?.value ?: route.canonicalRouteId}"
+                },
+                profileCount = routes.sumOf { it.profiles.size },
             ),
+            canonicalLenses = canonicalLensReports,
             cameras = entries,
             discoveryFailures = javaFailures.map { failure ->
                 DiscoveryFailureReport(
@@ -138,17 +158,18 @@ object CompatibilityReportFactory {
             }.sortedBy(LogicalRelationshipReport::logicalCameraId),
             hiddenRoutes = hiddenRoutes,
             userVisibleRoutes = userVisibleRoutes,
-            trustState = routes.map { route ->
-                RouteTrustReport(
-                    canonicalRouteId = route.canonicalRouteId,
-                    metadataTrust = route.trust.metadata.name,
-                    sessionTrust = route.trust.session.name,
-                    rawTrust = route.trust.raw.name,
-                    failure = route.trust.failure?.toReport(),
-                )
+            trustState = routes.flatMap { route ->
+                route.profiles.map { profile ->
+                    RouteTrustReport(
+                        canonicalRouteId = profile.profileId,
+                        metadataTrust = profile.metadataTrust.name,
+                        sessionTrust = profile.sessionTrust.name,
+                        rawTrust = profile.rawTrust.name,
+                        failure = profile.failure?.toReport(),
+                    )
+                }
             },
             failureReasons = failureReasons(routes, javaFailures, discovery.nativeFailures),
-            // Schema v2 reports lazy route trust directly; it never initiates probe sessions.
             probeResults = emptyList(),
             quirks = quirks,
             app = platform.app.toReport(),
@@ -165,6 +186,77 @@ object CompatibilityReportFactory {
     ): String = CompatibilityReportJson.encode(
         create(context, topology, discovery, startupTrace, lenses, quirks),
     )
+
+    private fun CameraRoute.toCanonicalLensReport(lens: LensDescriptor): CanonicalLensCompatibilityReport {
+        val orderedProfiles = profiles.sortedWith(
+            compareByDescending<CameraProfile> { CameraProfileSelector.score(it) }
+                .thenBy(CameraProfile::profileFingerprint),
+        )
+        val preferredId = preferredProfileId ?: orderedProfiles.firstOrNull()?.profileId
+        val profileReports = orderedProfiles.mapIndexed { index, profile ->
+            CameraProfileCompatibilityReport(
+                profileId = profile.profileId,
+                profileFingerprint = profile.profileFingerprint,
+                preferred = profile.profileId == preferredId,
+                ranking = index + 1,
+                profileScore = CameraProfileSelector.score(profile),
+                discoveredCameraId = profile.discoveredCameraId,
+                openCameraId = profile.openCameraId,
+                physicalCameraId = profile.streamPhysicalCameraId,
+                logicalParentCameraId = profile.logicalParentCameraId,
+                routeKind = profile.routeKind.name,
+                discoverySources = profile.discoverySources.map { it.name }.sorted(),
+                metadataTrust = profile.metadataTrust.name,
+                sessionTrust = profile.sessionTrust.name,
+                rawTrust = profile.rawTrust.name,
+                lastAttemptEpochMs = profile.lastAttemptEpochMs,
+                failure = profile.failure?.toReport(),
+                failureDurability = profile.failure?.durability?.name,
+                previewVerified = profile.sessionTrust == CameraSessionTrust.SESSION_VERIFIED,
+                rawAdvertised = profile.metadata.rawCapabilityAdvertised.name,
+                rawStreamActuallyDeclared = profile.metadata.rawStreamActuallyDeclared.name,
+            )
+        }
+        return CanonicalLensCompatibilityReport(
+            canonicalLensId = "cl2_${lens.fingerprint?.value ?: canonicalRouteId}",
+            opticalFingerprint = lens.fingerprint,
+            facing = lens.facing,
+            role = role.name,
+            roleConfidence = roleConfidence.name,
+            focalLengthsMm = minimalMetadata.focalLengthsMm,
+            fieldOfView = LensMath.fieldOfView(lens.capabilities),
+            sensorPhysicalSize = minimalMetadata.sensorPhysicalSize,
+            pixelArraySize = minimalMetadata.pixelArraySize,
+            canonicalTrust = CanonicalLensTrustReport(
+                metadataTrust = trust.metadata.name,
+                sessionTrust = trust.session.name,
+                rawTrust = trust.raw.name,
+                lastAttemptEpochMs = trust.lastAttemptEpochMs,
+                failure = trust.failure?.toReport(),
+            ),
+            preferredProfileId = preferredId,
+            profileCount = orderedProfiles.size,
+            groupingConfidence = groupingConfidence(orderedProfiles),
+            profiles = profileReports,
+        )
+    }
+
+    private fun groupingConfidence(profiles: List<CameraProfile>): String {
+        if (profiles.size <= 1) return "SINGLE_PROFILE"
+        val matches = buildList {
+            profiles.indices.forEach { left ->
+                for (right in left + 1 until profiles.size) {
+                    add(OpticalLensMatcher.compare(profiles[left], profiles[right]).match)
+                }
+            }
+        }
+        return when {
+            matches.isNotEmpty() && matches.all { it == OpticalLensMatch.STRONG_MATCH } -> "STRONG_MATCH"
+            matches.any { it == OpticalLensMatch.CONFLICT } -> "CONFLICT"
+            matches.any { it == OpticalLensMatch.PROBABLE_MATCH } -> "PROBABLE_MATCH"
+            else -> "MIXED_OR_INSUFFICIENT"
+        }
+    }
 
     private fun CameraEnvironmentFingerprint.toReport(topologySchemaVersion: Int) =
         CameraEnvironmentReport(
@@ -218,8 +310,8 @@ object CompatibilityReportFactory {
                 yuvPreviewSizes = minimalMetadata.yuvPreviewSizes,
             ),
             cacheStatus = when {
-                CameraDiscoverySource.CACHE !in sources -> "LIVE"
-                sources.size == 1 -> "CACHE_ONLY"
+                profiles.none { CameraDiscoverySource.CACHE in it.discoverySources } -> "LIVE"
+                profiles.all { it.discoverySources == setOf(CameraDiscoverySource.CACHE) } -> "CACHE_ONLY"
                 else -> "CACHE_AND_LIVE"
             },
             fingerprint = lens.fingerprint,
@@ -273,13 +365,15 @@ object CompatibilityReportFactory {
         statusCode = statusCode,
     )
 
+    /** Backend ID summaries include every profile, including failed/hidden aliases. */
     private fun List<CameraRoute>.cameraIdsFrom(
         vararg expectedSources: CameraDiscoverySource,
     ): List<String> {
         val sourceSet = expectedSources.toSet()
         return asSequence()
-            .filter { route -> route.sources.any(sourceSet::contains) }
-            .map(CameraRoute::discoveredCameraId)
+            .flatMap { route -> route.profiles.asSequence() }
+            .filter { profile -> profile.discoverySources.any(sourceSet::contains) }
+            .map(CameraProfile::discoveredCameraId)
             .distinct()
             .sorted()
             .toList()
@@ -291,7 +385,9 @@ object CompatibilityReportFactory {
         nativeFailures: List<NativeDiscoveryFailure>,
     ): List<FailureReasonSummaryReport> {
         val reasons = buildList {
-            routes.mapNotNull { it.trust.failure?.kind?.name }.forEach { add("route" to it) }
+            routes.flatMap { it.profiles }
+                .mapNotNull { it.failure?.kind?.name }
+                .forEach { add("profile" to it) }
             javaFailures.forEach { add("java" to it.reason) }
             nativeFailures.forEach { add("native" to it.reason.name) }
         }
@@ -335,11 +431,6 @@ object CompatibilityReportFactory {
     )
 
     private fun String.sanitizedDetail(): String = trim().take(256)
-
-    private data class RouteKey(
-        val openCameraId: String,
-        val physicalCameraId: String?,
-    )
 
     private fun nowUtc(): String = SimpleDateFormat(
         "yyyy-MM-dd'T'HH:mm:ss'Z'",
