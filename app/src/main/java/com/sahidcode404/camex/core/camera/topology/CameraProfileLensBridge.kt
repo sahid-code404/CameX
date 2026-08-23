@@ -24,10 +24,13 @@ fun CameraProfile.toLensDescriptor(
     trust = trust,
 ).toLensDescriptor().copy(fingerprint = opticalFingerprint)
 
-/** All profile descriptors share one optical fingerprint, which is the failover grouping key. */
+/**
+ * All profile descriptors share one optical fingerprint, which is the failover grouping key.
+ * Known-good/reliable profiles come first so startup and bounded failover never depend on camera ID.
+ */
 fun CameraRoute.profileLensDescriptors(): List<LensDescriptor> {
     val opticalFingerprint = lensFingerprint ?: return listOf(toLensDescriptor())
-    return profiles.map { profile ->
+    return CameraProfileSelector.ordered(profiles).map { profile ->
         profile.toLensDescriptor(opticalFingerprint, role, roleConfidence)
     }
 }
