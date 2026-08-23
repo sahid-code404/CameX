@@ -156,12 +156,25 @@ jobs:
           BUILD_TOOLS="$ANDROID_HOME/build-tools/37.0.0"
           "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$APK" > "$RUNNER_TEMP/apksigner.txt"
           CERT_SHA="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/apksigner.txt" | head -n 1 | tr -d ':' | tr '[:upper:]' '[:lower:]')"
-          test "$CERT_SHA" = "445538e26dd5ad46a026eeca5265fd32d1231dc8863b2383c15a5d55a3285640"
+
+          base64 --decode tools/dev-signing/camex-dev.jks.b64 > "$RUNNER_TEMP/camex-dev.jks"
+          TRUSTED_CERT_SHA="$(keytool -exportcert \
+            -keystore "$RUNNER_TEMP/camex-dev.jks" \
+            -storepass camex-dev-only-2026 \
+            -alias camex-dev \
+            | sha256sum | awk '{print $1}')"
+          echo "APK signer SHA-256: $CERT_SHA"
+          echo "Committed dev signer SHA-256: $TRUSTED_CERT_SHA"
+          test -n "$CERT_SHA"
+          test "$CERT_SHA" = "$TRUSTED_CERT_SHA"
 
           BADGING="$("$BUILD_TOOLS/aapt" dump badging "$APK")"
           PACKAGE_NAME="$(printf '%s\n' "$BADGING" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n 1)"
           APK_VERSION_CODE="$(printf '%s\n' "$BADGING" | sed -n "s/^package:.*versionCode='\([^']*\)'.*/\1/p" | head -n 1)"
           APK_VERSION_NAME="$(printf '%s\n' "$BADGING" | sed -n "s/^package:.*versionName='\([^']*\)'.*/\1/p" | head -n 1)"
+          echo "APK package: $PACKAGE_NAME"
+          echo "APK versionCode: $APK_VERSION_CODE"
+          echo "APK versionName: $APK_VERSION_NAME"
           test "$PACKAGE_NAME" = "com.sahidcode404.camex"
           test "$APK_VERSION_CODE" = "$DEV_OTA_VERSION_CODE"
           test "$APK_VERSION_NAME" = "$DEV_OTA_VERSION_NAME"
