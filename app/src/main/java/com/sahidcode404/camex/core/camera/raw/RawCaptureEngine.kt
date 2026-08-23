@@ -67,14 +67,6 @@ internal class RawCaptureEngine(
             }
         }, active.callbackHandler)
 
-        val request = active.device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-            addTarget(active.imageReader.surface)
-            set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-            if (active.continuousPictureAf) {
-                set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-            }
-        }.build()
-
         val callback = object : CameraCaptureSession.CaptureCallback() {
             override fun onCaptureCompleted(
                 session: CameraCaptureSession,
@@ -112,7 +104,47 @@ internal class RawCaptureEngine(
 
         var matchedImage: Image? = null
         return try {
-            active.session.capture(request, callback, active.callbackHandler)
+            val request = try {
+                active.device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                    addTarget(active.imageReader.surface)
+                    set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                    if (active.continuousPictureAf) {
+                        set(
+                            CaptureRequest.CONTROL_AF_MODE,
+                            CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
+                        )
+                    }
+                }.build()
+            } catch (rejected: IllegalArgumentException) {
+                return RawCaptureResult.Failed(
+                    reason = "RAW capture request was rejected by this camera profile",
+                    structural = true,
+                    diagnostics = diagnostics(
+                        context = context,
+                        active = active,
+                        startedNs = startedNs,
+                        error = "capture request rejected",
+                    ),
+                    failureKind = RawFailureKind.CAPTURE_REQUEST_REJECTED,
+                )
+            }
+
+            try {
+                active.session.capture(request, callback, active.callbackHandler)
+            } catch (rejected: IllegalArgumentException) {
+                return RawCaptureResult.Failed(
+                    reason = "RAW capture request target is unsupported by this camera profile",
+                    structural = true,
+                    diagnostics = diagnostics(
+                        context = context,
+                        active = active,
+                        startedNs = startedNs,
+                        error = "capture target rejected",
+                    ),
+                    failureKind = RawFailureKind.CAPTURE_REQUEST_REJECTED,
+                )
+            }
+
             val pair = withTimeout(timeoutMillis) { completion.await() }
             matchedImage = pair.image
             if (!isStillCurrent()) {
@@ -127,6 +159,7 @@ internal class RawCaptureEngine(
                         startedNs = startedNs,
                         error = "stale selection generation",
                     ),
+                    failureKind = RawFailureKind.STALE_SELECTION,
                 )
             }
 
@@ -139,9 +172,25 @@ internal class RawCaptureEngine(
             )
             onSaving(preWrite)
             val writeStartedNs = SystemClock.elapsedRealtimeNanos()
-            val characteristicsCameraId = active.physicalCameraId ?: active.openCameraId
-            val characteristics = cameraManager.getCameraCharacteristics(characteristicsCameraId)
-            val file = dngWriter.write(characteristics, pair.result.result, pair.image)
+            val file = try {
+                val characteristicsCameraId = active.physicalCameraId ?: active.openCameraId
+                val characteristics = cameraManager.getCameraCharacteristics(characteristicsCameraId)
+                dngWriter.write(characteristics, pair.result.result, pair.image)
+            } catch (error: Throwable) {
+                if (error is VirtualMachineError || error is ThreadDeath) throw error
+                val detail = error.message?.take(160) ?: error.javaClass.simpleName
+                return RawCaptureResult.Failed(
+                    reason = detail,
+                    structural = false,
+                    diagnostics = preWrite.copy(
+                        writeDurationMs = nanosToMillis(
+                            SystemClock.elapsedRealtimeNanos() - writeStartedNs,
+                        ),
+                        lastRawError = detail,
+                    ),
+                    failureKind = RawFailureKind.OUTPUT_WRITE,
+                )
+            }
             val finalDiagnostics = preWrite.copy(
                 dngWidth = file.width,
                 dngHeight = file.height,
@@ -161,18 +210,21 @@ internal class RawCaptureEngine(
                     startedNs = startedNs,
                     error = "capture timeout",
                 ),
+                failureKind = RawFailureKind.TIMEOUT,
             )
         } catch (error: Throwable) {
             if (error is VirtualMachineError || error is ThreadDeath) throw error
+            val detail = error.message?.take(160) ?: error.javaClass.simpleName
             RawCaptureResult.Failed(
-                reason = error.message?.take(160) ?: error.javaClass.simpleName,
+                reason = detail,
                 structural = false,
                 diagnostics = diagnostics(
                     context = context,
                     active = active,
                     startedNs = startedNs,
-                    error = error.message?.take(160) ?: error.javaClass.simpleName,
+                    error = detail,
                 ),
+                failureKind = RawFailureKind.CAPTURE_FAILED,
             )
         } finally {
             active.imageReader.setOnImageAvailableListener(null, null)
