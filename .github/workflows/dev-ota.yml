@@ -73,7 +73,7 @@ jobs:
           EXPECTED_CERT_SHA="445538e26dd5ad46a026eeca5265fd32d1231dc8863b2383c15a5d55a3285640"
           test "$CERT_SHA" = "$EXPECTED_CERT_SHA"
 
-          BADGING="$("$BUILD_TOOLS/aapt2" dump badging "$APK_SRC")"
+          BADGING="$("$BUILD_TOOLS/aapt" dump badging "$APK_SRC")"
           PACKAGE_NAME="$(printf '%s\n' "$BADGING" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n 1)"
           APK_VERSION_CODE="$(printf '%s\n' "$BADGING" | sed -n "s/^package:.*versionCode='\([^']*\)'.*/\1/p" | head -n 1)"
           APK_VERSION_NAME="$(printf '%s\n' "$BADGING" | sed -n "s/^package:.*versionName='\([^']*\)'.*/\1/p" | head -n 1)"
@@ -84,6 +84,7 @@ jobs:
           cp "$APK_SRC" Camera-dev.apk
           SHA="$(sha256sum Camera-dev.apk | awk '{print $1}')"
           test -n "$SHA"
+          export SHA CERT_SHA
 
           python3 - <<'PY'
           import json
@@ -106,25 +107,11 @@ jobs:
               json.dump(manifest, output, indent=2)
               output.write("\n")
           PY
-        env:
-          SHA: ${{ env.SHA }}
-          CERT_SHA: ${{ env.CERT_SHA }}
 
-      - name: Export verification values
-        run: |
-          set -euo pipefail
-          SHA="$(sha256sum Camera-dev.apk | awk '{print $1}')"
-          CERT_SHA="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/apksigner.txt" | head -n 1 | tr -d ':' | tr '[:upper:]' '[:lower:]')"
-          python3 - <<PY
-          import json
-          path = "dev-manifest.json"
-          data = json.load(open(path, encoding="utf-8"))
-          data["sha256"] = "$SHA"
-          data["signingCertSha256"] = "$CERT_SHA"
-          open(path, "w", encoding="utf-8").write(json.dumps(data, indent=2) + "\n")
-          PY
           grep -F "\"versionCode\": $DEV_OTA_VERSION_CODE" dev-manifest.json
           grep -F "\"gitSha\": \"$GITHUB_SHA\"" dev-manifest.json
+          grep -F "\"sha256\": \"$SHA\"" dev-manifest.json
+          grep -F "\"signingCertSha256\": \"$CERT_SHA\"" dev-manifest.json
 
       - name: Publish rolling dev-latest release
         env:
