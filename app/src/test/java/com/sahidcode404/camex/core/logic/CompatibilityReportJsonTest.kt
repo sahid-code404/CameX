@@ -6,9 +6,12 @@ import com.sahidcode404.camex.core.model.CameraCacheReport
 import com.sahidcode404.camex.core.model.CameraCompatibilityEntry
 import com.sahidcode404.camex.core.model.CameraEnvironmentReport
 import com.sahidcode404.camex.core.model.CameraMetadataEvidenceReport
+import com.sahidcode404.camex.core.model.CameraProfileCompatibilityReport
 import com.sahidcode404.camex.core.model.CameraRouteAliasReport
 import com.sahidcode404.camex.core.model.CameraRouteFailureReport
 import com.sahidcode404.camex.core.model.CameraStartupTraceReport
+import com.sahidcode404.camex.core.model.CanonicalLensCompatibilityReport
+import com.sahidcode404.camex.core.model.CanonicalLensTrustReport
 import com.sahidcode404.camex.core.model.CanonicalTopologyReport
 import com.sahidcode404.camex.core.model.CompatibilityReport
 import com.sahidcode404.camex.core.model.DeviceReport
@@ -19,16 +22,16 @@ import com.sahidcode404.camex.core.model.FailureCountReport
 import com.sahidcode404.camex.core.model.FailureReasonSummaryReport
 import com.sahidcode404.camex.core.model.GraphicsReport
 import com.sahidcode404.camex.core.model.LensCapabilities
-import com.sahidcode404.camex.core.model.PhysicalSize
 import com.sahidcode404.camex.core.model.LensFingerprint
+import com.sahidcode404.camex.core.model.LensProbeResult
 import com.sahidcode404.camex.core.model.LogicalRelationshipReport
+import com.sahidcode404.camex.core.model.PhysicalSize
 import com.sahidcode404.camex.core.model.ProbeOutcome
 import com.sahidcode404.camex.core.model.ProbeReportEntry
 import com.sahidcode404.camex.core.model.ProbeStage
 import com.sahidcode404.camex.core.model.ProbeStageResult
 import com.sahidcode404.camex.core.model.RouteTrustReport
 import com.sahidcode404.camex.core.model.Size2D
-import com.sahidcode404.camex.core.model.LensProbeResult
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -36,11 +39,16 @@ import org.junit.Test
 
 class CompatibilityReportJsonTest {
     @Test
-    fun reportRoundTripsWithDiagnosticsAndUnknownFields() {
+    fun reportRoundTripsWithDiagnosticsProfilesAndUnknownFields() {
         val lens = testLens("diagnostic-route")
         val fingerprint: LensFingerprint = LensFingerprintGenerator.generate(lens)
         val probe = LensProbeResult(
             stages = listOf(ProbeStageResult(ProbeStage.DISCOVERED, ProbeOutcome.SUCCESS, 4)),
+        )
+        val profileFailure = CameraRouteFailureReport(
+            kind = "SESSION_CONFIGURATION_UNSUPPORTED",
+            durability = "STRUCTURAL",
+            detail = "synthetic alias failure",
         )
         val report = CompatibilityReport(
             generatedAtUtc = "2026-08-23T12:00:00Z",
@@ -58,9 +66,9 @@ class CompatibilityReportJsonTest {
             ),
             environment = CameraEnvironmentReport(
                 stableKey = "ce1_sha256digest",
-                cacheSchemaVersion = 1,
-                topologySchemaVersion = 1,
-                discoverySchemaVersion = 1,
+                cacheSchemaVersion = 2,
+                topologySchemaVersion = 2,
+                discoverySchemaVersion = 3,
                 apiLevel = 37,
                 advertisedTopologySignature = "ca1_topologydigest",
             ),
@@ -110,9 +118,72 @@ class CompatibilityReportJsonTest {
                 ),
             ),
             canonicalTopology = CanonicalTopologyReport(
-                schemaVersion = 1,
+                schemaVersion = 2,
                 routeCount = 1,
-                canonicalRouteIds = listOf("cr1_16:diagnostic-route|0:"),
+                canonicalRouteIds = listOf("cl2_${fingerprint.value}"),
+                profileCount = 2,
+            ),
+            canonicalLenses = listOf(
+                CanonicalLensCompatibilityReport(
+                    canonicalLensId = "cl2_${fingerprint.value}",
+                    opticalFingerprint = fingerprint,
+                    facing = lens.facing,
+                    role = "PHOTOGRAPHIC_WIDE",
+                    roleConfidence = "STRONG",
+                    focalLengthsMm = lens.capabilities.focalLengthsMm.orEmpty(),
+                    fieldOfView = LensMath.fieldOfView(lens.capabilities),
+                    sensorPhysicalSize = lens.capabilities.sensorPhysicalSize,
+                    pixelArraySize = lens.capabilities.pixelArraySize,
+                    canonicalTrust = CanonicalLensTrustReport(
+                        metadataTrust = "METADATA_VALID",
+                        sessionTrust = "SESSION_VERIFIED",
+                        rawTrust = "UNKNOWN",
+                        lastAttemptEpochMs = 1234L,
+                    ),
+                    preferredProfileId = "profile-a",
+                    profileCount = 2,
+                    groupingConfidence = "STRONG_MATCH",
+                    profiles = listOf(
+                        CameraProfileCompatibilityReport(
+                            profileId = "profile-a",
+                            profileFingerprint = "cp2_a",
+                            preferred = true,
+                            ranking = 1,
+                            profileScore = 1200,
+                            discoveredCameraId = "diagnostic-route",
+                            openCameraId = "diagnostic-route",
+                            routeKind = "PUBLIC_DIRECT",
+                            discoverySources = listOf("JAVA_PUBLIC"),
+                            metadataTrust = "METADATA_VALID",
+                            sessionTrust = "SESSION_VERIFIED",
+                            rawTrust = "UNKNOWN",
+                            lastAttemptEpochMs = 1234L,
+                            previewVerified = true,
+                            rawAdvertised = "SUPPORTED",
+                            rawStreamActuallyDeclared = "SUPPORTED",
+                        ),
+                        CameraProfileCompatibilityReport(
+                            profileId = "profile-b",
+                            profileFingerprint = "cp2_b",
+                            ranking = 2,
+                            profileScore = -1000,
+                            discoveredCameraId = "physical-a",
+                            openCameraId = "diagnostic-route",
+                            physicalCameraId = "physical-a",
+                            logicalParentCameraId = "diagnostic-route",
+                            routeKind = "LOGICAL_PHYSICAL_MEMBER",
+                            discoverySources = listOf("JAVA_PHYSICAL"),
+                            metadataTrust = "METADATA_VALID",
+                            sessionTrust = "SESSION_REJECTED",
+                            rawTrust = "UNKNOWN",
+                            failure = profileFailure,
+                            failureDurability = "STRUCTURAL",
+                            previewVerified = false,
+                            rawAdvertised = "UNKNOWN",
+                            rawStreamActuallyDeclared = "UNKNOWN",
+                        ),
+                    ),
+                ),
             ),
             cameras = listOf(
                 CameraCompatibilityEntry(
@@ -161,7 +232,7 @@ class CompatibilityReportJsonTest {
             userVisibleRoutes = listOf("cr1_16:diagnostic-route|0:"),
             trustState = listOf(
                 RouteTrustReport(
-                    canonicalRouteId = "cr1_16:diagnostic-route|0:",
+                    canonicalRouteId = "profile-a",
                     metadataTrust = "METADATA_VALID",
                     sessionTrust = "SESSION_VERIFIED",
                     rawTrust = "RAW_VERIFIED",
@@ -188,23 +259,27 @@ class CompatibilityReportJsonTest {
         val decoded = CompatibilityReportJson.decode(withFutureField)
 
         assertEquals(report, decoded)
-        assertTrue(encoded.contains("\"schemaVersion\": 2"))
+        assertTrue(encoded.contains("\"schemaVersion\": 3"))
+        assertTrue(encoded.contains("\"canonicalLenses\""))
+        assertTrue(encoded.contains("\"profiles\""))
+        assertTrue(encoded.contains("\"profileFingerprint\": \"cp2_a\""))
+        assertTrue(encoded.contains("\"groupingConfidence\": \"STRONG_MATCH\""))
         assertTrue(encoded.contains("\"startupTrace\""))
         assertTrue(encoded.contains("\"canonicalTopology\""))
-        assertTrue(encoded.contains("\"canonicalRouteId\""))
         assertTrue(encoded.contains("\"rawStreamActuallyDeclared\": \"SUPPORTED\""))
         assertTrue(encoded.contains("\"discoveryFailures\""))
         assertTrue(encoded.contains("\"gitSha\": \"abc123\""))
     }
 
     @Test
-    fun schemaOnePayloadStillDecodesWithSchemaTwoFieldsDefaulted() {
+    fun schemaOnePayloadStillDecodesWithNewerFieldsDefaulted() {
         val decoded = CompatibilityReportJson.decode(
             """{"schemaVersion":1,"generatedAtUtc":"2026-08-23T12:00:00Z"}""",
         )
 
         assertEquals(1, decoded.schemaVersion)
         assertTrue(decoded.canonicalTopology.canonicalRouteIds.isEmpty())
+        assertTrue(decoded.canonicalLenses.isEmpty())
         assertTrue(decoded.startupTrace.offsetsNs.isEmpty())
         assertEquals("NOT_STARTED", decoded.javaDiscovery.status)
     }
