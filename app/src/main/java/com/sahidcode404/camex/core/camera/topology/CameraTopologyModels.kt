@@ -11,6 +11,7 @@ import com.sahidcode404.camex.core.model.PhysicalSize
 import com.sahidcode404.camex.core.model.SensorRect
 import com.sahidcode404.camex.core.model.Size2D
 import com.sahidcode404.camex.core.model.StreamFormat
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -105,6 +106,8 @@ data class CameraRouteTrust(
     val session: CameraSessionTrust = CameraSessionTrust.UNKNOWN,
     val raw: CameraRawTrust = CameraRawTrust.UNKNOWN,
     val failure: CameraRouteFailure? = null,
+    /** Wall-clock diagnostic metadata only; never used for latency calculations. */
+    val lastAttemptEpochMs: Long? = null,
 )
 
 @Serializable
@@ -161,10 +164,6 @@ data class MinimalCameraMetadata(
     val monochromeEvidence: CapabilitySupport = CapabilitySupport.UNKNOWN,
     val systemCameraAdvertised: CapabilitySupport = CapabilitySupport.UNKNOWN,
 ) {
-    /**
-     * Evidence strong enough to offer lazy user validation. Merely having an ID or a redundant RAW
-     * capability bit is not enough; an actual RAW declaration or preview-plus-optics is required.
-     */
     val hasCrediblePhotographicEvidence: Boolean
         get() = rawStreamActuallyDeclared == CapabilitySupport.SUPPORTED ||
             previewStreamActuallyDeclared == CapabilitySupport.SUPPORTED &&
@@ -175,17 +174,13 @@ data class MinimalCameraMetadata(
                 backwardCompatibleAdvertised == CapabilitySupport.SUPPORTED)
 }
 
-/** Stage-B metadata; deliberately CameX-owned rather than a retained CameraCharacteristics. */
 @Serializable
 data class FullCameraCapabilities(
     val capabilities: LensCapabilities = LensCapabilities(),
     val complete: Boolean = false,
 )
 
-/**
- * One transport/profile route underneath a physical optical lens. IDs identify transport routes,
- * not pieces of glass, and therefore never participate in stable optical identity.
- */
+/** One exact transport/profile route underneath a physical optical lens. */
 @Serializable
 data class CameraProfile(
     val profileId: String,
@@ -202,6 +197,7 @@ data class CameraProfile(
     val rawTrust: CameraRawTrust = CameraRawTrust.UNKNOWN,
     val metadataTrust: CameraMetadataTrust = CameraMetadataTrust.DISCOVERED,
     val failure: CameraRouteFailure? = null,
+    val lastAttemptEpochMs: Long? = null,
     val priority: Int = 0,
 ) {
     val routingKey: String
@@ -211,14 +207,19 @@ data class CameraProfile(
         }
 
     val trust: CameraRouteTrust
-        get() = CameraRouteTrust(metadataTrust, sessionTrust, rawTrust, failure)
+        get() = CameraRouteTrust(
+            metadataTrust,
+            sessionTrust,
+            rawTrust,
+            failure,
+            lastAttemptEpochMs,
+        )
 
     val structurallyRejected: Boolean
         get() = sessionTrust == CameraSessionTrust.SESSION_REJECTED &&
             failure?.durability == CameraFailureDurability.STRUCTURAL
 }
 
-/** Metadata used by the authoritative optical grouping engine. */
 @Serializable
 data class OpticalLensSignature(
     val facing: LensFacing,
@@ -233,10 +234,6 @@ data class OpticalLensSignature(
     val diagonalFieldOfViewDegrees: Double? = null,
 )
 
-/**
- * Physical/optical identity exposed to camera UI and user preferences. The selected transport is a
- * CameraProfile and can change without creating a new lens button or changing optical identity.
- */
 @Serializable
 data class CanonicalLens(
     val canonicalLensId: String,
@@ -256,10 +253,6 @@ data class CanonicalLens(
             ?: profiles.firstOrNull()
 }
 
-/**
- * Additional profile retained underneath a canonical route. Defaults keep cache decoding and old
- * unit fixtures source-compatible while Phase 1B persists profile-specific evidence.
- */
 @Serializable
 data class CameraRouteAlias(
     val discoveredCameraId: String,
@@ -284,10 +277,12 @@ data class CameraRouteAlias(
         )
 }
 
-/** One immutable canonical optical lens consumed by runtime and selector. */
+/**
+ * Compatibility-shaped canonical optical lens. Legacy route fields mirror the preferred profile so
+ * existing session/UI code can address it, while exact profile metadata is persisted separately.
+ */
 @Serializable
 data class CameraRoute(
-    /** Transport ID of the currently preferred profile; optical identity is lensFingerprint. */
     val canonicalRouteId: String,
     val discoveredCameraId: String,
     val openCameraId: String,
@@ -295,15 +290,18 @@ data class CameraRoute(
     val logicalParentCameraId: String? = null,
     val routeKind: CameraRouteKind,
     val sources: Set<CameraDiscoverySource>,
+    /** Canonical/representative optical metadata, not a transport profile snapshot. */
     val minimalMetadata: MinimalCameraMetadata,
     val fullCapabilities: FullCameraCapabilities? = null,
-    /** Phase 1B optical fingerprint. Stable metadata fingerprints do not include camera IDs. */
     val lensFingerprint: LensFingerprint? = null,
     val role: PhotographicRole = PhotographicRole.PHOTOGRAPHIC_UNKNOWN,
     val roleConfidence: RoleConfidence = RoleConfidence.UNKNOWN,
-    /** Aggregate lens trust; individual profile trust lives on the primary profile and aliases. */
+    /** Aggregate lens trust: one profile failure cannot poison the physical lens. */
     val trust: CameraRouteTrust = CameraRouteTrust(),
     val aliases: List<CameraRouteAlias> = emptyList(),
+    @SerialName("profiles")
+    val storedProfiles: List<CameraProfile> = emptyList(),
+    val preferredProfileId: String? = null,
 ) {
     val hasCrediblePhotographicEvidence: Boolean
         get() = minimalMetadata.hasCrediblePhotographicEvidence ||
@@ -327,8 +325,11 @@ data class CameraRoute(
             trust.metadata != CameraMetadataTrust.METADATA_REJECTED &&
             trust.session != CameraSessionTrust.SESSION_REJECTED
 
+    /** Exact transport snapshots; old fixtures/routes fall back to the compatibility route fields. */
     val profiles: List<CameraProfile>
-        get() = listOf(primaryProfile()) + aliases.map(CameraRouteAlias::toProfile)
+        get() = storedProfiles.takeIf(List<CameraProfile>::isNotEmpty)
+            ?: (listOf(primaryProfile()) + aliases.map(CameraRouteAlias::toProfile))
+                .distinctBy(CameraProfile::profileId)
 
     fun toCanonicalLens(): CanonicalLens {
         val fingerprint = requireNotNull(lensFingerprint) { "Canonical lens requires a fingerprint" }
@@ -341,7 +342,7 @@ data class CameraRoute(
             role = role,
             roleConfidence = roleConfidence,
             profiles = profiles,
-            preferredProfileId = primaryProfile().profileId,
+            preferredProfileId = preferredProfileId ?: primaryProfile().profileId,
             sessionTrust = trust.session,
             rawTrust = trust.raw,
         )
@@ -367,6 +368,7 @@ data class CameraRoute(
         rawTrust = trust.raw,
         metadataTrust = trust.metadata,
         failure = trust.failure,
+        lastAttemptEpochMs = trust.lastAttemptEpochMs,
     )
 }
 
@@ -385,6 +387,7 @@ private fun CameraRouteAlias.toProfile(): CameraProfile = CameraProfile(
     rawTrust = trust.raw,
     metadataTrust = trust.metadata,
     failure = trust.failure,
+    lastAttemptEpochMs = trust.lastAttemptEpochMs,
 )
 
 @Serializable
@@ -397,7 +400,6 @@ data class LogicalCameraRelationship(
 data class CameraTopology(
     val schemaVersion: Int = CURRENT_SCHEMA_VERSION,
     val environmentFingerprint: CameraEnvironmentFingerprint,
-    /** One entry per canonical optical lens; transport/profile aliases live under each entry. */
     val routes: List<CameraRoute> = emptyList(),
     val logicalRelationships: List<LogicalCameraRelationship> = emptyList(),
 ) {
@@ -413,7 +415,6 @@ data class CameraTopology(
     }
 }
 
-/** One backend observation before canonical reconciliation. */
 @Serializable
 data class CameraRouteEvidence(
     val source: CameraDiscoverySource,
@@ -430,13 +431,8 @@ data class CameraRouteEvidence(
 
 @Serializable
 enum class TopologyReconciliationMode {
-    /** Cache is the only backend; no live absence may be inferred. */
     CACHE_BOOTSTRAP,
-
-    /** One or more live backends are still running; retain cache-only profiles. */
     INCREMENTAL,
-
-    /** Every requested backend, including any required deep scan, has completed. */
     FULLY_RECONCILED,
 }
 
