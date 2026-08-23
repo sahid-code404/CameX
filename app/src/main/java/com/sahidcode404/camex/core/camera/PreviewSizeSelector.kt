@@ -1,6 +1,5 @@
 package com.sahidcode404.camex.core.camera
 
-import com.sahidcode404.camex.core.model.FpsRange
 import kotlin.math.abs
 import kotlin.math.ln
 import kotlin.math.max
@@ -117,52 +116,5 @@ object PreviewSizeSelector {
             0.0
         }
         return aspectPenalty + coveragePenalty + resolutionPenalty + frameRatePenalty
-    }
-}
-
-/**
- * Picks a normal-preview AE range around 30 fps from metadata actually reported by the camera.
- * A fixed 30/30 range wins when available; otherwise prefer the range with the highest lower bound
- * that still contains 30. This avoids unnecessarily allowing the HAL to sink to 10-15 fps while
- * preserving a metadata-driven fallback for cameras that only expose wider ranges.
- */
-object PreviewFpsSelector {
-    fun select(
-        ranges: Collection<FpsRange>?,
-        targetFps: Int = 30,
-        preferredFloorFps: Int = 24,
-    ): FpsRange? {
-        if (targetFps <= 0 || preferredFloorFps < 0) return null
-        val valid = ranges
-            .orEmpty()
-            .asSequence()
-            .filter { it.isValid && it.max > 0 }
-            .distinct()
-            .toList()
-        if (valid.isEmpty()) return null
-
-        val containing = valid.filter { it.min <= targetFps && it.max >= targetFps }
-        if (containing.isNotEmpty()) {
-            return containing.sortedWith(
-                compareByDescending<FpsRange> { it.min >= preferredFloorFps }
-                    .thenByDescending { it.min }
-                    .thenBy { abs(it.max - targetFps) }
-                    .thenBy { it.max },
-            ).first()
-        }
-
-        val usable = valid.filter { it.max >= preferredFloorFps }
-        if (usable.isNotEmpty()) {
-            return usable.minWithOrNull(
-                compareBy<FpsRange> { abs(it.max - targetFps) }
-                    .thenByDescending { it.min }
-                    .thenBy { it.max },
-            )
-        }
-
-        return valid.maxWithOrNull(
-            compareBy<FpsRange> { it.max }
-                .thenBy { it.min },
-        )
     }
 }
