@@ -2,20 +2,16 @@ package com.sahidcode404.camex.core.camera.topology
 
 import com.sahidcode404.camex.core.model.CapabilitySupport
 
-/**
- * Chooses a transport profile for one canonical optical lens. The policy is evidence based and
- * never compares numeric camera IDs. SESSION_VERIFIED profiles are sticky winners; structural
- * rejections fall to the bottom and are never tried ahead of an untested credible profile.
- */
+/** Evidence-based transport selection for one canonical optical lens. */
 object CameraProfileSelector {
     fun select(profiles: Collection<CameraProfile>): CameraProfile? = profiles
         .filter(::credible)
-        .maxWithOrNull(compareBy<CameraProfile>(::score)
+        .maxWithOrNull(compareBy<CameraProfile> { score(it) }
             .thenBy { it.profileFingerprint })
 
     fun ordered(profiles: Collection<CameraProfile>): List<CameraProfile> = profiles
         .filter(::credible)
-        .sortedWith(compareByDescending<CameraProfile>(::score)
+        .sortedWith(compareByDescending<CameraProfile> { score(it) }
             .thenBy(CameraProfile::profileFingerprint))
 
     fun score(profile: CameraProfile): Int {
@@ -66,21 +62,76 @@ object CameraProfileSelector {
     }
 }
 
-/** Lookup a profile by its stable transport/profile ID. */
+/** Whole-lens trust is an aggregate over profiles, never a copy of one arbitrary route. */
+object CanonicalLensTrustAggregator {
+    fun aggregate(
+        profiles: Collection<CameraProfile>,
+        canonicalMetadata: MinimalCameraMetadata,
+    ): CameraRouteTrust {
+        val values = profiles.toList()
+        if (values.isEmpty()) return CameraRouteTrust()
+        val metadata = when {
+            canonicalMetadata.systemCameraAdvertised == CapabilitySupport.SUPPORTED ->
+                CameraMetadataTrust.SYSTEM_ONLY
+            values.any { it.metadataTrust == CameraMetadataTrust.METADATA_VALID } ||
+                canonicalMetadata.hasCrediblePhotographicEvidence -> CameraMetadataTrust.METADATA_VALID
+            values.all { it.metadataTrust == CameraMetadataTrust.ACCESS_DENIED } ->
+                CameraMetadataTrust.ACCESS_DENIED
+            values.all { it.metadataTrust == CameraMetadataTrust.SYSTEM_ONLY } ->
+                CameraMetadataTrust.SYSTEM_ONLY
+            values.all { it.metadataTrust == CameraMetadataTrust.BROKEN } ->
+                CameraMetadataTrust.BROKEN
+            values.any { it.metadataTrust == CameraMetadataTrust.DISCOVERED } ->
+                CameraMetadataTrust.DISCOVERED
+            else -> CameraMetadataTrust.UNKNOWN
+        }
+        val session = when {
+            values.any { it.sessionTrust == CameraSessionTrust.SESSION_VERIFIED } ->
+                CameraSessionTrust.SESSION_VERIFIED
+            values.all(CameraProfile::structurallyRejected) -> CameraSessionTrust.SESSION_REJECTED
+            values.any { it.sessionTrust == CameraSessionTrust.TRANSIENT_FAILURE } ->
+                CameraSessionTrust.TRANSIENT_FAILURE
+            else -> CameraSessionTrust.UNKNOWN
+        }
+        val raw = when {
+            values.any { it.rawTrust == CameraRawTrust.RAW_VERIFIED } -> CameraRawTrust.RAW_VERIFIED
+            values.all { it.rawTrust == CameraRawTrust.NOT_ADVERTISED } -> CameraRawTrust.NOT_ADVERTISED
+            values.all {
+                it.rawTrust == CameraRawTrust.RAW_REJECTED ||
+                    it.rawTrust == CameraRawTrust.NOT_ADVERTISED
+            } -> CameraRawTrust.RAW_REJECTED
+            values.any { it.rawTrust == CameraRawTrust.TRANSIENT_FAILURE } ->
+                CameraRawTrust.TRANSIENT_FAILURE
+            else -> CameraRawTrust.UNKNOWN
+        }
+        val failure = if (session == CameraSessionTrust.SESSION_REJECTED) {
+            values.mapNotNull(CameraProfile::failure)
+                .filter { it.durability == CameraFailureDurability.STRUCTURAL }
+                .sortedWith(compareBy<CameraRouteFailure>({ it.kind.ordinal }, { it.detail.orEmpty() }))
+                .firstOrNull()
+        } else {
+            null
+        }
+        return CameraRouteTrust(
+            metadata = metadata,
+            session = session,
+            raw = raw,
+            failure = failure,
+            lastAttemptEpochMs = values.mapNotNull(CameraProfile::lastAttemptEpochMs).maxOrNull(),
+        )
+    }
+}
+
 fun CameraRoute.profile(profileId: String): CameraProfile? =
     profiles.firstOrNull { it.profileId == profileId }
 
-/** Lookup a profile by Camera2 routing key. */
 fun CameraRoute.profileForRoutingKey(routingKey: String): CameraProfile? =
     profiles.firstOrNull { it.routingKey == routingKey }
 
-/**
- * Rotate the preferred transport without changing optical fingerprint or canonical role. Every
- * previous route remains in aliases for diagnostics and later engineering analysis.
- */
+/** Change preferred transport only; optical metadata/fingerprint and aggregate lens trust remain. */
 fun CameraRoute.promoteProfile(profileId: String): CameraRoute {
     val selected = profile(profileId) ?: return this
-    val remaining = profiles.filterNot { it.profileId == selected.profileId }
+    val exactProfiles = profiles
     return copy(
         canonicalRouteId = selected.profileId,
         discoveredCameraId = selected.discoveredCameraId,
@@ -89,18 +140,16 @@ fun CameraRoute.promoteProfile(profileId: String): CameraRoute {
         logicalParentCameraId = selected.logicalParentCameraId,
         routeKind = selected.routeKind,
         sources = selected.discoverySources,
-        minimalMetadata = selected.metadata,
-        fullCapabilities = selected.fullCapabilities,
-        trust = selected.trust,
-        aliases = remaining.map(CameraProfile::toAlias),
+        aliases = exactProfiles.filterNot { it.profileId == selected.profileId }.map(CameraProfile::toAlias),
+        storedProfiles = exactProfiles,
+        preferredProfileId = selected.profileId,
     )
 }
 
-/** Promote the highest-ranked known-good/credible profile. */
 fun CameraRoute.promoteBestProfile(): CameraRoute =
     CameraProfileSelector.select(profiles)?.let { promoteProfile(it.profileId) } ?: this
 
-/** Replace only one profile's trust, then recalculate the preferred profile. */
+/** Replace one profile's trust, aggregate whole-lens trust, and promote the best surviving profile. */
 fun CameraRoute.withProfileTrust(
     profileId: String,
     trust: CameraRouteTrust,
@@ -111,10 +160,12 @@ fun CameraRoute.withProfileTrust(
             sessionTrust = trust.session,
             rawTrust = trust.raw,
             failure = trust.failure,
+            lastAttemptEpochMs = trust.lastAttemptEpochMs,
         ) else profile
     }
     if (updated.none { it.profileId == profileId }) return this
     val preferred = CameraProfileSelector.select(updated)
+        ?: preferredProfileId?.let { id -> updated.firstOrNull { it.profileId == id } }
         ?: updated.firstOrNull { it.profileId == canonicalRouteId }
         ?: updated.first()
     return copy(
@@ -125,11 +176,10 @@ fun CameraRoute.withProfileTrust(
         logicalParentCameraId = preferred.logicalParentCameraId,
         routeKind = preferred.routeKind,
         sources = preferred.discoverySources,
-        minimalMetadata = preferred.metadata,
-        fullCapabilities = preferred.fullCapabilities,
-        trust = preferred.trust,
-        aliases = updated.filterNot { it.profileId == preferred.profileId }
-            .map(CameraProfile::toAlias),
+        trust = CanonicalLensTrustAggregator.aggregate(updated, minimalMetadata),
+        aliases = updated.filterNot { it.profileId == preferred.profileId }.map(CameraProfile::toAlias),
+        storedProfiles = updated,
+        preferredProfileId = preferred.profileId,
     )
 }
 
