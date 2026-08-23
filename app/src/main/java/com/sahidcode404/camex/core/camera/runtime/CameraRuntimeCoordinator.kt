@@ -8,6 +8,7 @@ import com.sahidcode404.camex.core.camera.DefaultCameraSessionController
 import com.sahidcode404.camex.core.camera.diagnostics.CameraStartupMilestone
 import com.sahidcode404.camex.core.camera.discovery.CameraDiscoveryCoordinator
 import com.sahidcode404.camex.core.camera.discovery.CameraDiscoveryTrigger
+import com.sahidcode404.camex.core.camera.raw.RawCaptureRegistry
 import com.sahidcode404.camex.core.camera.topology.CameraProfile
 import com.sahidcode404.camex.core.camera.topology.CameraRoute
 import com.sahidcode404.camex.core.camera.topology.CameraTopology
@@ -74,6 +75,17 @@ class CameraRuntimeCoordinator(
     val activeSelection: StateFlow<ActiveCameraSelection?> = mutableActiveSelection.asStateFlow()
 
     init {
+        RawCaptureRegistry.initialize(context)
+        scope.launch {
+            mutableActiveSelection.collect { selection ->
+                RawCaptureRegistry.updateActiveSelectionDetails(
+                    selectionGeneration = selection?.selectionGeneration,
+                    routingKey = selection?.activeProfileRoutingKey,
+                    canonicalFingerprint = selection?.canonicalLensFingerprint?.value,
+                    profileFingerprint = selection?.activeProfileFingerprint,
+                )
+            }
+        }
         scope.launch {
             topology.collectLatest { value ->
                 // Runtime receives every profile so the failover wrapper can rotate routes. All
@@ -163,6 +175,7 @@ class CameraRuntimeCoordinator(
 
     /** Explicit canonical-lens request. Automatic sibling-profile failover remains one generation. */
     suspend fun selectLens(lens: LensDescriptor) = selectionRequestMutex.withLock {
+        RawCaptureRegistry.invalidateSelection()
         selectionTracker.beginSelection(lens)
         session.switchTo(lens)
     }
@@ -210,6 +223,7 @@ class CameraRuntimeCoordinator(
         discovery.resetDiscoveryCache()
         session.clearTransientFailureMemory()
         session.updateAvailableLenses(emptyList())
+        RawCaptureRegistry.invalidateSelection()
         mutablePhase.value = CameraRuntimePhase.CacheReady(routeCount = 0, hit = false)
         if (permissionGranted) start(preferredRearFingerprint, oneXReferenceFingerprint)
     }
@@ -217,6 +231,7 @@ class CameraRuntimeCoordinator(
     suspend fun pause() {
         permissionGranted = false
         reconciliationJob?.cancel()
+        RawCaptureRegistry.invalidateSelection()
         session.pause()
         mutablePhase.value = CameraRuntimePhase.Paused
     }
@@ -228,10 +243,12 @@ class CameraRuntimeCoordinator(
 
     override fun close() {
         reconciliationJob?.cancel()
+        RawCaptureRegistry.invalidateSelection()
         session.close()
     }
 
     private suspend fun openPrimary(lens: LensDescriptor) = selectionRequestMutex.withLock {
+        RawCaptureRegistry.invalidateSelection()
         selectionTracker.beginSelection(lens)
         discovery.startupTrace.mark(CameraStartupMilestone.PRIMARY_ROUTE_READY)
         mutablePhase.value = CameraRuntimePhase.OpeningPrimary(lens.identity.routingKey)
@@ -265,6 +282,7 @@ class CameraRuntimeCoordinator(
             .firstOrNull { it.identity.routingKey == key }
             ?: return
         selectionRequestMutex.withLock {
+            RawCaptureRegistry.invalidateSelection()
             selectionTracker.beginSelection(selected)
             session.open(selected)
         }
