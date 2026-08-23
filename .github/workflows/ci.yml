@@ -35,6 +35,9 @@ jobs:
       - name: Verify camera architecture
         run: ./scripts/verify-camera-architecture.sh
 
+      - name: Verify simple OTA architecture
+        run: bash scripts/verify-development-ota.sh
+
       - name: Validate Gradle wrapper
         uses: gradle/actions/wrapper-validation@0723195856401067f7a2779048b490ace7a47d7c # v5
 
@@ -70,6 +73,11 @@ jobs:
             --tests 'com.sahidcode404.camex.core.camera.topology.CanonicalFingerprintCollisionGuardTest' \
             --tests 'com.sahidcode404.camex.core.logic.LensDuplicateFilterTest' \
             --tests 'com.sahidcode404.camex.core.logic.CompatibilitySelectionReportJsonTest'
+
+      - name: Run Phase 1C OTA regressions
+        run: |
+          ./gradlew --no-daemon --stacktrace testDebugUnitTest \
+            --tests 'com.sahidcode404.camex.core.update.*'
 
       - name: Run unit tests, lint, native build, and assemble
         run: ./gradlew --no-daemon --stacktrace testDebugUnitTest lintDebug assembleDebug

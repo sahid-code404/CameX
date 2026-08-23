@@ -1,3 +1,4 @@
+import java.util.Properties
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
@@ -16,6 +17,23 @@ val gitSha = providers.environmentVariable("CAMEX_GIT_SHA")
     .getOrElse("unknown")
 val buildTimestampUtc = providers.environmentVariable("CAMEX_BUILD_TIMESTAMP_UTC")
     .getOrElse("unknown")
+val taggedVersionCode = providers.gradleProperty("cameraVersionCode")
+    .orNull
+    ?.toIntOrNull()
+    ?.takeIf { it in 1 until Int.MAX_VALUE }
+val taggedVersionName = providers.gradleProperty("cameraVersionName")
+    .orNull
+    ?.trim()
+    ?.takeIf(String::isNotEmpty)
+
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.isFile) {
+        keystorePropertiesFile.inputStream().use(::load)
+    }
+}
+val releaseSigningReady = listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
+    .all { !keystoreProperties.getProperty(it).isNullOrBlank() }
 
 fun String.asBuildConfigLiteral(): String =
     "\"${replace("\\", "\\\\").replace("\"", "\\\"")}\""
@@ -30,8 +48,9 @@ android {
         applicationId = "com.sahidcode404.camex"
         minSdk = 23
         targetSdk = 37
-        versionCode = 10_000 + ciRunNumber
-        versionName = if (ciRunNumber == 0) "0.1.0-dev" else "0.1.0-dev.$ciRunNumber"
+        versionCode = taggedVersionCode ?: (10_000 + ciRunNumber)
+        versionName = taggedVersionName
+            ?: if (ciRunNumber == 0) "0.1.0-dev" else "0.1.0-dev.$ciRunNumber"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -49,6 +68,27 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags += listOf("-std=c++20", "-Wall", "-Wextra", "-Werror")
+            }
+        }
+    }
+
+    signingConfigs {
+        create("stableRelease") {
+            if (releaseSigningReady) {
+                storeFile = file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
+    buildTypes {
+        getByName("debug")
+        getByName("release") {
+            isMinifyEnabled = false
+            if (releaseSigningReady) {
+                signingConfig = signingConfigs.getByName("stableRelease")
             }
         }
     }

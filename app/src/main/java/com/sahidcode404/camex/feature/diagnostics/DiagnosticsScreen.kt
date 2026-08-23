@@ -63,10 +63,12 @@ data class DiagnosticsUiState(
 @Composable
 fun DiagnosticsScreen(
     state: DiagnosticsUiState,
+    otaSummary: List<DiagnosticField>,
     onBack: () -> Unit,
     onNormalRescan: () -> Unit,
     onDeepRescan: () -> Unit,
     onResetDiscoveryCache: () -> Unit,
+    onOpenUpdates: () -> Unit,
     onExport: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -104,6 +106,12 @@ fun DiagnosticsScreen(
                             Text("Export JSON")
                         }
                         Button(
+                            onClick = onOpenUpdates,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("Updates")
+                        }
+                        Button(
                             onClick = onNormalRescan,
                             modifier = Modifier.fillMaxWidth(),
                         ) {
@@ -128,6 +136,9 @@ fun DiagnosticsScreen(
 
             if (state.buildSummary.isNotEmpty()) {
                 item { DiagnosticSection("App and device", state.buildSummary) }
+            }
+            if (otaSummary.isNotEmpty()) {
+                item { DiagnosticSection("Updates", otaSummary) }
             }
             if (state.nativeSummary.isNotEmpty()) {
                 item { DiagnosticSection("Native foundation", state.nativeSummary) }
@@ -158,11 +169,6 @@ private fun DiagnosticSection(title: String, fields: List<DiagnosticField>) {
     }
 }
 
-/**
- * One card is one physical/canonical optical lens. Transport aliases are expandable profile rows,
- * never sibling lens cards, which makes duplicate-ID problems obvious without polluting the normal
- * camera selector.
- */
 @Composable
 private fun LensDiagnosticCard(lens: LensDiagnosticsUiModel) {
     var expanded by rememberSaveable(lens.fingerprint) { mutableStateOf(false) }
@@ -188,9 +194,7 @@ private fun LensDiagnosticCard(lens: LensDiagnosticsUiModel) {
                 if (lens.profiles.isEmpty()) {
                     Text("No transport profiles", style = MaterialTheme.typography.bodySmall)
                 } else {
-                    lens.profiles.forEach { profile ->
-                        ProfileDiagnostics(profile)
-                    }
+                    lens.profiles.forEach { profile -> ProfileDiagnostics(profile) }
                 }
             }
             Text(
