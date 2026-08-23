@@ -235,10 +235,11 @@ private fun CameraBottomControls(
     onCapture: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val captureEnabled = previewVisible &&
-        rawState.capability.canAttempt &&
-        rawState.capability.sessionReady &&
-        !rawState.inProgress
+    // The runtime owns capability/failover decisions. Keeping the shutter clickable while a
+    // verified preview is live is important: a profile whose combined preview+RAW session was
+    // rejected must be allowed to enter the bounded same-canonical RAW failover path instead of
+    // being silently blocked by UI state. Only an in-flight capture disables the shutter.
+    val captureEnabled = previewVisible && !rawState.inProgress
 
     Column(
         modifier = modifier
@@ -307,8 +308,10 @@ private fun CameraBottomControls(
                     .semantics {
                         contentDescription = if (captureEnabled) {
                             "Capture one RAW DNG"
+                        } else if (rawState.inProgress) {
+                            "RAW capture in progress"
                         } else {
-                            "RAW capture unavailable"
+                            "Camera preview is not ready"
                         }
                     },
                 contentAlignment = Alignment.Center,
