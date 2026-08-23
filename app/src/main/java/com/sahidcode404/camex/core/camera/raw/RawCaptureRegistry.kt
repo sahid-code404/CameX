@@ -39,6 +39,8 @@ object RawCaptureRegistry : RawCaptureController {
     private val active = AtomicReference<ActiveRawSession?>(null)
     private val activeSelectionGeneration = AtomicLong(INVALID_GENERATION)
     private val activeSelectionRoutingKey = AtomicReference<String?>(null)
+    private val activeCanonicalFingerprint = AtomicReference<String?>(null)
+    private val activeProfileFingerprint = AtomicReference<String?>(null)
     private val transportGeneration = AtomicLong(0L)
     private val captureTokens = AtomicLong(0L)
     private val gate = RawCaptureGate()
@@ -138,7 +140,8 @@ object RawCaptureRegistry : RawCaptureController {
     internal fun combinedSessionRejected(prepared: PreparedRawOutput, detail: String) {
         runCatching { prepared.reader.close() }
         transportGeneration.incrementAndGet()
-        active.compareAndSet(active.get()?.takeIf { it.routingKey == prepared.routingKey }, null)
+        val current = active.get()
+        if (current?.routingKey == prepared.routingKey) active.compareAndSet(current, null)
         val capability = mutableState.value.capability
         mutableState.value = RawCaptureState(
             phase = RawCapturePhase.IDLE,
@@ -166,13 +169,49 @@ object RawCaptureRegistry : RawCaptureController {
     }
 
     override fun updateActiveSelection(selectionGeneration: Long?, routingKey: String?) {
+        updateActiveSelectionDetails(selectionGeneration, routingKey, null, null)
+    }
+
+    fun updateActiveSelectionDetails(
+        selectionGeneration: Long?,
+        routingKey: String?,
+        canonicalFingerprint: String?,
+        profileFingerprint: String?,
+    ) {
         if (selectionGeneration == null || routingKey.isNullOrBlank()) {
             activeSelectionGeneration.set(INVALID_GENERATION)
             activeSelectionRoutingKey.set(null)
+            activeCanonicalFingerprint.set(null)
+            activeProfileFingerprint.set(null)
         } else {
             activeSelectionGeneration.set(selectionGeneration)
             activeSelectionRoutingKey.set(routingKey)
+            activeCanonicalFingerprint.set(canonicalFingerprint)
+            activeProfileFingerprint.set(profileFingerprint)
         }
+    }
+
+    fun invalidateSelection() {
+        updateActiveSelectionDetails(null, null, null, null)
+    }
+
+    suspend fun captureCurrent(): RawCaptureResult {
+        val generation = activeSelectionGeneration.get()
+        if (generation == INVALID_GENERATION) {
+            val diagnostics = mutableState.value.diagnostics.copy(lastRawError = "no verified camera selection")
+            return RawCaptureResult.Failed(
+                reason = "RAW capture requires a verified preview selection",
+                structural = false,
+                diagnostics = diagnostics,
+            )
+        }
+        return captureRaw(
+            RawCaptureRequest(
+                selectionGeneration = generation,
+                canonicalFingerprint = activeCanonicalFingerprint.get(),
+                profileFingerprint = activeProfileFingerprint.get(),
+            ),
+        )
     }
 
     override suspend fun captureRaw(request: RawCaptureRequest): RawCaptureResult {
