@@ -7,9 +7,11 @@ import com.sahidcode404.camex.core.camera.topology.CameraRawTrust
 import com.sahidcode404.camex.core.camera.topology.CameraRouteTrust
 import com.sahidcode404.camex.core.camera.topology.CameraSessionTrust
 import com.sahidcode404.camex.core.camera.topology.CameraTopology
+import com.sahidcode404.camex.core.camera.topology.withProfileTrust
 import com.sahidcode404.camex.core.model.LensFingerprint
 import kotlinx.serialization.Serializable
 
+/** One persisted trust record per CameraProfile transport endpoint. */
 @Serializable
 data class CameraTrustRecord(
     val canonicalRouteId: String,
@@ -24,7 +26,7 @@ data class CameraTrustSnapshot(
     val records: List<CameraTrustRecord> = emptyList(),
 ) {
     companion object {
-        const val CURRENT_SCHEMA_VERSION = 1
+        const val CURRENT_SCHEMA_VERSION = 2
     }
 }
 
@@ -52,7 +54,7 @@ object CameraTrustCachePolicy {
     ): CameraTrustCacheResult {
         if (cached == null) return CameraTrustCacheResult.Miss(CameraCacheMissReason.EMPTY)
         val migration = migrate(cached) ?: return CameraTrustCacheResult.Miss(
-            if (cached.cacheSchemaVersion > CameraTopology.CACHE_SCHEMA_VERSION) {
+            if (cached.cacheSchemaVersion != CameraTopology.CACHE_SCHEMA_VERSION) {
                 CameraCacheMissReason.CACHE_SCHEMA_CHANGED
             } else {
                 CameraCacheMissReason.CORRUPT
@@ -71,19 +73,10 @@ object CameraTrustCachePolicy {
         return CameraTrustCacheResult.Hit(value, migrated = migration.second)
     }
 
+    /** Phase 1B intentionally does not reinterpret route-per-lens trust as profile trust. */
     private fun migrate(cached: CachedCameraTrust): Pair<CachedCameraTrust, Boolean>? = when {
-        cached.cacheSchemaVersion == CameraTopology.CACHE_SCHEMA_VERSION -> cached to false
-        cached.cacheSchemaVersion == 0 && CameraTopology.CACHE_SCHEMA_VERSION == 1 -> {
-            cached.copy(
-                cacheSchemaVersion = CameraTopology.CACHE_SCHEMA_VERSION,
-                snapshot = cached.snapshot.copy(
-                    schemaVersion = CameraTrustSnapshot.CURRENT_SCHEMA_VERSION,
-                    environmentFingerprint = cached.snapshot.environmentFingerprint.copy(
-                        cacheSchemaVersion = CameraTopology.CACHE_SCHEMA_VERSION,
-                    ),
-                ),
-            ) to true
-        }
+        cached.cacheSchemaVersion == CameraTopology.CACHE_SCHEMA_VERSION &&
+            cached.snapshot.schemaVersion == CameraTrustSnapshot.CURRENT_SCHEMA_VERSION -> cached to false
         else -> null
     }
 
@@ -94,7 +87,7 @@ object CameraTrustCachePolicy {
     }
 }
 
-/** Monotonic trust progression plus conservative structural-failure handling. */
+/** Monotonic profile trust progression plus conservative structural-failure handling. */
 object CameraTrustPolicy {
     fun merge(previous: CameraRouteTrust, observation: CameraRouteTrust): CameraRouteTrust {
         val transient = observation.failure?.durability == CameraFailureDurability.TRANSIENT ||
@@ -113,42 +106,55 @@ object CameraTrustPolicy {
         return CameraRouteTrust(metadata, session, raw, failure)
     }
 
+    /** Apply persisted trust to each profile independently; verified profiles become preferred. */
     fun apply(snapshot: CameraTrustSnapshot, topology: CameraTopology): CameraTopology {
         if (!snapshot.environmentFingerprint.isCompatibleWith(topology.environmentFingerprint)) {
             return topology
         }
         val records = snapshot.records.associateBy(CameraTrustRecord::canonicalRouteId)
-        return topology.copy(routes = topology.routes.map { route ->
-            val record = records[route.canonicalRouteId] ?: return@map route
-            if (record.lensFingerprint != null && route.lensFingerprint != null &&
-                record.lensFingerprint != route.lensFingerprint
-            ) return@map route
-            route.copy(trust = merge(route.trust, record.trust))
+        return topology.copy(routes = topology.routes.map { canonical ->
+            canonical.profiles.fold(canonical) { route, profile ->
+                val record = records[profile.profileId] ?: return@fold route
+                if (record.lensFingerprint != null && canonical.lensFingerprint != null &&
+                    record.lensFingerprint != canonical.lensFingerprint
+                ) return@fold route
+                route.withProfileTrust(profile.profileId, merge(profile.trust, record.trust))
+            }
         })
     }
 
+    /** Persist one record for every raw discovered profile, never only the preferred route. */
     fun reconcile(
         previous: CameraTrustSnapshot?,
         topology: CameraTopology,
     ): CameraTrustSnapshot {
         val compatible = previous?.takeIf {
-            it.environmentFingerprint.isCompatibleWith(topology.environmentFingerprint)
+            it.environmentFingerprint.isCompatibleWith(topology.environmentFingerprint) &&
+                it.schemaVersion == CameraTrustSnapshot.CURRENT_SCHEMA_VERSION
         }
         val old = compatible?.records.orEmpty().associateBy(CameraTrustRecord::canonicalRouteId)
+        val records = topology.routes.flatMap { canonical ->
+            canonical.profiles.map { profile ->
+                val stored = old[profile.profileId]
+                val fingerprintChanged = stored?.lensFingerprint != null &&
+                    canonical.lensFingerprint != null &&
+                    stored.lensFingerprint != canonical.lensFingerprint
+                val trust = if (stored == null || fingerprintChanged) {
+                    profile.trust
+                } else {
+                    merge(stored.trust, profile.trust)
+                }
+                CameraTrustRecord(
+                    canonicalRouteId = profile.profileId,
+                    lensFingerprint = canonical.lensFingerprint,
+                    trust = trust,
+                )
+            }
+        }
         return CameraTrustSnapshot(
             environmentFingerprint = topology.environmentFingerprint,
-            records = topology.routes.map { route ->
-                val stored = old[route.canonicalRouteId]
-                val trust = if (stored == null ||
-                    stored.lensFingerprint != null && route.lensFingerprint != null &&
-                    stored.lensFingerprint != route.lensFingerprint
-                ) {
-                    route.trust
-                } else {
-                    merge(stored.trust, route.trust)
-                }
-                CameraTrustRecord(route.canonicalRouteId, route.lensFingerprint, trust)
-            }.sortedBy(CameraTrustRecord::canonicalRouteId),
+            records = records.distinctBy(CameraTrustRecord::canonicalRouteId)
+                .sortedBy(CameraTrustRecord::canonicalRouteId),
         )
     }
 
