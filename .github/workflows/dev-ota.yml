@@ -1,0 +1,155 @@
+name: Development OTA
+
+on:
+  push:
+    branches:
+      - main
+      - 'phase/**'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: camex-development-ota
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    name: Build and publish development OTA
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      CAMEX_GIT_SHA: ${{ github.sha }}
+      CI: "true"
+
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5
+        with:
+          dependency-graph: disabled
+
+      - name: Install Android SDK, NDK, and CMake
+        run: ./scripts/install-android-sdk.sh
+
+      - name: Resolve development build identity
+        run: |
+          set -euo pipefail
+          DEV_OTA_VERSION_CODE="$((1000000 + GITHUB_RUN_NUMBER))"
+          DEV_OTA_VERSION_NAME="0.2.0-dev.${GITHUB_RUN_NUMBER}"
+          commit_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          commit_timestamp="$(date --utc --date="@${commit_epoch}" +%Y-%m-%dT%H:%M:%SZ)"
+          changelog="$(git log -1 --pretty=%s "$GITHUB_SHA")"
+          echo "DEV_OTA_VERSION_CODE=$DEV_OTA_VERSION_CODE" >> "$GITHUB_ENV"
+          echo "DEV_OTA_VERSION_NAME=$DEV_OTA_VERSION_NAME" >> "$GITHUB_ENV"
+          echo "CAMEX_BUILD_TIMESTAMP_UTC=$commit_timestamp" >> "$GITHUB_ENV"
+          echo "DEV_OTA_CHANGELOG=$changelog" >> "$GITHUB_ENV"
+
+      - name: Assemble fixed-signer development APK
+        run: |
+          ./gradlew --no-daemon --stacktrace :app:assembleDevOta \
+            -PdevOtaVersionCode="$DEV_OTA_VERSION_CODE" \
+            -PdevOtaVersionName="$DEV_OTA_VERSION_NAME"
+
+      - name: Verify APK and create development manifest
+        run: |
+          set -euo pipefail
+          APK_SRC="$(find app/build/outputs/apk/devOta -name '*.apk' -type f | head -n 1)"
+          test -f "$APK_SRC"
+
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/37.0.0"
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$APK_SRC" > "$RUNNER_TEMP/apksigner.txt"
+          CERT_SHA="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/apksigner.txt" | head -n 1 | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+          EXPECTED_CERT_SHA="445538e26dd5ad46a026eeca5265fd32d1231dc8863b2383c15a5d55a3285640"
+          test "$CERT_SHA" = "$EXPECTED_CERT_SHA"
+
+          BADGING="$("$BUILD_TOOLS/aapt2" dump badging "$APK_SRC")"
+          PACKAGE_NAME="$(printf '%s\n' "$BADGING" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n 1)"
+          APK_VERSION_CODE="$(printf '%s\n' "$BADGING" | sed -n "s/^package:.*versionCode='\([^']*\)'.*/\1/p" | head -n 1)"
+          APK_VERSION_NAME="$(printf '%s\n' "$BADGING" | sed -n "s/^package:.*versionName='\([^']*\)'.*/\1/p" | head -n 1)"
+          test "$PACKAGE_NAME" = "com.sahidcode404.camex"
+          test "$APK_VERSION_CODE" = "$DEV_OTA_VERSION_CODE"
+          test "$APK_VERSION_NAME" = "$DEV_OTA_VERSION_NAME"
+
+          cp "$APK_SRC" Camera-dev.apk
+          SHA="$(sha256sum Camera-dev.apk | awk '{print $1}')"
+          test -n "$SHA"
+
+          python3 - <<'PY'
+          import json
+          import os
+
+          manifest = {
+              "schema": 1,
+              "versionCode": int(os.environ["DEV_OTA_VERSION_CODE"]),
+              "versionName": os.environ["DEV_OTA_VERSION_NAME"],
+              "minSdk": 23,
+              "apkAssetName": "Camera-dev.apk",
+              "sha256": os.environ["SHA"],
+              "signingCertSha256": os.environ["CERT_SHA"],
+              "gitSha": os.environ["GITHUB_SHA"],
+              "buildTimestamp": os.environ["CAMEX_BUILD_TIMESTAMP_UTC"],
+              "changelog": os.environ.get("DEV_OTA_CHANGELOG", "Development build"),
+              "mandatory": False,
+          }
+          with open("dev-manifest.json", "w", encoding="utf-8") as output:
+              json.dump(manifest, output, indent=2)
+              output.write("\n")
+          PY
+        env:
+          SHA: ${{ env.SHA }}
+          CERT_SHA: ${{ env.CERT_SHA }}
+
+      - name: Export verification values
+        run: |
+          set -euo pipefail
+          SHA="$(sha256sum Camera-dev.apk | awk '{print $1}')"
+          CERT_SHA="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/apksigner.txt" | head -n 1 | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+          python3 - <<PY
+          import json
+          path = "dev-manifest.json"
+          data = json.load(open(path, encoding="utf-8"))
+          data["sha256"] = "$SHA"
+          data["signingCertSha256"] = "$CERT_SHA"
+          open(path, "w", encoding="utf-8").write(json.dumps(data, indent=2) + "\n")
+          PY
+          grep -F "\"versionCode\": $DEV_OTA_VERSION_CODE" dev-manifest.json
+          grep -F "\"gitSha\": \"$GITHUB_SHA\"" dev-manifest.json
+
+      - name: Publish rolling dev-latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view dev-latest >/dev/null 2>&1; then
+            gh release create dev-latest \
+              --target "$GITHUB_SHA" \
+              --title "CameX Development OTA" \
+              --prerelease \
+              --notes "Rolling development OTA channel. Not a stable release."
+          fi
+          gh release upload dev-latest Camera-dev.apk dev-manifest.json --clobber
+          gh release edit dev-latest \
+            --title "CameX Development OTA" \
+            --prerelease \
+            --notes "Build $DEV_OTA_VERSION_NAME · $GITHUB_SHA"
+
+      - name: Upload development APK artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Camera-dev-ota-${{ github.sha }}
+          path: |
+            Camera-dev.apk
+            dev-manifest.json
+          if-no-files-found: error
+          retention-days: 14
