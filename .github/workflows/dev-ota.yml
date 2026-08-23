@@ -69,8 +69,9 @@ jobs:
           test -f "$APK_SRC"
 
           BUILD_TOOLS="$ANDROID_HOME/build-tools/37.0.0"
-          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$APK_SRC" > "$RUNNER_TEMP/apksigner.txt"
-          CERT_SHA="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/apksigner.txt" | head -n 1 | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$APK_SRC" > "$RUNNER_TEMP/apksigner.txt" 2>&1
+          cat "$RUNNER_TEMP/apksigner.txt"
+          CERT_SHA="$(grep -m1 -F 'certificate SHA-256 digest:' "$RUNNER_TEMP/apksigner.txt" | sed 's/.*certificate SHA-256 digest:[[:space:]]*//' | tr -d ':' | tr '[:upper:]' '[:lower:]')"
 
           base64 --decode tools/dev-signing/camex-dev.jks.b64 > "$RUNNER_TEMP/camex-dev.jks"
           TRUSTED_CERT_SHA="$(keytool -exportcert \
