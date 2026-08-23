@@ -16,7 +16,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-data class PreparedRawOutput internal constructor(
+internal data class PreparedRawOutput(
     val routingKey: String,
     val openCameraId: String,
     val physicalCameraId: String?,
@@ -198,11 +198,14 @@ object RawCaptureRegistry : RawCaptureController {
     suspend fun captureCurrent(): RawCaptureResult {
         val generation = activeSelectionGeneration.get()
         if (generation == INVALID_GENERATION) {
-            val diagnostics = mutableState.value.diagnostics.copy(lastRawError = "no verified camera selection")
+            val diagnostics = mutableState.value.diagnostics.copy(
+                lastRawError = "no verified camera selection",
+            )
             return RawCaptureResult.Failed(
                 reason = "RAW capture requires a verified preview selection",
                 structural = false,
                 diagnostics = diagnostics,
+                failureKind = RawFailureKind.STALE_SELECTION,
             )
         }
         return captureRaw(
@@ -216,11 +219,14 @@ object RawCaptureRegistry : RawCaptureController {
 
     override suspend fun captureRaw(request: RawCaptureRequest): RawCaptureResult {
         if (!gate.tryBegin()) {
-            val diagnostics = mutableState.value.diagnostics.copy(lastRawError = "capture already in progress")
+            val diagnostics = mutableState.value.diagnostics.copy(
+                lastRawError = "capture already in progress",
+            )
             return RawCaptureResult.Failed(
                 reason = "RAW capture already in progress",
                 structural = false,
                 diagnostics = diagnostics,
+                failureKind = RawFailureKind.DUPLICATE_CAPTURE,
             )
         }
 
@@ -228,6 +234,7 @@ object RawCaptureRegistry : RawCaptureController {
             val current = active.get()
             val capability = mutableState.value.capability
             if (current == null || !capability.sessionReady) {
+                val failureKind = unavailableFailureKind(capability)
                 val reason = capability.detail ?: when (capability.support) {
                     RawSupportState.UNSUPPORTED -> "Selected camera profile does not support RAW_SENSOR"
                     RawSupportState.UNKNOWN -> "RAW_SENSOR availability is unknown for this profile"
@@ -240,15 +247,18 @@ object RawCaptureRegistry : RawCaptureController {
                 )
                 return RawCaptureResult.Failed(
                     reason = reason,
-                    structural = capability.canAttempt && !capability.sessionReady,
+                    structural = failureKind.mayRotateProfile(),
                     diagnostics = diagnostics,
+                    failureKind = failureKind,
                 )
             }
 
             if (activeSelectionGeneration.get() != request.selectionGeneration ||
                 activeSelectionRoutingKey.get() != current.routingKey
             ) {
-                val diagnostics = mutableState.value.diagnostics.copy(lastRawError = "stale selection generation")
+                val diagnostics = mutableState.value.diagnostics.copy(
+                    lastRawError = "stale selection generation",
+                )
                 mutableState.value = mutableState.value.copy(
                     phase = RawCapturePhase.FAILED,
                     diagnostics = diagnostics,
@@ -257,6 +267,7 @@ object RawCaptureRegistry : RawCaptureController {
                     reason = "Camera selection changed before RAW capture started",
                     structural = false,
                     diagnostics = diagnostics,
+                    failureKind = RawFailureKind.STALE_SELECTION,
                 )
             }
 
@@ -365,7 +376,9 @@ object RawCaptureRegistry : RawCaptureController {
                     profileRoutingKey = routingKey,
                     detail = detail,
                 ),
-                continuousPictureAf = afModes.contains(CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE),
+                continuousPictureAf = afModes.contains(
+                    CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
+                ),
             )
         } catch (error: Throwable) {
             if (error is VirtualMachineError || error is ThreadDeath) throw error
@@ -379,6 +392,27 @@ object RawCaptureRegistry : RawCaptureController {
             )
         }
     }
+
+    private fun unavailableFailureKind(capability: RawCapabilityInfo): RawFailureKind = when {
+        capability.support == RawSupportState.UNSUPPORTED -> RawFailureKind.CAPABILITY_UNAVAILABLE
+        capability.selectedSize == null && capability.detail.isExplicitRawSizeAbsence() ->
+            RawFailureKind.RAW_SIZE_UNAVAILABLE
+        capability.selectedSize != null && !capability.sessionReady ->
+            RawFailureKind.SESSION_CONFIGURATION
+        else -> RawFailureKind.UNKNOWN
+    }
+
+    private fun String?.isExplicitRawSizeAbsence(): Boolean {
+        val value = this ?: return false
+        return value.contains("RAW_SENSOR sizes are absent") ||
+            value.contains("no RAW_SENSOR size")
+    }
+
+    private fun RawFailureKind.mayRotateProfile(): Boolean =
+        this == RawFailureKind.CAPABILITY_UNAVAILABLE ||
+            this == RawFailureKind.RAW_SIZE_UNAVAILABLE ||
+            this == RawFailureKind.SESSION_CONFIGURATION ||
+            this == RawFailureKind.CAPTURE_REQUEST_REJECTED
 
     private fun routingKey(openCameraId: String, physicalCameraId: String?): String =
         if (physicalCameraId.isNullOrBlank()) openCameraId else "$openCameraId/$physicalCameraId"
