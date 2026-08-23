@@ -15,6 +15,10 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -85,10 +89,21 @@ private fun CameraApplication(
     var screen by rememberSaveable { mutableStateOf(AppScreen.CAMERA) }
     var pendingReport by remember { mutableStateOf<String?>(null) }
     var permissionRequested by rememberSaveable { mutableStateOf(false) }
+    var promptedVersionCode by rememberSaveable { mutableStateOf<Long?>(null) }
+    var showUpdatePrompt by rememberSaveable { mutableStateOf(false) }
 
     // Match Universal_Camera: on app open, perform the lightweight GitHub check only if 12h elapsed.
     LaunchedEffect(Unit) {
         updateViewModel.checkForUpdatesIfDue()
+    }
+
+    val availableUpdate = (updateState.updateState as? UpdateState.Available)?.update
+    LaunchedEffect(availableUpdate?.manifest?.versionCode) {
+        val update = availableUpdate ?: return@LaunchedEffect
+        if (promptedVersionCode != update.manifest.versionCode) {
+            promptedVersionCode = update.manifest.versionCode
+            showUpdatePrompt = true
+        }
     }
 
     BackHandler(enabled = screen != AppScreen.CAMERA) {
@@ -123,7 +138,7 @@ private fun CameraApplication(
             permissionPermanentlyDenied = !state.camera.permissionGranted &&
                 permissionRequested &&
                 !activity.shouldShowRequestPermissionRationale(Manifest.permission.CAMERA),
-            updateAvailable = updateState.updateState is UpdateState.Available,
+            updateAvailable = availableUpdate != null,
             onRequestPermission = {
                 permissionRequested = true
                 permissionLauncher.launch(Manifest.permission.CAMERA)
@@ -186,6 +201,35 @@ private fun CameraApplication(
             onInstall = updateViewModel::installUpdate,
             onOpenInstallPermissionSettings = updateViewModel::openInstallPermissionSettings,
             onResetFailure = updateViewModel::resetFailure,
+        )
+    }
+
+    if (showUpdatePrompt && availableUpdate != null && screen == AppScreen.CAMERA) {
+        val manifest = availableUpdate.manifest
+        AlertDialog(
+            onDismissRequest = { showUpdatePrompt = false },
+            title = { Text("Camera ${manifest.versionName} is available") },
+            text = {
+                Text(
+                    manifest.changelog.takeIf { it.isNotBlank() }
+                        ?: "A newer version of Camera is ready to download.",
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showUpdatePrompt = false
+                        screen = AppScreen.UPDATES
+                    },
+                ) {
+                    Text("Update")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showUpdatePrompt = false }) {
+                    Text("Later")
+                }
+            },
         )
     }
 }
