@@ -2,54 +2,30 @@
 
 ## Scope
 
-CameX uses the same simple GitHub Release OTA shape as `sahid-code404/Universal_Camera`:
+CameX follows the same simple GitHub Release OTA shape as `sahid-code404/Universal_Camera`:
 
 `git tag vX.Y.Z → git push origin vX.Y.Z → GitHub Actions → signed APK + release-manifest.json → GitHub Release → Camera checks /releases/latest → download → verify → Android installer`
 
-Like `Universal_Camera`, CameX performs a lightweight update check when Camera opens if the previous automatic check was at least 12 hours ago. The check runs asynchronously and does not wait for camera discovery or preview. Manual checking remains available from Diagnostics → Updates.
+The public release workflow is tag-only. There is no AI release branch, manual workflow dispatch, candidate/staging release path, GitHub Environment, release database, or separate OTA channel.
 
-## Release command
+Like `Universal_Camera`, CameX performs a lightweight update check when Camera opens if the previous automatic check was at least 12 hours ago. The check runs asynchronously and does not block camera discovery or preview. Manual checking remains available from Diagnostics → Updates.
 
-After Phase 1C is accepted and merged, normal releases are:
+## Release flow
 
-```bash
-git switch main
-git pull
-
-git tag v0.1.1
-git push origin v0.1.1
-```
-
-Next release:
-
-```bash
-git tag v0.1.2
-git push origin v0.1.2
-```
-
-The release workflow derives:
+Normal releases are created from a pushed `v*` tag. The workflow derives:
 
 - `versionName`: `${GITHUB_REF_NAME#v}`
 - `versionCode`: `${GITHUB_RUN_NUMBER}`
 
-There is no semver versionCode allocator, candidate release flow, manual workflow dispatch, release database, or separate OTA channel.
+It builds `assembleRelease`, prepares `Camera-<version>.apk` and `release-manifest.json`, then creates the GitHub Release.
 
-## Repository secrets
+The workflow retains the same ordinary Android release-signing placeholders/style as the reference repository. Release signing/publication validation is deferred until releases are actually being produced; it is not an implementation blocker for Phase 2.
 
-The release workflow uses the same four ordinary repository-level GitHub Actions secrets as `Universal_Camera`:
-
-- `ANDROID_KEYSTORE_BASE64`
-- `ANDROID_KEYSTORE_PASSWORD`
-- `ANDROID_KEY_ALIAS`
-- `ANDROID_KEY_PASSWORD`
-
-No GitHub Environment is required. The keystore is decoded only into runner temporary storage and referenced through `keystore.properties` for the release build.
-
-The workflow derives the public signing-certificate SHA-256 from the final signed APK, so no additional certificate secret or metadata-signing key is required.
+No keystore is committed to the repository and there is no second OTA metadata-signing system.
 
 ## Release assets
 
-Every release uploads exactly two OTA assets:
+Every release contains exactly two OTA assets:
 
 1. `Camera-<version>.apk`
 2. `release-manifest.json`
@@ -80,21 +56,19 @@ CameX requests:
 
 The updater finds `release-manifest.json`, parses schema 1, compares `versionCode`, and locates the APK using `manifest.apkAssetName`.
 
-If `manifest.versionCode <= installedVersionCode`, Camera is up to date. Otherwise the release is offered as an available update.
+If no release exists, or `manifest.versionCode <= installedVersionCode`, Camera reports up to date. Otherwise the release is offered as an available update.
 
-Automatic behavior matches `Universal_Camera`:
+Automatic behavior:
 
 - when Camera opens, `UpdateAutoChecker` checks only if 12 hours have elapsed since `last_check_ms`
-- an available update is surfaced quietly with an update indicator in the Camera UI
+- an available update is surfaced with the existing update popup/indicator flow
 - up-to-date and failed background checks stay quiet
-- Diagnostics → Updates → Check for updates always remains available for an explicit manual check
+- Diagnostics → Updates → Check for updates remains available for an explicit manual check
 - there is no WorkManager job or continuous background polling
 
 ## Download and verification
 
-The APK downloads into app-private storage:
-
-`cacheDir/updates/`
+The APK downloads into app-private storage at `cacheDir/updates/`.
 
 A `.part` file is used while the download is incomplete. After verification it is promoted to the final APK filename.
 
@@ -109,7 +83,7 @@ Before Android installer handoff CameX verifies:
 - downloaded APK signer matches the installed Camera signing certificate
 - manifest signing certificate matches the installed Camera signing certificate
 
-The package/version/signer checks are the one intentional CameX improvement over the reference updater. They remain inside one small `ApkVerifier` rather than a separate OTA security framework.
+The package/version/signer checks are the intentional CameX improvement over the reference updater. They remain inside one small `ApkVerifier` rather than a separate OTA security framework.
 
 ## Installer
 
@@ -124,16 +98,8 @@ On Android 8.0+ Camera checks `PackageManager.canRequestPackageInstalls()`. If p
 
 There is no PackageInstaller session framework and no silent installation path.
 
-## Phase 1C acceptance boundary
+## Validation status
 
-Keep PR #2 DRAFT until the real signed update-in-place path succeeds:
+The OTA implementation is present and structurally follows `Universal_Camera`. Actual signed release publication and physical update-in-place validation have not been claimed here; those checks are deferred until releases are being produced.
 
-1. install a stable-signed base release
-2. publish a later `vX.Y.Z` tag with the same signing key
-3. let the app discover it automatically when the 12-hour check is due, or check manually from Diagnostics → Updates
-4. download and verify
-5. confirm Android installer handoff
-6. confirm app data survives
-7. confirm Phase 1B camera behavior and warm cached startup remain intact
-
-Do not start Phase 2 before Phase 1C acceptance.
+Phase 2 may proceed once the normal Phase 1C code/architecture CI is green. OTA behavior and updater code stay frozen during Phase 2.
