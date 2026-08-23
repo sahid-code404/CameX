@@ -1,6 +1,7 @@
 package com.sahidcode404.camex.core.camera.topology
 
 import com.sahidcode404.camex.core.model.ColorFilterArrangement
+import com.sahidcode404.camex.core.model.LensCapabilities
 import com.sahidcode404.camex.core.model.LensFacing
 import com.sahidcode404.camex.core.model.Size2D
 import kotlin.math.abs
@@ -23,13 +24,15 @@ data class OpticalLensComparison(
 )
 
 /**
- * Pure metadata matcher used only by CameraTopologyResolver. Camera IDs are intentionally absent
- * from the optical signature: IDs describe transport/profile endpoints, not physical glass.
+ * Pure metadata matcher used only for optical identity. Camera IDs, route kinds and discovery
+ * sources are intentionally absent from the decision: they describe transport/profile endpoints,
+ * not physical glass. Strong sensor/optical evidence may therefore group two completely different
+ * vendor route IDs into one CanonicalLens.
  *
- * Android defines physical/pixel/active-array metadata as sensor geometry, but vendor aliases can
- * expose cropped/binned variants. Therefore exact geometry is strong evidence while small numeric
- * tolerances and integer binning relationships are treated conservatively rather than requiring
- * bit-for-bit equality.
+ * Vendor aliases can expose cropped/binned variants, so exact geometry is strong evidence while
+ * small numeric tolerances and common integer binning relationships remain conservative. Any
+ * authoritative conflict (facing, focal length, sensor geometry, CFA, orientation or FOV) prevents
+ * grouping regardless of how similar the transport routes look.
  */
 object OpticalLensMatcher {
     private const val FOCAL_STRONG_RELATIVE_TOLERANCE = 0.015
@@ -47,74 +50,43 @@ object OpticalLensMatcher {
     private const val PROBABLE_SCORE = 55
     private const val MINIMUM_EVIDENCE_COUNT = 4
 
-    fun signature(route: CameraRoute): OpticalLensSignature {
-        val metadata = route.minimalMetadata
-        val capabilities = route.fullCapabilities?.capabilities
-        return OpticalLensSignature(
-            facing = metadata.facing,
-            focalLengthMm = metadata.focalLengthsMm
-                .filter { it.isFinite() && it > 0.0 }
-                .minOrNull(),
-            sensorPhysicalSize = metadata.sensorPhysicalSize,
-            activeArraySize = metadata.activeArray?.let { rect ->
-                Size2D(rect.right - rect.left, rect.bottom - rect.top).takeIf(Size2D::isValid)
-            },
-            pixelArraySize = metadata.pixelArraySize,
-            rawSizes = metadata.rawSizes.filter(Size2D::isValid).distinct(),
-            colorFilterArrangement = capabilities?.colorFilterArrangement,
-            sensorOrientationDegrees = metadata.sensorOrientationDegrees
-                ?: capabilities?.sensorOrientationDegrees,
-            aperture = capabilities?.apertures.orEmpty()
-                .filter { it.isFinite() && it > 0.0 }
-                .minOrNull(),
-            diagonalFieldOfViewDegrees = metadata.approximateFieldOfView?.diagonalDegrees
-                ?.takeIf { it.isFinite() && it > 0.0 && it < 180.0 },
-        )
-    }
+    fun signature(route: CameraRoute): OpticalLensSignature =
+        signature(route.minimalMetadata, route.fullCapabilities?.capabilities)
 
-    fun compare(left: CameraRoute, right: CameraRoute): OpticalLensComparison {
-        val physicalLeft = left.streamPhysicalCameraId?.trim()?.takeIf(String::isNotEmpty)
-        val physicalRight = right.streamPhysicalCameraId?.trim()?.takeIf(String::isNotEmpty)
-        if (physicalLeft != null && physicalLeft == physicalRight) {
-            return OpticalLensComparison(
-                OpticalLensMatch.STRONG_MATCH,
-                score = 200,
-                evidenceCount = 1,
-                reasons = listOf("same physical Camera2 member"),
-            )
-        }
+    fun signature(profile: CameraProfile): OpticalLensSignature =
+        signature(profile.metadata, profile.fullCapabilities?.capabilities)
 
-        val base = compare(signature(left), signature(right))
-        if (base.match == OpticalLensMatch.CONFLICT) return base
+    private fun signature(
+        metadata: MinimalCameraMetadata,
+        capabilities: LensCapabilities?,
+    ): OpticalLensSignature = OpticalLensSignature(
+        facing = metadata.facing,
+        focalLengthMm = metadata.focalLengthsMm
+            .filter { it.isFinite() && it > 0.0 }
+            .minOrNull(),
+        sensorPhysicalSize = metadata.sensorPhysicalSize,
+        activeArraySize = metadata.activeArray?.let { rect ->
+            Size2D(rect.right - rect.left, rect.bottom - rect.top).takeIf(Size2D::isValid)
+        },
+        pixelArraySize = metadata.pixelArraySize,
+        rawSizes = metadata.rawSizes.filter(Size2D::isValid).distinct(),
+        colorFilterArrangement = capabilities?.colorFilterArrangement,
+        sensorOrientationDegrees = metadata.sensorOrientationDegrees
+            ?: capabilities?.sensorOrientationDegrees,
+        aperture = capabilities?.apertures.orEmpty()
+            .filter { it.isFinite() && it > 0.0 }
+            .minOrNull(),
+        diagonalFieldOfViewDegrees = metadata.approximateFieldOfView?.diagonalDegrees
+            ?.takeIf { it.isFinite() && it > 0.0 && it < 180.0 },
+    )
 
-        // Two completely independent public routes can legitimately be two real sensors with very
-        // similar geometry. Require one additional alias/profile signal before collapsing them:
-        // differing discovery paths/route kinds, or authoritative CFA+orientation agreement.
-        val leftSignature = signature(left)
-        val rightSignature = signature(right)
-        val cfaAgreement = knownCfa(leftSignature.colorFilterArrangement) != null &&
-            knownCfa(leftSignature.colorFilterArrangement) == knownCfa(rightSignature.colorFilterArrangement)
-        val orientationAgreement = leftSignature.sensorOrientationDegrees != null &&
-            leftSignature.sensorOrientationDegrees == rightSignature.sensorOrientationDegrees
-        val aliasEvidence = left.routeKind != right.routeKind ||
-            left.sources != right.sources ||
-            cfaAgreement && orientationAgreement
+    /** Transport/profile identity is deliberately not consulted here. */
+    fun compare(left: CameraRoute, right: CameraRoute): OpticalLensComparison =
+        compare(signature(left), signature(right))
 
-        val result = when {
-            base.match == OpticalLensMatch.STRONG_MATCH && aliasEvidence -> OpticalLensMatch.STRONG_MATCH
-            base.match == OpticalLensMatch.STRONG_MATCH -> OpticalLensMatch.PROBABLE_MATCH
-            base.match == OpticalLensMatch.PROBABLE_MATCH && aliasEvidence -> OpticalLensMatch.PROBABLE_MATCH
-            else -> OpticalLensMatch.INSUFFICIENT_EVIDENCE
-        }
-        return base.copy(
-            match = result,
-            reasons = base.reasons + if (aliasEvidence) {
-                "profile/alias evidence present"
-            } else {
-                "independent public routes require more alias evidence"
-            },
-        )
-    }
+    /** Profile IDs are deliberately not consulted here. */
+    fun compare(left: CameraProfile, right: CameraProfile): OpticalLensComparison =
+        compare(signature(left), signature(right))
 
     fun compare(left: OpticalLensSignature, right: OpticalLensSignature): OpticalLensComparison {
         val reasons = mutableListOf<String>()
@@ -138,7 +110,11 @@ object OpticalLensMatcher {
             if (relation.conflict) return conflict("meaningfully different focal length")
             score += if (relation.strong) 30 else 18
             evidence++
-            reasons += if (relation.strong) "focal length strongly agrees" else "focal length probably agrees"
+            reasons += if (relation.strong) {
+                "focal length strongly agrees"
+            } else {
+                "focal length probably agrees"
+            }
         }
 
         val leftPhysical = left.sensorPhysicalSize
@@ -170,7 +146,11 @@ object OpticalLensMatcher {
             if (!relation.conflict) {
                 score += if (relation.strong) 15 else 7
                 evidence++
-                reasons += if (relation.strong) "pixel array agrees" else "pixel array is binning-compatible"
+                reasons += if (relation.strong) {
+                    "pixel array agrees"
+                } else {
+                    "pixel array is binning-compatible"
+                }
             }
         }
 
@@ -181,13 +161,19 @@ object OpticalLensMatcher {
             if (!relation.conflict) {
                 score += if (relation.strong) 14 else 6
                 evidence++
-                reasons += if (relation.strong) "active array agrees" else "active array is crop/binning-compatible"
+                reasons += if (relation.strong) {
+                    "active array agrees"
+                } else {
+                    "active array is crop/binning-compatible"
+                }
             }
         }
 
         if (left.rawSizes.isNotEmpty() && right.rawSizes.isNotEmpty()) {
             val exact = left.rawSizes.any { it in right.rawSizes }
-            val compatible = exact || left.rawSizes.any { a -> right.rawSizes.any { b -> binningCompatible(a, b) } }
+            val compatible = exact || left.rawSizes.any { a ->
+                right.rawSizes.any { b -> binningCompatible(a, b) }
+            }
             when {
                 exact -> {
                     score += 20
@@ -254,22 +240,17 @@ object OpticalLensMatcher {
         }
 
         val match = when {
-            evidence >= MINIMUM_EVIDENCE_COUNT && score >= STRONG_SCORE -> OpticalLensMatch.STRONG_MATCH
-            evidence >= MINIMUM_EVIDENCE_COUNT && score >= PROBABLE_SCORE -> OpticalLensMatch.PROBABLE_MATCH
+            evidence >= MINIMUM_EVIDENCE_COUNT && score >= STRONG_SCORE ->
+                OpticalLensMatch.STRONG_MATCH
+            evidence >= MINIMUM_EVIDENCE_COUNT && score >= PROBABLE_SCORE ->
+                OpticalLensMatch.PROBABLE_MATCH
             else -> OpticalLensMatch.INSUFFICIENT_EVIDENCE
         }
         return OpticalLensComparison(match, score, evidence, reasons)
     }
 
-    fun shouldGroup(left: CameraRoute, right: CameraRoute): Boolean = when (compare(left, right).match) {
-        OpticalLensMatch.STRONG_MATCH -> true
-        // Probable is intentionally diagnostics-only. False merges are more damaging than one
-        // extra advanced profile, so only strong evidence creates optical identity.
-        OpticalLensMatch.PROBABLE_MATCH,
-        OpticalLensMatch.INSUFFICIENT_EVIDENCE,
-        OpticalLensMatch.CONFLICT,
-        -> false
-    }
+    fun shouldGroup(left: CameraRoute, right: CameraRoute): Boolean =
+        compare(left, right).match == OpticalLensMatch.STRONG_MATCH
 
     private fun conflict(reason: String) = OpticalLensComparison(
         OpticalLensMatch.CONFLICT,
@@ -288,9 +269,9 @@ object OpticalLensMatcher {
         probableTolerance: Double,
         conflictDelta: Double,
     ): RelativeRelation? {
-        if (left == null || right == null || !left.isFinite() || !right.isFinite() || left <= 0 || right <= 0) {
-            return null
-        }
+        if (left == null || right == null || !left.isFinite() || !right.isFinite() ||
+            left <= 0 || right <= 0
+        ) return null
         val delta = relativeDelta(left, right)
         return when {
             delta > conflictDelta -> RelativeRelation(strong = false, conflict = true)
