@@ -129,6 +129,7 @@ readonly PROFILE_SELECTOR=app/src/main/java/com/sahidcode404/camex/core/camera/t
 readonly FAILOVER_CONTROLLER=app/src/main/java/com/sahidcode404/camex/core/camera/runtime/FailoverCameraSessionController.kt
 readonly RUNTIME_COORDINATOR=app/src/main/java/com/sahidcode404/camex/core/camera/runtime/CameraRuntimeCoordinator.kt
 readonly VIEW_MODEL=app/src/main/java/com/sahidcode404/camex/CameraViewModel.kt
+readonly DUPLICATE_FILTER=app/src/main/java/com/sahidcode404/camex/core/logic/LensDuplicateFilter.kt
 readonly DIAGNOSTICS_SCREEN=app/src/main/java/com/sahidcode404/camex/feature/diagnostics/DiagnosticsScreen.kt
 readonly COMPATIBILITY_REPORT=app/src/main/java/com/sahidcode404/camex/core/model/CompatibilityReport.kt
 readonly COMPATIBILITY_FACTORY=app/src/main/java/com/sahidcode404/camex/core/diagnostics/CompatibilityReportFactory.kt
@@ -185,6 +186,13 @@ reject_pattern \
   '(?is)fun\s+(?:selectLens|switchFacing)\s*\([^)]*\)\s*\{.{0,1800}?\b(?:normalRescan|deepRescan|reconcile\s*\(|seedPrimaryRoute)\b' \
   --multiline --multiline-dotall "${VIEW_MODEL}"
 
+# Canonical topology owns optical identity. The UI duplicate filter may only use exact identity
+# safety nets; it must never grow a second focal/FOV/geometry based canonicalizer.
+reject_pattern \
+  "second heuristic optical canonicalization in LensDuplicateFilter" \
+  '(?i)\b(?:focal|fieldOfView|sensorPhysical|pixelArray|activeArray|rawSize|aperture)\b' \
+  "${DUPLICATE_FILTER}"
+
 require_pattern "runtime coordinator" '\bclass CameraRuntimeCoordinator\b' app/src/main
 require_pattern "discovery coordinator" '\bclass CameraDiscoveryCoordinator\b' app/src/main
 require_pattern "topology repository" '\bclass CameraTopologyRepository\b' app/src/main
@@ -201,8 +209,14 @@ require_pattern "deep AUX backend" '\bclass DeepAuxDiscoveryBackend\b' app/src/m
 require_pattern "canonical optical lens domain model" '\bdata class CanonicalLens\b' "${TOPOLOGY_MODELS}"
 require_pattern "camera profile domain model" '\bdata class CameraProfile\b' "${TOPOLOGY_MODELS}"
 require_pattern "optical lens signature" '\bdata class OpticalLensSignature\b' "${TOPOLOGY_MODELS}"
+require_pattern "persisted grouping comparison model" '\bdata class OpticalGroupingComparisonRecord\b' "${TOPOLOGY_MODELS}"
 require_pattern "confidence based optical matcher" '\bobject OpticalLensMatcher\b' "${OPTICAL_MATCHER}"
+require_pattern "optical evidence families" '\benum class OpticalEvidenceFamily\b' "${OPTICAL_MATCHER}"
+require_pattern "correlated geometry is one evidence family" '\bOpticalEvidenceFamily\.GEOMETRY\b' "${OPTICAL_MATCHER}"
+require_pattern "strong optical anchor required" '\bstrongOpticalAnchor\b' "${OPTICAL_MATCHER}"
 require_pattern "route matcher delegates to optical signatures" 'compare\s*\(\s*signature\s*\(\s*left\s*\)\s*,\s*signature\s*\(\s*right\s*\)\s*\)' "${OPTICAL_MATCHER}"
+require_pattern "complete-link optical clustering" 'comparisons\.any\s*\{\s*it\.match\s*!=\s*OpticalLensMatch\.STRONG_MATCH\s*\}' "${TOPOLOGY_RESOLVER}"
+require_pattern "grouping comparisons persisted" '\bgroupingComparisons\s*=\s*groupingComparisons\b' "${TOPOLOGY_RESOLVER}"
 require_pattern "profile selector" '\bobject CameraProfileSelector\b' "${PROFILE_SELECTOR}"
 require_pattern "bounded profile failover controller" '\bclass FailoverCameraSessionController\b' "${FAILOVER_CONTROLLER}"
 require_pattern "failover resolves exact profile descriptor" '\bprofileForRoutingKey\s*\(\s*lens\.identity\.routingKey\s*\)' "${FAILOVER_CONTROLLER}"
@@ -212,8 +226,8 @@ require_pattern "profile diagnostics UI model" '\bdata class CameraProfileDiagno
 require_pattern "nested canonical lens compatibility report" '\bdata class CanonicalLensCompatibilityReport\b' "${COMPATIBILITY_REPORT}"
 require_pattern "nested camera profile compatibility report" '\bdata class CameraProfileCompatibilityReport\b' "${COMPATIBILITY_REPORT}"
 require_pattern "compatibility export populates canonical lenses" '\bcanonicalLenses\s*=\s*canonicalLensReports\b' "${COMPATIBILITY_FACTORY}"
-require_pattern "cache schema v2" '\bCACHE_SCHEMA_VERSION\s*=\s*2\b' "${TOPOLOGY_MODELS}"
-require_pattern "topology schema v2" '\bCURRENT_SCHEMA_VERSION\s*=\s*2\b' "${TOPOLOGY_MODELS}"
+require_pattern "cache schema v3" '\bCACHE_SCHEMA_VERSION\s*=\s*3\b' "${TOPOLOGY_MODELS}"
+require_pattern "topology schema v3" '\bCURRENT_SCHEMA_VERSION\s*=\s*3\b' "${TOPOLOGY_MODELS}"
 
 require_pattern \
   "bounded Java metadata semaphore" \
