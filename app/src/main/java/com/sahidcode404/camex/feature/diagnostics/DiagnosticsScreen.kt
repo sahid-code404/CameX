@@ -64,6 +64,7 @@ data class DiagnosticsUiState(
 fun DiagnosticsScreen(
     state: DiagnosticsUiState,
     otaSummary: List<DiagnosticField>,
+    modifier: Modifier = Modifier,
     rawSummary: List<DiagnosticField> = emptyList(),
     onBack: () -> Unit,
     onNormalRescan: () -> Unit,
@@ -71,7 +72,6 @@ fun DiagnosticsScreen(
     onResetDiscoveryCache: () -> Unit,
     onOpenUpdates: () -> Unit,
     onExport: () -> Unit,
-    modifier: Modifier = Modifier,
 ) {
     Scaffold(
         modifier = modifier.fillMaxSize(),
