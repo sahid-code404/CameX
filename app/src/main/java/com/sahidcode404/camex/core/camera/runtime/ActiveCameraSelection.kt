@@ -5,6 +5,7 @@ import com.sahidcode404.camex.core.camera.CameraSessionState
 import com.sahidcode404.camex.core.camera.topology.CameraProfile
 import com.sahidcode404.camex.core.camera.topology.CameraRoute
 import com.sahidcode404.camex.core.camera.topology.CameraTopology
+import com.sahidcode404.camex.core.camera.topology.sessionRoutingKey
 import com.sahidcode404.camex.core.model.LensDescriptor
 import com.sahidcode404.camex.core.model.LensFacing
 import com.sahidcode404.camex.core.model.LensFingerprint
@@ -55,7 +56,7 @@ object CanonicalLensResolver {
 
         val exactProfileMatch = normalizedRoutingKey?.let { key ->
             topology.routes.asSequence().mapNotNull { route ->
-                route.profiles.firstOrNull { it.routingKey == key }?.let { route to it }
+                route.profiles.firstOrNull { it.sessionRoutingKey() == key }?.let { route to it }
             }.firstOrNull()
         }
         val fingerprintProfileMatch = if (exactProfileMatch == null && normalizedProfileFingerprint != null) {
@@ -77,7 +78,7 @@ object CanonicalLensResolver {
         val profile = exactProfileMatch?.second
             ?: fingerprintProfileMatch?.second
             ?: canonicalRoute?.profiles?.firstOrNull { candidate ->
-                normalizedRoutingKey != null && candidate.routingKey == normalizedRoutingKey
+                normalizedRoutingKey != null && candidate.sessionRoutingKey() == normalizedRoutingKey
             }
             ?: canonicalRoute?.profiles?.firstOrNull { candidate ->
                 normalizedProfileFingerprint != null &&
