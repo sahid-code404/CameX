@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.22.1)
 project(camex_native VERSION 0.1.0 LANGUAGES CXX)
 
 add_library(camex_native SHARED
+    src/main/cpp/camera_discovery.cpp
     src/main/cpp/camex_native.cpp
 )
 
@@ -18,3 +19,7 @@ target_compile_options(camex_native PRIVATE
     -Wextra
     -Werror
 )
+
+# ACameraManager starts at API 24 while CameX supports API 23. Resolve the public NDK camera
+# library at runtime so the rest of libcamex_native remains loadable on Android 6.
+target_link_libraries(camex_native PRIVATE dl)

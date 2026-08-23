@@ -18,24 +18,32 @@ object LensClassifier {
         lens: LensDescriptor,
         fieldOfView: FieldOfView? = LensMath.fieldOfView(lens.capabilities),
     ): LensCategory {
-        if (lens.usability == LensUsability.DEPTH_AUXILIARY ||
+        when (lens.usability) {
+            LensUsability.SYSTEM_ONLY -> return LensCategory.SYSTEM_ONLY
+            LensUsability.INACCESSIBLE -> return LensCategory.INACCESSIBLE
+            LensUsability.BROKEN -> return LensCategory.BROKEN
+            LensUsability.DEPTH_AUXILIARY -> return LensCategory.NON_PHOTO_DEPTH
+            else -> Unit
+        }
+        if (
             lens.capabilities.reportedCapabilities?.contains(CameraCapability.DEPTH_OUTPUT) == true &&
-            lens.capabilities.flags.backwardCompatible == CapabilitySupport.UNSUPPORTED ||
-            lens.capabilities.colorFilterArrangement == ColorFilterArrangement.NIR ||
-            lens.capabilities.reportedCapabilities?.contains(CameraCapability.MONOCHROME) == true &&
-            lens.capabilities.flags.backwardCompatible != CapabilitySupport.SUPPORTED
-        ) return LensCategory.AUXILIARY
-        if (lens.facing == LensFacing.FRONT) return LensCategory.FRONT
-        if (lens.facing == LensFacing.EXTERNAL) return LensCategory.EXTERNAL
+            lens.capabilities.flags.backwardCompatible == CapabilitySupport.UNSUPPORTED
+        ) return LensCategory.NON_PHOTO_DEPTH
+        if (lens.capabilities.colorFilterArrangement == ColorFilterArrangement.NIR) {
+            return LensCategory.NON_PHOTO_IR
+        }
+        if (lens.capabilities.reportedCapabilities?.contains(CameraCapability.MONOCHROME) == true) {
+            return LensCategory.PHOTOGRAPHIC_MONO
+        }
 
         val diagonal = fieldOfView?.diagonalDegrees
             ?.takeIf { it.isFinite() && it > 0.0 && it < 180.0 }
-            ?: return LensCategory.UNKNOWN
+            ?: return LensCategory.PHOTOGRAPHIC_UNKNOWN
         return when {
-            diagonal >= 90.0 -> LensCategory.ULTRAWIDE
-            diagonal >= 55.0 -> LensCategory.WIDE
-            diagonal >= 25.0 -> LensCategory.TELEPHOTO
-            else -> LensCategory.SUPER_TELEPHOTO
+            diagonal >= 90.0 -> LensCategory.PHOTOGRAPHIC_ULTRAWIDE
+            diagonal >= 55.0 -> LensCategory.PHOTOGRAPHIC_WIDE
+            diagonal >= 25.0 -> LensCategory.PHOTOGRAPHIC_TELEPHOTO
+            else -> LensCategory.PHOTOGRAPHIC_SUPER_TELEPHOTO
         }
     }
 }

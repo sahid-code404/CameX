@@ -47,11 +47,11 @@ class LensDuplicateFilterTest {
     }
 
     @Test
-    fun independentOpticalGeometryEvidenceFindsDuplicate() {
+    fun independentRoutesWithMatchingOpticsStayDistinct() {
         val first = testLens("a")
         val second = testLens("b")
 
-        assertTrue(LensDuplicateFilter.areDuplicates(first, second))
+        assertFalse(LensDuplicateFilter.areDuplicates(first, second))
     }
 
     @Test
@@ -85,13 +85,26 @@ class LensDuplicateFilterTest {
             "raw",
             usability = LensUsability.RAW_NATIVE,
             discoveryOrder = 1,
+        ).copy(
+            identity = LensIdentity("raw-parent", "shared-physical", "raw-parent", LensNodeKind.PHYSICAL),
         )
-        val groups = LensDuplicateFilter.group(listOf(processed, raw))
+        val routedProcessed = processed.copy(
+            identity = LensIdentity(
+                "processed-parent",
+                "shared-physical",
+                "processed-parent",
+                LensNodeKind.PHYSICAL,
+            ),
+        )
+        val groups = LensDuplicateFilter.group(listOf(routedProcessed, raw))
 
         assertEquals(1, groups.size)
         assertEquals(2, groups.single().members.size)
         assertEquals(raw, groups.single().representative)
-        assertEquals(listOf(raw), LensDuplicateFilter.filterForSelector(listOf(processed, raw)))
+        assertEquals(
+            listOf(raw),
+            LensDuplicateFilter.filterForSelector(listOf(routedProcessed, raw)),
+        )
     }
 
     @Test

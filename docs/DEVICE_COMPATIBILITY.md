@@ -1,45 +1,70 @@
 # Device compatibility
 
-## What CI can prove
+## What automation proves
 
-GitHub Actions proves that the Kotlin/Compose application, Camera2 adapters, unit-tested policy, C++20 library, and JNI symbols compile into a structurally valid APK. It cannot provide a representative physical Camera HAL. Emulator success is not evidence that auxiliary cameras, logical/physical routing, RAW streams, or stabilization work on a phone.
+GitHub Actions proves that the static architecture constraints, Kotlin/Compose code, pure topology/cache/trust policy, Camera2 adapters, C++20 native metadata backend, JNI symbols, lint, and APK structure build together. It cannot provide a representative physical camera HAL or measure real startup latency. Emulator success is not evidence that AUX exposure, logical/physical routing, first-frame delivery, RAW metadata, or repeated lifecycle behavior works on a phone.
 
-No device family is currently declared universally supported. Compatibility is established from runtime diagnostics and repeatable physical tests, never a brand assumption.
+No manufacturer or device family is declared universally supported. Compatibility comes from runtime evidence and repeatable physical validation on each app commit plus OS build.
 
-## Physical-device validation
+## Required real-device evidence
 
-For each test phone, record the app commit SHA, Android build, and exported compatibility report, then verify:
+Use the same physical phone previously tested with the owner's Camera applications. CameX must expose every equivalent application-accessible photographic route—ultrawide, main, telephoto, macro/periscope, monochrome, or other AUX—that the older implementation can safely access. A missing route is acceptable only when the compatibility report demonstrates that current Android/firmware no longer exposes usable metadata or access.
 
-- clean installation and launch;
-- camera permission denial, grant, and subsequent launch;
-- rear/front discovery and logical/physical relationships;
-- filtering of depth, IR, support, inaccessible, and duplicate nodes;
-- live preview orientation, aspect ratio, rotation, background/resume, and rapid lens switching;
-- RAW capability claims against safe probe results;
-- rename, visibility, ordering, 1x reference, and last-lens persistence;
-- diagnostics readability and sanitized JSON export;
-- continued operation when one camera route fails.
+Record the CameX commit SHA, Android build fingerprint, exported compatibility report, and screenshots of the first and cached launches. Validate:
 
-Suggested short sequence:
+- fresh permission denial, grant, and later relaunch behavior;
+- first-install rear preview starts without waiting for full/deep discovery;
+- new photographic lens buttons appear incrementally without preview restart;
+- logical/physical routes open through the correct parent and deliver a frame;
+- unknown photographic candidates remain testable while depth, ToF, IR, system-only, and inaccessible routes stay out of the normal selector;
+- preview orientation/aspect, front/back switching, rapid lens switching, rotation, pause/resume, and surface recreation;
+- user labels, visibility, order, 1x reference, and last selection survive force-stop/relaunch and topology refresh;
+- normal rescan, deep rescan, and discovery-cache reset have their documented scopes;
+- diagnostics are readable and exported JSON is sanitized;
+- failure of one route does not remove unrelated routes or deadlock the camera service.
 
-1. Install the development APK, launch it, and grant camera permission.
-2. Switch through every visible rear and front lens; rotate the phone once on each facing.
-3. Background and resume the app, then switch lenses several times.
-4. Rename, hide, and reorder one lens; force-stop and relaunch to confirm persistence.
-5. Open diagnostics, retry probes once, and export the compatibility report.
+## Startup and stability acceptance
 
-Do not repeatedly probe a route that disconnects the camera service; reboot the phone before collecting a clean follow-up report.
+Performance figures are targets to measure, not universal guarantees:
+
+- cached topology read: approximately under 20 ms where storage permits;
+- cached lens row: first useful UI frame;
+- camera request: immediately after cached route resolution;
+- normal first preview: approximately 150–400 ms depending on HAL;
+- Java/NDK reconciliation and deep scan: never block preview;
+- normal cached launch: no mandatory deep scan and no startup-wide session probing.
+
+Run at least ten fully closed launches. The cached lens row and remembered/main camera should be available immediately each time, with no duplicate routes, random disappearance, order instability, cache corruption, repeated deep scan, known-good re-probe, or camera-service deadlock.
+
+Exercise repeated switching in this order: ultrawide → main → telephoto → main → ultrawide → front → back. It must cause no global rediscovery, route-list reset, UI freeze, stale preview, or overlapping camera opens. Background and resume must preserve topology and reopen only the selected route when needed.
+
+## Twelve-step validation sequence
+
+1. Install the CI development APK fresh and launch it.
+2. Deny camera permission once, then grant it and continue.
+3. Confirm the first rear preview begins before full/deep discovery completes.
+4. Confirm additional photographic lens buttons appear without restarting that preview.
+5. Run **Deep Rescan Cameras** once and compare the route set with the older Camera app on the same phone.
+6. Open every normal and Advanced Discovered Camera route; record which routes deliver a first frame.
+7. Run the repeated lens-switch sequence, rotate once, then background and resume.
+8. Rename, hide, reorder, and choose a 1x reference; force-stop the app.
+9. Relaunch and confirm all cached lens buttons appear immediately and the remembered/main preview opens without deep scan.
+10. Repeat fully closed launch until ten launches have completed without instability.
+11. Open Diagnostics, capture startup/cache/backend/trust screens, and export the compatibility report.
+12. Send the report and screenshots with phone model, Android build, CameX commit SHA, observed timing, and any route mismatch.
+
+Use **Rescan Cameras** to refresh advertised evidence and **Deep Rescan Cameras** only when bounded AUX exploration is intended. Use **Reset Camera Discovery Cache** to validate progressive rebuilding; it must preserve user lens settings. If the camera service repeatedly disconnects, reboot before collecting a clean follow-up report rather than looping scans.
 
 ## Recording results
 
-Use one row per app commit and OS build. “Pass” means the checklist was actually run, not that metadata merely advertised the feature.
+Use one row per app commit and OS build. “Pass” means the complete relevant checklist ran; advertised metadata alone is not a pass.
 
-| Device / OS build | App commit | Discovery | Preview / switch | RAW probe | Settings | Report | Notes |
-|---|---|---|---|---|---|---|---|
-| Awaiting physical validation | — | — | — | — | — | — | — |
+| Device / OS build | App commit | Cold seed | Cached launch | AUX parity | Preview / switch | Rescan / cache | Report | Notes |
+|---|---|---|---|---|---|---|---|---|
+| Awaiting physical validation | — | — | — | — | — | — | — | — |
 
-Compatibility fixes should improve the generic capability path first. A quirk is appropriate only for a narrow, reproducible HAL defect and must document its match criteria, evidence, correction, and safe fallback.
+Compatibility fixes should improve the generic capability path first. A quirk is acceptable only for a narrow, reproducible HAL defect with documented match criteria, evidence, correction, and safe fallback; quirks must not become manufacturer-wide discovery pipelines.
 
 ## Report privacy
 
-The exported report may contain device model/build information, graphics capabilities, Camera2 IDs and characteristics, app build information, probe outcomes, and applied quirks. It must not contain photographs, account data, contacts, location, personal media paths, or credentials. Review a report before publishing it if a device/build identifier is sensitive in your context.
+The compatibility report may contain device/build information, graphics capabilities, opaque Camera2 IDs, canonical topology, metadata, trust/rejection state, backend outcomes, timings, app build information, and applied quirks. It must not contain photographs, account data, contacts, location, personal media paths, credentials, raw stack traces, or unbounded vendor payloads. Review device/build identifiers before publishing if they are sensitive in your context.

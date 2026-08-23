@@ -1,84 +1,100 @@
 # Camera discovery
 
-## Principle
+## Contract
 
-Discovery answers two different questions:
+Discovery answers what Android exposes and how each observed node can be routed; it does not prove every route by opening it. All IDs are opaque, all metadata is nullable/untrusted, every ID failure is isolated, and no manufacturer, model, SoC, or numeric camera-ID table decides topology.
 
-1. What camera nodes and lens relationships does Android expose to this application?
-2. Which of those routes can this application safely use for ordinary photography?
+The backends emit evidence independently. `CameraTopologyResolver` canonicalizes it, and `CameraTopologyRepository` publishes incremental immutable topologies. A slow or failed backend cannot erase credible evidence supplied by another backend while reconciliation is in progress.
 
-Existence is never treated as proof of usability. All metadata access is nullable and isolated per node.
+## Level 0: cache bootstrap
 
-## Public cameras
+`CameraTopologyStore` and `CameraTrustStore` are the first discovery inputs on a normal launch. A valid cache is read before live enumeration, publishes every known selector route, resolves the remembered/primary route, and permits the open request immediately. Background reconciliation is launched separately and is not awaited by preview.
 
-Discovery starts with `CameraManager.cameraIdList`. Each ID is handled independently: obtain `CameraCharacteristics`, map known fields into an internal descriptor, record unknown fields as unknown, and continue if another ID throws. No ID such as `"0"` or `"1"` has special meaning.
+Cache compatibility is evaluated using `CameraEnvironmentFingerprint`: cache schema version, Android build fingerprint, API level, discovery schema version, and—after a cheap live scan—an optional normalized advertised-ID signature. Corrupt or incompatible data is a cache miss, not a crash.
 
-Facing, sensor geometry, focal lengths, stream maps, hardware level, control modes, stabilization, high-speed support, and request capabilities come from runtime characteristics. Manufacturer and model are diagnostic context only.
+On a cache miss, `scanPrimaryCameraFast()` reads minimal Java metadata in advertised order, stops at the first credible rear route with PRIVATE preview support, and falls back to another credible preview route. It does not enumerate every camera capability. The lens row can then grow incrementally while preview is already starting.
 
-## Logical and physical relationships
+## Level 1: advertised reconciliation
 
-On API levels that support logical multi-camera metadata, discovery reads `physicalCameraIds` for each logical camera. Characteristics for an exposed physical ID are read through the logical relationship where the platform permits it.
+Fast live reconciliation runs Java and NDK advertised discovery concurrently in background work:
 
-A physical-only lens is represented as:
+- `JavaCameraDiscoveryBackend` reads `CameraManager.cameraIdList`, safe minimal characteristics, and logical `physicalCameraIds`. Minimal candidates and relationships are emitted before asynchronous full capability enrichment.
+- `PhysicalCameraTopologyBackend` preserves logical-parent/physical-member routes even when a vendor withholds child characteristics.
+- `NativeCameraDiscoveryBackend` independently uses `ACameraManager_getCameraIdList` and `ACameraManager_getCameraCharacteristics`.
 
-```text
-logical parent ID + physical ID + lens capabilities
-```
+Java metadata extraction is bounded by a semaphore with three default lanes while the parallel NDK advertised scan uses one sequential lane, keeping combined HAL metadata concurrency at the target maximum of four. Results are processed in bounded batches. This allows independent metadata calls to overlap without creating an unbounded job storm against a fragile HAL.
 
-It is not blindly passed to `openCamera`. Preview/session construction must open the logical parent and target the physical output surface using supported platform APIs. Older Android versions simply omit this relationship rather than failing discovery.
+The useful minimal fields are facing, focal lengths, sensor physical size, active/pixel arrays, orientation, hardware level, advertised request capabilities, actual PRIVATE/YUV preview declarations, actual RAW stream declarations, and depth/ToF/IR/monochrome/system evidence. Full stream tables and feature capabilities are enrichment data, never prerequisites for the first preview.
 
-## Usability and non-photographic filtering
+## Level 2: bounded deep AUX discovery
 
-The normal UI only considers a route when its metadata and conservative probe support a photographic preview. Depth-only output, ToF, IR, face-authentication, tracking, monochrome support, and other auxiliary nodes remain visible in diagnostics but are not camera buttons unless their advertised streams and successful probe establish ordinary photographic use.
+Deep AUX discovery runs only on first install, incompatible/changed topology, evidence that advertised results are incomplete, or an explicit **Deep Rescan Cameras** action. It is not on the synchronous startup path.
 
-Classification distinguishes native/physical/max-resolution RAW, processed-only, preview-only, depth/auxiliary, privileged/system, inaccessible, broken, unknown, and disabled-by-user outcomes. A richer internal result may retain several flags rather than force one lossy enum.
+`DeepAuxCandidatePlanner` produces a deterministic priority list:
 
-## `SYSTEM_CAMERA` limitation
+1. previously successful deep IDs;
+2. cached successful IDs;
+3. advertised numeric IDs;
+4. a small bounded neighborhood around known numeric IDs;
+5. a bounded low numeric namespace.
 
-Android may omit privileged system cameras from a normal application's public camera list or deny access when queried/opened. CameX does not bypass that security boundary. A system-only node that can be identified is recorded as privileged and excluded; an ID Android does not reveal cannot be discovered by a normal application. Failed privileged access is not retried in a loop.
+Defaults cover low IDs `0..31`, a neighbor radius of four, and at most 96 candidates. Defensive hard caps bound candidate count, numeric values, input IDs, and ID length. Numeric values carry no lens meaning; they are only a generic finite namespace to ask the camera service for metadata.
 
-## RAW detection
+The native scan creates one `ACameraManager`, attempts characteristics lookup once per planned candidate, records bounded sanitized failures, and destroys all metadata/manager resources. It never calls a camera-open or capture-session API, never uses a privileged API, never retries endlessly, and never probes a preview or RAW frame.
 
-RAW support requires more than a single capability bit. Discovery cross-checks request capabilities and stream configuration formats/sizes, including portable `RAW_SENSOR` and supported packed RAW formats such as RAW10, RAW12, or RAW14. It records maximum sizes and whether routing is direct or requires a logical parent.
+## Logical and physical routing
 
-`RAW_PRIVATE` may be reported for diagnostics but is not a universal processing foundation because its layout can be implementation-specific. Phase 1 does not save DNG files. A one-frame RAW test, if enabled later in diagnostics, must be isolated, strictly timed, immediately discarded, and reported separately from metadata/session validation.
+A public direct route opens its public ID. A physical-member route stores both the logical `openCameraId` and `streamPhysicalCameraId`; session construction opens the logical device and targets the physical output on supported Android versions. An NDK-discovered ID remains a candidate direct route unless stronger relationship evidence proves otherwise.
 
-## Lens fingerprint
+Physical IDs are not assumed to appear in `cameraIdList`, and an observed physical ID is not blindly passed to `openCamera`. On older APIs, CameX retains direct public discovery and records unavailable relationship detail as unknown.
 
-Preferences use a SHA-256 hash of a normalized, versioned representation of stable observable fields when available:
+## Reconciliation and duplicate policy
 
-- lens facing and logical/physical relationship;
-- sensor physical dimensions, pixel array, active array, and orientation;
-- focal lengths and apertures;
-- RAW dimensions and color-filter arrangement when exposed.
+Exact routing keys merge across cache, Java, physical, advertised-NDK, and deep-NDK sources. Strong aliases require compatible route identity and optical/sensor evidence. Similar focal length, matching role, or a nearby numeric ID is insufficient. When evidence is uncertain, both routes survive; diagnostics retain sources and aliases.
 
-Normalization uses locale-independent ordering and numeric formatting. Missing fields have explicit markers, so the same input produces the same hash. When too little metadata exists, a documented fallback adds the Camera2 ID and device/build fingerprint. This fallback is less stable across ROM updates; old settings are therefore tolerated and ignored rather than treated as corruption.
+During cache bootstrap and incremental reconciliation, absence from a partial live result does not delete a cached route. Stale cached routes may be pruned only after all required backends—including a required deep scan—completed successfully enough to make absence meaningful. Resolver ordering and canonical IDs are deterministic.
 
-## Field of view and labels
+## Photographic taxonomy
 
-For valid sensor dimension `d` and focal length `f`, angular field of view is approximated as:
+Roles are explicit:
 
-```text
-FOV = 2 * atan(d / (2 * f))
-```
+- photographic: `PHOTOGRAPHIC_ULTRAWIDE`, `PHOTOGRAPHIC_WIDE`, `PHOTOGRAPHIC_TELEPHOTO`, `PHOTOGRAPHIC_SUPER_TELEPHOTO`, `PHOTOGRAPHIC_MACRO`, `PHOTOGRAPHIC_MONO`, `PHOTOGRAPHIC_UNKNOWN`;
+- confidently non-photographic: `NON_PHOTO_DEPTH`, `NON_PHOTO_TOF`, `NON_PHOTO_IR`;
+- unavailable: `SYSTEM_ONLY`, `INACCESSIBLE`, `BROKEN`.
 
-Rear lenses are categorized from comparable horizontal/diagonal FOV, not camera IDs. Relative zoom is the selected 1x reference's FOV ratio to another lens. Labels are rounded only when metadata is sufficiently reliable; otherwise the UI uses a neutral lens name. Users can override the 1x reference.
+Facing (`BACK`, `FRONT`, `EXTERNAL`, `UNKNOWN`) is separate. Field of view is computed only from valid sensor dimensions and focal length, using `2 * atan(d / (2 * f))`; unavailable geometry produces no invented zoom/FOV claim.
 
-## Duplicate filtering
+The normal selector includes known photographic roles that are not structurally rejected. Credible `PHOTOGRAPHIC_UNKNOWN` routes remain available under Advanced Discovered Cameras so the user can show/hide, rename, reorder, select a 1x reference, and try them. Depth/ToF/IR/system/inaccessible routes remain diagnostics-only. There is no blanket “AUX” exclusion, and unknown is never synonymous with broken.
 
-Duplicate detection compares route identity, logical parent, sensor geometry, focal lengths/FOV, orientation, and stream formats. It groups only high-confidence matches and chooses the best successfully probed representation for the normal UI. Every original descriptor remains in diagnostics, avoiding irreversible data loss from an uncertain heuristic.
+## RAW evidence
 
-## Sequential probe
+RAW metadata is cross-checked. An actual portable RAW stream (`RAW_SENSOR`, RAW10, RAW12, or RAW14 where supported) is evidence even when a redundant capability bit is missing; an advertised bit without a usable stream is recorded as a discrepancy. `RAW_PRIVATE` is diagnostic only because its layout is implementation-specific.
 
-Candidates are probed one at a time with explicit timeouts. Stages distinguish metadata validation, session-configuration support, device open, preview delivery, RAW configuration, optional RAW delivery, and overall usability. Each stage records success, unsupported, failure, timeout, or exception with a sanitized reason.
+Phase 1A does not open a RAW session, acquire a RAW frame, save DNG, or claim `RAW_VERIFIED`. Those operations belong to a later explicitly scoped phase.
 
-Cleanup runs after every outcome. A session-scoped failure memory prevents immediate retry loops; a user-started diagnostics retry can clear temporary failure state. No permanent blacklist is created from a transient failure.
+## Lazy route validation and trust
 
-## Fallbacks
+New credible routes can appear before any open. When the user selects a route, the single `CameraSessionController` opens it. Camera-open, session-configured, and first-frame events are reported; a first frame advances session trust to `SESSION_VERIFIED` and persists it against the environment fingerprint.
 
-- API too old for physical IDs: retain public-camera discovery and direct routes.
-- Missing or invalid sensor geometry: use a generic label and omit FOV/zoom claims.
-- Inconsistent RAW metadata: downgrade the RAW claim and retain the discrepancy in diagnostics.
-- Session/open failure: classify only that route, release resources, and continue.
-- Firmware changes: recompute fingerprints and ignore orphaned preferences safely.
-- Quirk match: apply the smallest documented correction after the generic path; never replace discovery with a brand-wide pipeline.
+Failures are classified as transient or structural. In-use, maximum-cameras-in-use, disconnection, app-background, timeout, and service disruption retain prior good trust and do not create a permanent blacklist. Invalid metadata or a deterministic unsupported session route may become `METADATA_REJECTED` or `SESSION_REJECTED`. A changed environment invalidates that knowledge. No known-good route is re-probed merely because the process restarted.
+
+## User recovery actions
+
+- **Rescan Cameras** reruns advertised Java/NDK reconciliation and preserves user settings; it does not invoke deep discovery.
+- **Deep Rescan Cameras** runs advertised reconciliation plus the bounded metadata-only candidate scan.
+- **Reset Camera Discovery Cache** clears topology and trust/rejection state but retains lens labels, visibility, order, 1x reference, and other unrelated preferences; discovery then rebuilds progressively.
+
+Discovery completion must not restart an active preview. Recovery may reopen the selected camera only when the session was already in a recoverable error state.
+
+## Diagnostics and fallbacks
+
+Diagnostics/reporting retain canonical/route IDs, logical and physical IDs, fingerprints, sources, aliases, role/confidence, facing, FOV/sensor/preview/RAW evidence, cache status, trust dimensions, rejection reason, backend failures/counts/timings, relationships, and monotonic startup milestones. Reports contain no images or personal data.
+
+Fallbacks are conservative:
+
+- missing geometry: generic label and no FOV claim;
+- malformed metadata: bounded per-ID failure and continued discovery;
+- Java/NDK disagreement: retain independent evidence and reconcile without assuming either is universally authoritative;
+- `SYSTEM_CAMERA` restriction: record when observable, never bypass Android access control;
+- backend failure: keep cache and other-backend evidence rather than erasing routes;
+- firmware/ROM/HAL change: invalidate environment-bound discovery/trust while migrating matching user preferences by lens fingerprint.

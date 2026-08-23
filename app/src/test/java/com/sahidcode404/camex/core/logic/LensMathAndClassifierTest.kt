@@ -82,12 +82,12 @@ class LensMathAndClassifierTest {
         val lens = testLens("any")
         fun fov(diagonal: Double) = FieldOfView(diagonal, diagonal, diagonal, 4.0)
 
-        assertEquals(LensCategory.ULTRAWIDE, LensClassifier.classify(lens, fov(90.0)))
-        assertEquals(LensCategory.WIDE, LensClassifier.classify(lens, fov(55.0)))
-        assertEquals(LensCategory.TELEPHOTO, LensClassifier.classify(lens, fov(25.0)))
-        assertEquals(LensCategory.SUPER_TELEPHOTO, LensClassifier.classify(lens, fov(24.99)))
+        assertEquals(LensCategory.PHOTOGRAPHIC_ULTRAWIDE, LensClassifier.classify(lens, fov(90.0)))
+        assertEquals(LensCategory.PHOTOGRAPHIC_WIDE, LensClassifier.classify(lens, fov(55.0)))
+        assertEquals(LensCategory.PHOTOGRAPHIC_TELEPHOTO, LensClassifier.classify(lens, fov(25.0)))
+        assertEquals(LensCategory.PHOTOGRAPHIC_SUPER_TELEPHOTO, LensClassifier.classify(lens, fov(24.99)))
         assertEquals(
-            LensCategory.UNKNOWN,
+            LensCategory.PHOTOGRAPHIC_UNKNOWN,
             LensClassifier.classify(lens.copy(capabilities = LensCapabilities()), null),
         )
     }
@@ -95,7 +95,7 @@ class LensMathAndClassifierTest {
     @Test
     fun facingAndAuxiliaryEvidenceOverrideFov() {
         val front = testLens("front", facing = LensFacing.FRONT)
-        assertEquals(LensCategory.FRONT, LensClassifier.classify(front, null))
+        assertEquals(LensCategory.PHOTOGRAPHIC_UNKNOWN, LensClassifier.classify(front, null))
 
         val depth = testLens("depth").copy(
             usability = LensUsability.DEPTH_AUXILIARY,
@@ -106,6 +106,6 @@ class LensMathAndClassifierTest {
                 ),
             ),
         )
-        assertEquals(LensCategory.AUXILIARY, LensClassifier.classify(depth, null))
+        assertEquals(LensCategory.NON_PHOTO_DEPTH, LensClassifier.classify(depth, null))
     }
 }

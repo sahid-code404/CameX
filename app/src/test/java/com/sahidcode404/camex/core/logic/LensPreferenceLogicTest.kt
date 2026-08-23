@@ -102,6 +102,7 @@ class LensPreferenceLogicTest {
                 LensPreferenceRecord("orphan", displayName = "Keep for reconnect"),
             ),
             oneXReferenceFingerprint = "old",
+            lastSelectedFingerprint = "old",
             lastSelectedRearFingerprint = "old",
             lastSelectedFrontFingerprint = "orphan",
         )
@@ -111,6 +112,7 @@ class LensPreferenceLogicTest {
         assertEquals(LensPreferencesState.CURRENT_SCHEMA_VERSION, migrated.schemaVersion)
         assertEquals(setOf("new", "orphan"), migrated.records.map { it.fingerprint }.toSet())
         assertEquals("new", migrated.oneXReferenceFingerprint)
+        assertEquals("new", migrated.lastSelectedFingerprint)
         assertEquals("new", migrated.lastSelectedRearFingerprint)
         assertEquals("orphan", migrated.lastSelectedFrontFingerprint)
     }

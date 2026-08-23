@@ -15,11 +15,13 @@ data class LensPreferencesState(
     val schemaVersion: Int = CURRENT_SCHEMA_VERSION,
     val records: List<LensPreferenceRecord> = emptyList(),
     val oneXReferenceFingerprint: String? = null,
+    /** Last successfully previewed lens across every facing. */
+    val lastSelectedFingerprint: String? = null,
     val lastSelectedRearFingerprint: String? = null,
     val lastSelectedFrontFingerprint: String? = null,
 ) {
     companion object {
-        const val CURRENT_SCHEMA_VERSION = 2
+        const val CURRENT_SCHEMA_VERSION = 3
     }
 }
 

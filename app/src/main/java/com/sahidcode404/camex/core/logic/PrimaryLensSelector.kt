@@ -25,7 +25,7 @@ object PrimaryLensSelector {
     ): LensDescriptor? {
         val eligible = lenses.filter {
             it.facing == LensFacing.BACK && it.usability.isSelectable &&
-                it.category != LensCategory.AUXILIARY
+                it.category.isNormalSelectorCandidate
         }
         userReference?.let { preferred ->
             eligible.firstOrNull { it.fingerprint?.value == preferred.value }?.let { return it }
@@ -48,15 +48,18 @@ object PrimaryLensSelector {
             LensUsability.RAW_MAX_RESOLUTION -> 56
             LensUsability.PROCESSED_ONLY -> 50
             LensUsability.PREVIEW_ONLY -> 25
+            LensUsability.PHOTOGRAPHIC_CANDIDATE -> 15
             else -> 0
         }
         val fov = LensMath.fieldOfView(lens.capabilities)?.diagonalDegrees
         // A conventional wide lens is normally near 70° diagonal; use a broad curve, not a label.
         val fovSuitability = fov?.let { (100.0 - abs(it - 70.0) * 2.0).toInt().coerceIn(0, 100) }
             ?: when (lens.category) {
-                LensCategory.WIDE -> 70
-                LensCategory.ULTRAWIDE, LensCategory.TELEPHOTO -> 30
-                LensCategory.SUPER_TELEPHOTO -> 10
+                LensCategory.PHOTOGRAPHIC_WIDE -> 70
+                LensCategory.PHOTOGRAPHIC_ULTRAWIDE,
+                LensCategory.PHOTOGRAPHIC_TELEPHOTO,
+                -> 30
+                LensCategory.PHOTOGRAPHIC_SUPER_TELEPHOTO -> 10
                 else -> 0
             }
         val flags = lens.capabilities.flags

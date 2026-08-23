@@ -8,7 +8,14 @@ import androidx.lifecycle.viewModelScope
 import com.sahidcode404.camex.core.camera.CameraRuntimeSnapshot
 import com.sahidcode404.camex.core.camera.CameraSessionController
 import com.sahidcode404.camex.core.camera.CameraSessionState
-import com.sahidcode404.camex.core.camera.DefaultCameraSessionController
+import com.sahidcode404.camex.core.camera.diagnostics.CameraStartupTraceSnapshot
+import com.sahidcode404.camex.core.camera.discovery.HybridCameraDiscoverySnapshot
+import com.sahidcode404.camex.core.camera.runtime.CameraRuntimeCoordinator
+import com.sahidcode404.camex.core.camera.runtime.CameraRuntimePhase
+import com.sahidcode404.camex.core.camera.topology.CameraDiscoverySource
+import com.sahidcode404.camex.core.camera.topology.CameraRoute
+import com.sahidcode404.camex.core.camera.topology.CameraTopology
+import com.sahidcode404.camex.core.camera.topology.toLensDescriptor
 import com.sahidcode404.camex.core.diagnostics.CompatibilityReportFactory
 import com.sahidcode404.camex.core.diagnostics.PlatformDiagnostics
 import com.sahidcode404.camex.core.logic.LensDuplicateFilter
@@ -50,9 +57,29 @@ data class CameraAppUiState(
     val diagnostics: DiagnosticsUiState = DiagnosticsUiState(),
 )
 
+private data class CameraUiRuntime(
+    val sessionState: CameraSessionState,
+    val session: CameraRuntimeSnapshot,
+    val topology: CameraTopology,
+    val discovery: HybridCameraDiscoverySnapshot,
+    val phase: CameraRuntimePhase,
+    val startupTrace: CameraStartupTraceSnapshot = CameraStartupTraceSnapshot(),
+) {
+    val lenses: List<LensDescriptor>
+        get() = topology.routes.mapIndexed { index, route ->
+            route.toLensDescriptor().copy(discoveryOrder = index)
+        }
+
+    val selectedLens: LensDescriptor?
+        get() = session.selectedRoutingKey?.let { key ->
+            lenses.firstOrNull { it.identity.routingKey == key }
+        }
+}
+
 class CameraViewModel(application: Application) : AndroidViewModel(application) {
     private val appContext = application.applicationContext
-    private val controller: CameraSessionController = DefaultCameraSessionController(appContext)
+    private val runtimeCoordinator = CameraRuntimeCoordinator(appContext, viewModelScope)
+    private val controller: CameraSessionController = runtimeCoordinator.session
     private val settingsStore = LensSettingsStore(appContext)
     private val permissionGranted = MutableStateFlow(false)
     private val settings = settingsStore.state.stateIn(
@@ -62,15 +89,26 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     )
     private val platform = PlatformDiagnostics.collect(appContext)
     private var discoveryJob: Job? = null
-    private var hasDiscovered = false
+    private var hasStarted = false
+
+    private val runtimeUi = combine(
+        controller.state,
+        controller.snapshot,
+        runtimeCoordinator.topology,
+        runtimeCoordinator.discovery.snapshot,
+        runtimeCoordinator.phase,
+    ) { sessionState, session, topology, discovery, phase ->
+        CameraUiRuntime(sessionState, session, topology, discovery, phase)
+    }.combine(runtimeCoordinator.discovery.startupTrace.snapshot) { runtime, trace ->
+        runtime.copy(startupTrace = trace)
+    }
 
     val uiState: StateFlow<CameraAppUiState> = combine(
         permissionGranted,
-        controller.state,
-        controller.snapshot,
+        runtimeUi,
         settings,
-    ) { permission, sessionState, runtime, preferences ->
-        buildUiState(permission, sessionState, runtime, preferences)
+    ) { permission, runtime, preferences ->
+        buildUiState(permission, runtime, preferences)
     }.stateIn(
         viewModelScope,
         SharingStarted.WhileSubscribed(stopTimeoutMillis = 5_000L),
@@ -78,6 +116,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     )
 
     init {
+        launchSafely { runtimeCoordinator.bootstrapCache() }
         launchSafely {
             controller.state.collect { state ->
                 if (state is CameraSessionState.Previewing) {
@@ -98,28 +137,33 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         permissionGranted.value = granted
         if (!granted) {
             discoveryJob?.cancel()
-            launchSafely { controller.pause() }
+            launchSafely { runtimeCoordinator.pause() }
             return
         }
-        if ((changed || !hasDiscovered) && discoveryJob?.isActive != true) {
-            discoverAndSelect(retryRememberedFailures = false)
+        if ((changed || !hasStarted) && discoveryJob?.isActive != true) {
+            startCameraRuntime()
         } else {
-            launchSafely { controller.resume() }
+            launchSafely { runtimeCoordinator.resume() }
         }
     }
 
-    fun retryDiscoveryAndProbes() {
-        if (permissionGranted.value) discoverAndSelect(retryRememberedFailures = true)
+    fun rescanCameras() {
+        if (permissionGranted.value) launchSafely { runtimeCoordinator.normalRescan() }
+    }
+
+    fun deepRescanCameras() {
+        if (permissionGranted.value) launchSafely { runtimeCoordinator.deepRescan() }
+    }
+
+    fun resetDiscoveryCache() {
+        launchSafely { runtimeCoordinator.resetDiscoveryCache() }
     }
 
     fun bindPreview(view: android.view.TextureView) {
         launchSafely {
-            val candidates = selectorLenses(
-                controller.snapshot.value,
-                settings.value,
-                includeHidden = false,
-            )
-            val selectedKey = controller.snapshot.value.selectedLens?.identity?.routingKey
+            val runtime = currentRuntime()
+            val candidates = selectorLenses(runtime, settings.value, includeHidden = false)
+            val selectedKey = runtime.session.selectedRoutingKey
             val target = candidates.firstOrNull { it.identity.routingKey == selectedKey }
                 ?: PrimaryLensSelector.select(candidates, userReference(settings.value))
                 ?: candidates.firstOrNull()
@@ -143,18 +187,18 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun onBackground() {
         discoveryJob?.cancel()
-        launchSafely { controller.pause() }
+        launchSafely { runtimeCoordinator.pause() }
     }
 
     fun selectLens(fingerprint: String) {
-        val lens = selectorLenses(controller.snapshot.value, settings.value, includeHidden = false)
+        val lens = selectorLenses(currentRuntime(), settings.value, includeHidden = false)
             .firstOrNull { it.fingerprint?.value == fingerprint }
             ?: return
         openAndRemember(lens)
     }
 
     fun switchFacing() {
-        val runtime = controller.snapshot.value
+        val runtime = currentRuntime()
         val preferences = settings.value
         val lenses = selectorLenses(runtime, preferences, includeHidden = false)
         val currentFacing = runtime.selectedLens?.facing ?: LensFacing.BACK
@@ -177,14 +221,15 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     fun setLensVisible(fingerprint: String, visible: Boolean) {
         launchSafely {
             settingsStore.setVisible(fingerprint, visible)
-            val selectedFingerprint = controller.snapshot.value.selectedLens?.fingerprint?.value
+            val runtimeSnapshot = currentRuntime()
+            val selectedFingerprint = runtimeSnapshot.selectedLens?.fingerprint?.value
             val records = settings.value.records.associateBy { it.fingerprint }.toMutableMap()
             records[fingerprint] = (records[fingerprint] ?: LensPreferenceRecord(fingerprint))
                 .copy(visible = visible)
             val nextPreferences = settings.value.copy(records = records.values.toList())
             if (visible) {
                 val candidates = selectorLenses(
-                    controller.snapshot.value,
+                    runtimeSnapshot,
                     nextPreferences,
                     includeHidden = false,
                 )
@@ -200,7 +245,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 }
             } else if (!visible && selectedFingerprint == fingerprint) {
                 val target = selectorLenses(
-                    controller.snapshot.value,
+                    currentRuntime(),
                     nextPreferences,
                     includeHidden = false,
                 ).firstOrNull()
@@ -220,7 +265,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun moveLens(from: Int, to: Int) {
-        val ordered = lensSettingsModels(controller.snapshot.value, settings.value)
+        val ordered = lensSettingsModels(currentRuntime(), settings.value)
             .map { it.fingerprint }
             .toMutableList()
         if (from !in ordered.indices || to !in ordered.indices || from == to) return
@@ -233,11 +278,16 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         launchSafely { settingsStore.setOneXReference(fingerprint) }
     }
 
-    fun compatibilityReportJson(): String = CompatibilityReportFactory.encode(
-        context = appContext,
-        discovery = controller.snapshot.value.discovery,
-        lenses = controller.snapshot.value.lenses,
-    )
+    fun compatibilityReportJson(): String {
+        val runtime = currentRuntime()
+        return CompatibilityReportFactory.encode(
+            context = appContext,
+            topology = runtime.topology,
+            discovery = runtime.discovery,
+            startupTrace = runtime.startupTrace,
+            lenses = selectorLenses(runtime, settings.value, includeHidden = false),
+        )
+    }
 
     suspend fun writeCompatibilityReport(uri: Uri, json: String) = withContext(Dispatchers.IO) {
         require(json.isNotBlank()) { "Compatibility report is empty" }
@@ -247,33 +297,29 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     override fun onCleared() {
-        controller.close()
+        runtimeCoordinator.close()
     }
 
-    private fun discoverAndSelect(retryRememberedFailures: Boolean) {
+    private fun startCameraRuntime() {
         discoveryJob?.cancel()
         discoveryJob = launchSafely {
-            // A denial/revocation path pauses the controller. Re-grant must reactivate it before
-            // discovery selects a route, otherwise a valid lens remains paused.
-            controller.resume()
-            val runtime = controller.discoverAndProbe(retryRememberedFailures)
-            // Read the first DataStore value directly so an initial default StateFlow value can
-            // never overwrite a persisted last-lens choice on a fast discovery pass.
             val preferences = settingsStore.state.first()
-            val lenses = selectorLenses(runtime, preferences, includeHidden = false)
-            val lastRear = preferences.lastSelectedRearFingerprint
-            val target = lenses.firstOrNull {
-                it.facing == LensFacing.BACK && it.fingerprint?.value == lastRear
-            } ?: PrimaryLensSelector.select(lenses, userReference(preferences))
-                ?: lenses.firstOrNull { it.facing == LensFacing.BACK }
-                ?: lenses.firstOrNull { it.facing == LensFacing.FRONT }
-                ?: lenses.firstOrNull()
-            target?.let {
-                controller.open(it)
-            }
-            hasDiscovered = true
+            runtimeCoordinator.start(
+                preferredRearFingerprint = preferences.lastSelectedRearFingerprint,
+                oneXReferenceFingerprint = preferences.oneXReferenceFingerprint,
+            )
+            hasStarted = true
         }
     }
+
+    private fun currentRuntime() = CameraUiRuntime(
+        sessionState = controller.state.value,
+        session = controller.snapshot.value,
+        topology = runtimeCoordinator.topology.value,
+        discovery = runtimeCoordinator.discovery.snapshot.value,
+        phase = runtimeCoordinator.phase.value,
+        startupTrace = runtimeCoordinator.discovery.startupTrace.current(),
+    )
 
     private fun openAndRemember(lens: LensDescriptor) {
         launchSafely {
@@ -299,10 +345,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun buildUiState(
         permission: Boolean,
-        sessionState: CameraSessionState,
-        runtime: CameraRuntimeSnapshot,
+        runtime: CameraUiRuntime,
         preferences: LensPreferencesState,
     ): CameraAppUiState {
+        val sessionState = runtime.sessionState
         val selector = selectorLenses(runtime, preferences, includeHidden = false)
         val selected = runtime.selectedLens
         val activeFacing = selected?.facing ?: selector.firstOrNull()?.facing ?: LensFacing.BACK
@@ -320,10 +366,13 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         val records = preferences.records.associateBy { it.fingerprint }
         val cameraState = CameraScreenUiState(
             permissionGranted = permission,
-            statusText = if (permission && selector.isEmpty() && runtime.lenses.isNotEmpty()) {
-                "No visible photographic lens. Re-enable one in Lens settings."
-            } else {
-                sessionState.statusText()
+            statusText = when {
+                permission && selector.isEmpty() && runtime.lenses.isNotEmpty() ->
+                    "No visible photographic lens. Re-enable one in Lens settings."
+                permission && selector.isEmpty() && runtime.phase ==
+                    CameraRuntimePhase.ReconcilingTopology ->
+                    "Starting camera while discovery continues in the background"
+                else -> sessionState.statusText()
             },
             lenses = facingLenses.map { lens ->
                 val fingerprint = lens.fingerprint?.value ?: lens.identity.routingKey
@@ -354,7 +403,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun selectorLenses(
-        runtime: CameraRuntimeSnapshot,
+        runtime: CameraUiRuntime,
         preferences: LensPreferencesState,
         includeHidden: Boolean,
     ): List<LensDescriptor> {
@@ -383,12 +432,15 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun lensSettingsModels(
-        runtime: CameraRuntimeSnapshot,
+        runtime: CameraUiRuntime,
         preferences: LensPreferencesState,
     ): List<LensSettingsUiModel> {
         val unique = LensDuplicateFilter.filterForSelector(runtime.lenses)
         val resolved = LensPreferenceOrdering.resolve(unique, preferences, includeHidden = true)
         val reference = referenceLens(unique, preferences)
+        val advancedRoutingKeys = runtime.topology.routes
+            .filter { it.isAdvancedPhotographicCandidate }
+            .mapTo(mutableSetOf()) { it.toLensDescriptor().identity.routingKey }
         return resolved.map { preference ->
             val lens = preference.lens
             val fingerprint = lens.fingerprint?.value ?: lens.identity.routingKey
@@ -400,12 +452,13 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 visible = preference.visible,
                 isOneXReference = lens.fingerprint?.value == reference?.fingerprint?.value,
                 supportsOneXReference = lens.facing == LensFacing.BACK,
+                advanced = lens.identity.routingKey in advancedRoutingKeys,
             )
         }
     }
 
     private fun diagnosticsState(
-        runtime: CameraRuntimeSnapshot,
+        runtime: CameraUiRuntime,
         sessionState: CameraSessionState,
         preferences: LensPreferencesState,
         reference: LensDescriptor?,
@@ -425,11 +478,86 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 DiagnosticField("Version", platform.app.nativeVersion ?: "Unknown"),
                 DiagnosticField("Self-test", platform.app.nativeSelfTestPassed.passFail()),
             ),
+            startupTraceSummary = buildList {
+                add(DiagnosticField("Cache → lenses", runtime.startupTrace.cacheToLensesMs.ms()))
+                add(DiagnosticField("App → camera request", runtime.startupTrace.appToCameraRequestMs.ms()))
+                add(DiagnosticField("App → first frame", runtime.startupTrace.appToFirstPreviewFrameMs.ms()))
+                add(DiagnosticField("Advertised reconciliation", runtime.startupTrace.advertisedScanMs.ms()))
+                add(DiagnosticField("Deep AUX scan", runtime.startupTrace.deepAuxScanMs.ms()))
+                runtime.startupTrace.offsetsNs.entries
+                    .sortedBy { it.key.ordinal }
+                    .forEach { (milestone, offset) ->
+                        add(DiagnosticField(milestone.name, (offset / 1_000_000.0).ms()))
+                    }
+            },
+            cacheSummary = listOf(
+                DiagnosticField("Cache ready", runtime.discovery.cacheReady.yesNo()),
+                DiagnosticField("Cache hit", runtime.discovery.cacheHit.yesNo()),
+                DiagnosticField("Miss reason", runtime.discovery.cacheMissReason?.name ?: "None"),
+                DiagnosticField(
+                    "Cache generation (epoch ms)",
+                    runtime.discovery.cacheGeneratedAtEpochMs?.toString() ?: "None",
+                ),
+                DiagnosticField("Routes", runtime.topology.routes.size.toString()),
+                DiagnosticField("Initial deep scan", runtime.discovery.initialDeepScanRequired.yesNo()),
+                DiagnosticField("Environment", runtime.topology.environmentFingerprint.stableKey.take(20)),
+                DiagnosticField(
+                    "Advertised signature",
+                    runtime.topology.environmentFingerprint.advertisedTopologySignature?.take(20)
+                        ?: "Not scanned",
+                ),
+            ),
             discoverySummary = buildList {
-                if (runtime.discovery.failures.isEmpty()) {
+                listOf(
+                    "Java" to runtime.discovery.java,
+                    "NDK advertised" to runtime.discovery.ndk,
+                    "NDK deep" to runtime.discovery.deep,
+                ).forEach { (name, backend) ->
+                    add(
+                        DiagnosticField(
+                            name,
+                            "${backend.status.name}; ${backend.candidateCount} candidates; " +
+                                (backend.durationMs?.let { "$it ms" } ?: "duration pending"),
+                        ),
+                    )
+                }
+                val routes = runtime.topology.routes
+                add(
+                    DiagnosticField(
+                        "Java IDs",
+                        routes.idsFromSources(
+                            CameraDiscoverySource.JAVA_PUBLIC,
+                            CameraDiscoverySource.JAVA_PHYSICAL,
+                        ),
+                    ),
+                )
+                add(
+                    DiagnosticField(
+                        "NDK IDs",
+                        routes.idsFromSources(CameraDiscoverySource.NDK_ADVERTISED),
+                    ),
+                )
+                add(
+                    DiagnosticField(
+                        "Deep IDs",
+                        routes.idsFromSources(CameraDiscoverySource.NDK_DEEP),
+                    ),
+                )
+                add(
+                    DiagnosticField(
+                        "Physical relationships",
+                        runtime.topology.logicalRelationships.joinToString { relationship ->
+                            "${relationship.logicalCameraId}→" +
+                                relationship.physicalCameraIds.joinToString(prefix = "[", postfix = "]")
+                        }.ifBlank { "None" },
+                    ),
+                )
+                if (runtime.discovery.javaFailures.isEmpty() &&
+                    runtime.discovery.nativeFailures.isEmpty()
+                ) {
                     add(DiagnosticField("Discovery failures", "None"))
                 } else {
-                    runtime.discovery.failures.forEachIndexed { index, failure ->
+                    runtime.discovery.javaFailures.forEachIndexed { index, failure ->
                         val route = listOfNotNull(
                             failure.publicCameraId,
                             failure.physicalCameraId?.let { "physical $it" },
@@ -441,8 +569,17 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                             ),
                         )
                     }
+                    runtime.discovery.nativeFailures.forEachIndexed { index, failure ->
+                        add(
+                            DiagnosticField(
+                                "Native failure ${index + 1}",
+                                "${failure.cameraId ?: "backend"}: ${failure.stage.name}/" +
+                                    failure.reason.name,
+                            ),
+                        )
+                    }
                 }
-                runtime.probe.failureMemory.forEach { (route, memory) ->
+                runtime.session.livePreviewFailureMemory.forEach { (route, memory) ->
                     add(
                         DiagnosticField(
                             "Retry memory",
@@ -454,7 +591,14 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 }
             },
             lenses = runtime.lenses.map { lens ->
-                lens.toDiagnostics(records[lens.fingerprint?.value]?.displayName, reference)
+                val route = runtime.topology.routes.firstOrNull {
+                    it.toLensDescriptor().identity.routingKey == lens.identity.routingKey
+                }
+                lens.toDiagnostics(
+                    records[lens.fingerprint?.value]?.displayName,
+                    reference,
+                    route,
+                )
             },
             // A zero-camera or permission-denied device still benefits from a platform/build report.
             exportEnabled = true,
@@ -465,6 +609,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private fun LensDescriptor.toDiagnostics(
         customLabel: String?,
         reference: LensDescriptor?,
+        topologyRoute: CameraRoute?,
     ): LensDiagnosticsUiModel {
         val fov = LensMath.fieldOfView(capabilities)
         val fingerprintValue = fingerprint?.value ?: identity.routingKey
@@ -479,7 +624,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 stage.failureKind?.let { append("/").append(it.name) }
                 stage.detail?.takeIf(String::isNotBlank)?.let { append(" (").append(it).append(')') }
             }
-        } ?: "Not probed"
+        } ?: "Not opened yet"
         val rawFormats = capabilities.portableRawConfigurations
             .map { "${it.format.name} ${it.size.width}×${it.size.height}" }
             .distinct()
@@ -500,6 +645,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             summary = listOf(
                 DiagnosticField("Facing", facing.name),
                 DiagnosticField("Category", category.name),
+                DiagnosticField("Role confidence", topologyRoute?.roleConfidence?.name ?: "Unknown"),
+                DiagnosticField("Metadata trust", topologyRoute?.trust?.metadata?.name ?: "Unknown"),
+                DiagnosticField("Session trust", topologyRoute?.trust?.session?.name ?: "Unknown"),
+                DiagnosticField("RAW trust", topologyRoute?.trust?.raw?.name ?: "Unknown"),
                 DiagnosticField("Focal length", capabilities.focalLengthsMm.mmList()),
                 DiagnosticField("Approx. FOV", fov?.let {
                     "%.1f° × %.1f° (diag %.1f°)".format(
@@ -519,9 +668,26 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 DiagnosticField("Estimated max RAW FPS", capabilities.estimatedMaximumRawFps?.let {
                     "%.2f".format(Locale.ROOT, it)
                 } ?: "Unknown"),
-                DiagnosticField("Probe", probeText),
+                DiagnosticField("Lazy validation", probeText),
             ),
             advanced = listOf(
+                DiagnosticField("Canonical route", topologyRoute?.canonicalRouteId ?: "Unknown"),
+                DiagnosticField("Route kind", topologyRoute?.routeKind?.name ?: "Unknown"),
+                DiagnosticField(
+                    "Discovery sources",
+                    topologyRoute?.sources?.joinToString { it.name } ?: "Unknown",
+                ),
+                DiagnosticField(
+                    "Aliases",
+                    topologyRoute?.aliases?.joinToString { it.discoveredCameraId }
+                        ?.ifBlank { "None" } ?: "None",
+                ),
+                DiagnosticField(
+                    "Persistable failure",
+                    topologyRoute?.trust?.failure?.let {
+                        "${it.kind.name}/${it.durability.name}: ${it.detail.orEmpty()}"
+                    } ?: "None",
+                ),
                 DiagnosticField("Fingerprint", fingerprintValue),
                 DiagnosticField("Fingerprint mode", fingerprint?.strategy?.name ?: "Unknown"),
                 DiagnosticField("Public ID", identity.publicCameraId),
@@ -584,31 +750,34 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             )?.let { return it }
         }
         return when (lens.category) {
-            LensCategory.ULTRAWIDE -> "Ultrawide"
-            LensCategory.WIDE -> "Wide"
-            LensCategory.TELEPHOTO -> "Tele"
-            LensCategory.SUPER_TELEPHOTO -> "Super tele"
-            LensCategory.FRONT -> "Front"
-            LensCategory.EXTERNAL -> "External"
-            LensCategory.AUXILIARY -> "Auxiliary"
-            LensCategory.UNKNOWN -> when (lens.facing) {
+            LensCategory.PHOTOGRAPHIC_ULTRAWIDE -> "Ultrawide"
+            LensCategory.PHOTOGRAPHIC_WIDE -> "Wide"
+            LensCategory.PHOTOGRAPHIC_TELEPHOTO -> "Tele"
+            LensCategory.PHOTOGRAPHIC_SUPER_TELEPHOTO -> "Super tele"
+            LensCategory.PHOTOGRAPHIC_MACRO -> "Macro"
+            LensCategory.PHOTOGRAPHIC_MONO -> "Monochrome"
+            LensCategory.PHOTOGRAPHIC_UNKNOWN -> when (lens.facing) {
                 LensFacing.FRONT -> "Front"
                 LensFacing.BACK -> "Rear lens"
                 LensFacing.EXTERNAL -> "External"
                 LensFacing.UNKNOWN -> "Lens"
             }
+            LensCategory.NON_PHOTO_DEPTH -> "Depth camera"
+            LensCategory.NON_PHOTO_TOF -> "ToF camera"
+            LensCategory.NON_PHOTO_IR -> "IR camera"
+            LensCategory.SYSTEM_ONLY -> "System camera"
+            LensCategory.INACCESSIBLE -> "Inaccessible camera"
+            LensCategory.BROKEN -> "Unavailable camera"
         }
     }
 
     private fun CameraSessionState.statusText(): String = when (this) {
         CameraSessionState.Idle -> "Starting camera foundation"
         CameraSessionState.PermissionRequired -> "Camera permission required"
-        CameraSessionState.Discovering -> "Discovering application-accessible cameras"
-        is CameraSessionState.Probing -> "Safely probing $candidateCount camera routes"
         is CameraSessionState.Ready -> if (lensCount == 0) {
-            "No usable photographic lens was verified; open diagnostics"
+            "No photographic camera is available yet; open diagnostics"
         } else {
-            "$lensCount usable photographic lens${if (lensCount == 1) "" else "es"}"
+            "$lensCount photographic camera${if (lensCount == 1) "" else "s"} available"
         }
         is CameraSessionState.AwaitingSurface -> "Preparing preview surface"
         is CameraSessionState.Opening -> "Opening lens"
@@ -628,10 +797,24 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         .joinToString { "ƒ/%.1f".format(Locale.ROOT, it) }
         .ifBlank { "Unknown" }
 
+    private fun List<CameraRoute>.idsFromSources(
+        vararg sources: CameraDiscoverySource,
+    ): String {
+        val expected = sources.toSet()
+        return asSequence()
+            .filter { route -> route.sources.any(expected::contains) }
+            .map(CameraRoute::discoveredCameraId)
+            .distinct()
+            .sorted()
+            .joinToString()
+            .ifBlank { "None" }
+    }
+
     private fun com.sahidcode404.camex.core.model.Size2D?.sizeText(): String =
         this?.takeIf { it.isValid }?.let { "${it.width}×${it.height}" } ?: "Unknown"
 
     private fun Set<String>?.listText(): String = this.orEmpty().joinToString().ifBlank { "Unknown" }
+    private fun Double?.ms(): String = this?.let { "%.2f ms".format(Locale.ROOT, it) } ?: "Pending"
     private fun Boolean.yesNo(): String = if (this) "Yes" else "No"
     private fun Boolean.passFail(): String = if (this) "Passed" else "Failed"
 }

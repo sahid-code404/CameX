@@ -29,6 +29,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 
@@ -40,6 +42,7 @@ data class LensSettingsUiModel(
     val visible: Boolean,
     val isOneXReference: Boolean,
     val supportsOneXReference: Boolean,
+    val advanced: Boolean = false,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -54,6 +57,9 @@ fun LensSettingsScreen(
     modifier: Modifier = Modifier,
 ) {
     var editing by remember { mutableStateOf<LensSettingsUiModel?>(null) }
+    val indexedLenses = lenses.withIndex().toList()
+    val normalLenses = indexedLenses.filterNot { it.value.advanced }
+    val advancedLenses = indexedLenses.filter { it.value.advanced }
 
     Scaffold(
         modifier = modifier.fillMaxSize(),
@@ -64,32 +70,67 @@ fun LensSettingsScreen(
             )
         },
     ) { padding ->
-        if (lenses.isEmpty()) {
-            Column(
-                modifier = Modifier
-                    .padding(padding)
-                    .padding(24.dp),
-            ) {
-                Text("No usable photographic lenses have been discovered yet.")
+        LazyColumn(
+            modifier = Modifier.padding(padding),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+        ) {
+            item {
+                LensSettingsSectionHeader(
+                    title = "NORMAL PHOTOGRAPHIC LENSES",
+                    empty = normalLenses.isEmpty(),
+                    emptyMessage = "No normal photographic lenses have been discovered yet.",
+                )
             }
-        } else {
-            LazyColumn(
-                modifier = Modifier.padding(padding),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
-            ) {
-                itemsIndexed(lenses, key = { _, lens -> lens.fingerprint }) { index, lens ->
-                    LensPreferenceCard(
-                        lens = lens,
-                        canMoveUp = index > 0,
-                        canMoveDown = index < lenses.lastIndex,
-                        onSetVisible = { onSetVisible(lens.fingerprint, it) },
-                        onEditName = { editing = lens },
-                        onMoveUp = { onMove(index, index - 1) },
-                        onMoveDown = { onMove(index, index + 1) },
-                        onSetOneXReference = { onSetOneXReference(lens.fingerprint) },
-                    )
-                }
+            itemsIndexed(
+                items = normalLenses,
+                key = { _, indexed -> indexed.value.fingerprint },
+            ) { sectionIndex, indexed ->
+                LensPreferenceCard(
+                    lens = indexed.value,
+                    canMoveUp = sectionIndex > 0,
+                    canMoveDown = sectionIndex < normalLenses.lastIndex,
+                    onSetVisible = { onSetVisible(indexed.value.fingerprint, it) },
+                    onEditName = { editing = indexed.value },
+                    onMoveUp = {
+                        onMove(indexed.index, normalLenses[sectionIndex - 1].index)
+                    },
+                    onMoveDown = {
+                        onMove(indexed.index, normalLenses[sectionIndex + 1].index)
+                    },
+                    onSetOneXReference = {
+                        onSetOneXReference(indexed.value.fingerprint)
+                    },
+                )
+            }
+
+            item {
+                LensSettingsSectionHeader(
+                    title = "ADVANCED DISCOVERED CAMERAS",
+                    empty = advancedLenses.isEmpty(),
+                    emptyMessage = "No additional camera routes have been discovered.",
+                )
+            }
+            itemsIndexed(
+                items = advancedLenses,
+                key = { _, indexed -> indexed.value.fingerprint },
+            ) { sectionIndex, indexed ->
+                LensPreferenceCard(
+                    lens = indexed.value,
+                    canMoveUp = sectionIndex > 0,
+                    canMoveDown = sectionIndex < advancedLenses.lastIndex,
+                    onSetVisible = { onSetVisible(indexed.value.fingerprint, it) },
+                    onEditName = { editing = indexed.value },
+                    onMoveUp = {
+                        onMove(indexed.index, advancedLenses[sectionIndex - 1].index)
+                    },
+                    onMoveDown = {
+                        onMove(indexed.index, advancedLenses[sectionIndex + 1].index)
+                    },
+                    onSetOneXReference = {
+                        onSetOneXReference(indexed.value.fingerprint)
+                    },
+                )
             }
         }
     }
@@ -103,6 +144,29 @@ fun LensSettingsScreen(
                 editing = null
             },
         )
+    }
+}
+
+@Composable
+private fun LensSettingsSectionHeader(
+    title: String,
+    empty: Boolean,
+    emptyMessage: String,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 8.dp, bottom = 2.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.Bold,
+        )
+        if (empty) {
+            Text(emptyMessage, style = MaterialTheme.typography.bodySmall)
+        }
     }
 }
 
@@ -135,7 +199,13 @@ private fun LensPreferenceCard(
                 }
                 Text("Visible")
                 Spacer(Modifier.width(8.dp))
-                Switch(checked = lens.visible, onCheckedChange = onSetVisible)
+                Switch(
+                    checked = lens.visible,
+                    onCheckedChange = onSetVisible,
+                    modifier = Modifier.semantics {
+                        contentDescription = "Show ${lens.customLabel ?: lens.defaultLabel}"
+                    },
+                )
             }
 
             if (lens.supportsOneXReference) {
@@ -143,6 +213,10 @@ private fun LensPreferenceCard(
                     RadioButton(
                         selected = lens.isOneXReference,
                         onClick = onSetOneXReference,
+                        modifier = Modifier.semantics {
+                            contentDescription =
+                                "Use ${lens.customLabel ?: lens.defaultLabel} as rear 1× reference"
+                        },
                     )
                     Text("Use as rear 1× reference")
                 }

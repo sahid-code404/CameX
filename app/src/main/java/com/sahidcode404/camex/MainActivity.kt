@@ -125,7 +125,7 @@ private fun CameraApplication(
             onSwitchFacing = viewModel::switchFacing,
             onOpenLensSettings = { screen = AppScreen.LENS_SETTINGS },
             onOpenDiagnostics = { screen = AppScreen.DIAGNOSTICS },
-            onRetry = viewModel::retryDiscoveryAndProbes,
+            onRetry = viewModel::rescanCameras,
         )
         AppScreen.LENS_SETTINGS -> LensSettingsScreen(
             lenses = state.lensSettings,
@@ -138,7 +138,9 @@ private fun CameraApplication(
         AppScreen.DIAGNOSTICS -> DiagnosticsScreen(
             state = state.diagnostics,
             onBack = { screen = AppScreen.CAMERA },
-            onRetryProbes = viewModel::retryDiscoveryAndProbes,
+            onNormalRescan = viewModel::rescanCameras,
+            onDeepRescan = viewModel::deepRescanCameras,
+            onResetDiscoveryCache = viewModel::resetDiscoveryCache,
             onExport = {
                 val report = runCatching(viewModel::compatibilityReportJson).getOrNull()
                 if (report == null) {

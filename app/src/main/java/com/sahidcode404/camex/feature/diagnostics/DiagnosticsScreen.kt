@@ -14,6 +14,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -43,6 +44,8 @@ data class LensDiagnosticsUiModel(
 data class DiagnosticsUiState(
     val buildSummary: List<DiagnosticField> = emptyList(),
     val nativeSummary: List<DiagnosticField> = emptyList(),
+    val startupTraceSummary: List<DiagnosticField> = emptyList(),
+    val cacheSummary: List<DiagnosticField> = emptyList(),
     val discoverySummary: List<DiagnosticField> = emptyList(),
     val lenses: List<LensDiagnosticsUiModel> = emptyList(),
     val exportEnabled: Boolean = false,
@@ -54,7 +57,9 @@ data class DiagnosticsUiState(
 fun DiagnosticsScreen(
     state: DiagnosticsUiState,
     onBack: () -> Unit,
-    onRetryProbes: () -> Unit,
+    onNormalRescan: () -> Unit,
+    onDeepRescan: () -> Unit,
+    onResetDiscoveryCache: () -> Unit,
     onExport: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -84,11 +89,30 @@ fun DiagnosticsScreen(
                                 "it contains no photos, accounts, location, contacts, or tokens.",
                             style = MaterialTheme.typography.bodySmall,
                         )
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(onClick = onExport, enabled = state.exportEnabled) {
-                                Text("Export JSON")
-                            }
-                            TextButton(onClick = onRetryProbes) { Text("Retry probes") }
+                        Button(
+                            onClick = onExport,
+                            enabled = state.exportEnabled,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("Export JSON")
+                        }
+                        Button(
+                            onClick = onNormalRescan,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("Normal rescan")
+                        }
+                        OutlinedButton(
+                            onClick = onDeepRescan,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("Deep rescan")
+                        }
+                        TextButton(
+                            onClick = onResetDiscoveryCache,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("Reset discovery cache")
                         }
                         Text(state.statusText, style = MaterialTheme.typography.bodySmall)
                     }
@@ -100,6 +124,12 @@ fun DiagnosticsScreen(
             }
             if (state.nativeSummary.isNotEmpty()) {
                 item { DiagnosticSection("Native foundation", state.nativeSummary) }
+            }
+            if (state.startupTraceSummary.isNotEmpty()) {
+                item { DiagnosticSection("Startup trace", state.startupTraceSummary) }
+            }
+            if (state.cacheSummary.isNotEmpty()) {
+                item { DiagnosticSection("Discovery cache", state.cacheSummary) }
             }
             if (state.discoverySummary.isNotEmpty()) {
                 item { DiagnosticSection("Discovery and failure memory", state.discoverySummary) }

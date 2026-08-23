@@ -15,13 +15,13 @@ class PrimaryLensSelectorTest {
         val teleWithConventionalId = testLens(
             id = "0",
             focalMm = 12.0,
-            category = LensCategory.TELEPHOTO,
+            category = LensCategory.PHOTOGRAPHIC_TELEPHOTO,
             discoveryOrder = 0,
         )
         val wideWithArbitraryId = testLens(
             id = "camera-zeta",
             focalMm = 4.0,
-            category = LensCategory.WIDE,
+            category = LensCategory.PHOTOGRAPHIC_WIDE,
             discoveryOrder = 1,
         )
 
@@ -41,7 +41,11 @@ class PrimaryLensSelectorTest {
     @Test
     fun excludesFrontAuxiliaryAndUnusableNodes() {
         val front = testLens("front", facing = LensFacing.FRONT)
-        val depth = testLens("depth", category = LensCategory.AUXILIARY)
+        val depth = testLens(
+            "depth",
+            category = LensCategory.NON_PHOTO_DEPTH,
+            usability = LensUsability.DEPTH_AUXILIARY,
+        )
         val broken = testLens("broken", usability = LensUsability.BROKEN)
 
         assertNull(PrimaryLensSelector.select(listOf(front, depth, broken)))
@@ -53,13 +57,13 @@ class PrimaryLensSelectorTest {
             "ultra",
             focalMm = 2.0,
             usability = LensUsability.RAW_NATIVE,
-            category = LensCategory.ULTRAWIDE,
+            category = LensCategory.PHOTOGRAPHIC_ULTRAWIDE,
         )
         val processedWide = testLens(
             "wide",
             focalMm = 4.0,
             usability = LensUsability.PROCESSED_ONLY,
-            category = LensCategory.WIDE,
+            category = LensCategory.PHOTOGRAPHIC_WIDE,
         )
 
         assertEquals(processedWide, PrimaryLensSelector.select(listOf(rawUltra, processedWide)))

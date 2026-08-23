@@ -12,15 +12,14 @@ import java.security.MessageDigest
 /**
  * Creates a deterministic, versioned identity from normalized observable metadata.
  *
- * Camera IDs are deliberately excluded from the stable path. The stable path requires a valid
- * focal length plus sensor geometry, which prevents a facing/orientation-only record from looking
- * stable. If that evidence is missing, the fallback hashes all partial evidence together with the
- * routing IDs and non-secret build/device strings. That fallback is device/ROM scoped and may
- * change after an update; preference migration must therefore be best-effort and never assume it
- * is permanent. Raw canonical input is never retained in [LensFingerprint].
+ * The stable path requires valid optics plus a hardware-route identity (physical ID when present,
+ * otherwise the public ID). This intentionally keeps two different IDs with identical metadata
+ * distinct: false duplicate removal is worse than losing a preference migration after a HAL
+ * renumbering. Sparse fallbacks also include non-secret build/device context. Raw canonical input
+ * is never retained in [LensFingerprint].
  */
 object LensFingerprintGenerator {
-    private const val SCHEMA = "lens-fingerprint-v1"
+    private const val SCHEMA = "lens-fingerprint-v2"
 
     fun generate(
         lens: LensDescriptor,
@@ -40,6 +39,10 @@ object LensFingerprintGenerator {
         val canonical = buildString {
             appendPart("schema", SCHEMA)
             appendPart("strategy", strategy.name)
+            appendPart(
+                "hardwareCameraId",
+                lens.identity.physicalCameraId ?: lens.identity.publicCameraId,
+            )
             stableParts.forEach { (name, value) -> appendPart(name, value) }
             if (strategy == FingerprintStrategy.DEVICE_SCOPED_FALLBACK) {
                 appendPart("publicCameraId", lens.identity.publicCameraId)
@@ -50,7 +53,7 @@ object LensFingerprintGenerator {
                 appendPart("model", fallbackContext.model)
             }
         }
-        val prefix = if (strategy == FingerprintStrategy.STABLE_METADATA) "lm1_" else "lf1_"
+        val prefix = if (strategy == FingerprintStrategy.STABLE_METADATA) "lm2_" else "lf2_"
         return LensFingerprint(prefix + sha256(canonical), strategy)
     }
 

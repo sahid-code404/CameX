@@ -35,8 +35,12 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -48,8 +52,6 @@ import kotlinx.coroutines.withTimeout
 sealed interface CameraSessionState {
     data object Idle : CameraSessionState
     data object PermissionRequired : CameraSessionState
-    data object Discovering : CameraSessionState
-    data class Probing(val candidateCount: Int) : CameraSessionState
     data class Ready(val lensCount: Int) : CameraSessionState
     data class AwaitingSurface(val routingKey: String) : CameraSessionState
     data class Opening(val routingKey: String) : CameraSessionState
@@ -61,23 +63,48 @@ sealed interface CameraSessionState {
     data object Closed : CameraSessionState
 }
 
+sealed interface CameraSessionEvent {
+    data class CameraOpened(
+        val routingKey: String,
+    ) : CameraSessionEvent
+
+    data class SessionConfigured(
+        val routingKey: String,
+    ) : CameraSessionEvent
+
+    data class PreviewVerified(
+        val routingKey: String,
+    ) : CameraSessionEvent
+
+    data class PreviewFailed(
+        val routingKey: String,
+        val kind: ProbeFailureKind,
+        /** Only deterministic route/session incompatibilities are structural. */
+        val structural: Boolean,
+        /** Sanitized and bounded diagnostic detail. */
+        val detail: String,
+    ) : CameraSessionEvent
+}
+
 data class CameraRuntimeError(
     val kind: ProbeFailureKind,
     val detail: String,
     val routingKey: String? = null,
 )
 
+data class CameraFailureMemoryEntry(
+    val consecutiveFailures: Int,
+    val lastFailureKind: ProbeFailureKind,
+    val automaticRetrySuppressed: Boolean,
+)
+
 data class CameraRuntimeSnapshot(
-    val discovery: CameraDiscoverySnapshot = CameraDiscoverySnapshot.Empty,
-    val probe: CameraProbeSnapshot = CameraProbeSnapshot.Empty,
+    val lenses: List<LensDescriptor> = emptyList(),
     val selectedRoutingKey: String? = null,
     val activePreviewSize: Size2D? = null,
     val lastError: CameraRuntimeError? = null,
-    val livePreviewFailureMemory: Map<String, ProbeFailureMemoryEntry> = emptyMap(),
+    val livePreviewFailureMemory: Map<String, CameraFailureMemoryEntry> = emptyMap(),
 ) {
-    val lenses: List<LensDescriptor>
-        get() = probe.lenses.ifEmpty { discovery.lenses }
-
     val selectedLens: LensDescriptor?
         get() = selectedRoutingKey?.let { key ->
             lenses.firstOrNull { it.identity.routingKey == key }
@@ -92,9 +119,10 @@ data class CameraRuntimeSnapshot(
 interface CameraSessionController : Closeable {
     val state: StateFlow<CameraSessionState>
     val snapshot: StateFlow<CameraRuntimeSnapshot>
+    val sessionEvents: SharedFlow<CameraSessionEvent>
 
-    suspend fun discoverAndProbe(retryRememberedFailures: Boolean = false): CameraRuntimeSnapshot
-    suspend fun retryProbe(lens: LensDescriptor): LensDescriptor
+    suspend fun updateAvailableLenses(lenses: List<LensDescriptor>)
+    suspend fun clearTransientFailureMemory(routingKey: String? = null)
     suspend fun bindPreview(textureView: TextureView)
     suspend fun unbindPreview()
     suspend fun open(lens: LensDescriptor)
@@ -104,13 +132,11 @@ interface CameraSessionController : Closeable {
 }
 
 /**
- * Serialized Camera2 lifecycle implementation. All open/switch/close/probe operations share one
- * mutex, and camera callbacks run on one owned HandlerThread rather than the UI thread.
+ * Serialized Camera2 lifecycle implementation. All open/switch/close operations share one mutex,
+ * and camera callbacks run on one owned HandlerThread rather than the UI thread.
  */
 class DefaultCameraSessionController(
     context: Context,
-    private val discoveryEngine: CameraDiscoveryEngine = CameraDiscoveryEngine(context),
-    private val probeEngine: CameraProbeEngine = CameraProbeEngine(context),
     private val cameraManager: CameraManager = context.applicationContext
         .getSystemService(CameraManager::class.java),
     private val quirkRegistry: CameraQuirkRegistry = CameraQuirkRegistry(),
@@ -128,7 +154,6 @@ class DefaultCameraSessionController(
     private val activeDevice = AtomicReference<OpenCameraLease?>(null)
     private val activeSession = AtomicReference<CaptureSessionLease?>(null)
     private val activeSurface = AtomicReference<Surface?>(null)
-    private val activeProbeJob = AtomicReference<Job?>(null)
     private val activeOpenJob = AtomicReference<Job?>(null)
     private val livePreviewFailures = mutableMapOf<String, LivePreviewFailure>()
     private val pendingTextureFrame = AtomicReference<PreviewFrameGate?>(null)
@@ -136,9 +161,15 @@ class DefaultCameraSessionController(
     private val lifecycleEpoch = AtomicLong(0L)
     private val mutableState = MutableStateFlow<CameraSessionState>(CameraSessionState.Idle)
     private val mutableSnapshot = MutableStateFlow(CameraRuntimeSnapshot.Empty)
+    private val mutableSessionEvents = MutableSharedFlow<CameraSessionEvent>(
+        replay = 0,
+        extraBufferCapacity = SESSION_EVENT_BUFFER_CAPACITY,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
 
     override val state: StateFlow<CameraSessionState> = mutableState.asStateFlow()
     override val snapshot: StateFlow<CameraRuntimeSnapshot> = mutableSnapshot.asStateFlow()
+    override val sessionEvents: SharedFlow<CameraSessionEvent> = mutableSessionEvents.asSharedFlow()
 
     private var boundTextureView: TextureView? = null
     private var selectedLens: LensDescriptor? = null
@@ -183,123 +214,41 @@ class DefaultCameraSessionController(
         }
     }
 
-    override suspend fun discoverAndProbe(
-        retryRememberedFailures: Boolean,
-    ): CameraRuntimeSnapshot {
-        val callingJob = currentCoroutineContext()[Job]
-        return try {
-            operationMutex.withLock {
-                ensureOpen()
-                activeProbeJob.set(callingJob)
-                ensureOperationActive()
-                closePreviewLocked(updateState = false)
-                mutableState.value = CameraSessionState.Discovering
-                try {
-                    if (retryRememberedFailures) {
-                        probeEngine.clearFailureMemory()
-                        livePreviewFailures.clear()
-                        publishLivePreviewFailureMemory()
-                    }
-                    val discovery = discoveryEngine.discover()
-                    ensureOperationActive()
-                    mutableSnapshot.value = mutableSnapshot.value.copy(
-                        discovery = discovery,
-                        probe = CameraProbeSnapshot.Empty,
-                        activePreviewSize = null,
-                        lastError = null,
-                    )
-                    mutableState.value = CameraSessionState.Probing(discovery.lenses.size)
-                    val probe = probeEngine.probeSequentially(discovery.lenses)
-                    ensureOperationActive()
-                    val selectedKey = selectedLens?.identity?.routingKey
-                        ?.takeIf { key -> probe.lenses.any { it.identity.routingKey == key } }
-                    selectedLens = selectedKey?.let { key ->
-                        probe.lenses.firstOrNull { it.identity.routingKey == key }
-                    }
-                    mutableSnapshot.value = CameraRuntimeSnapshot(
-                        discovery = discovery,
-                        probe = probe,
-                        selectedRoutingKey = selectedKey,
-                        livePreviewFailureMemory = livePreviewFailures.mapValues {
-                            (_, failure) -> failure.snapshot()
-                        },
-                    )
-                    val permissionDenied = probe.resultsByRoutingKey.values.any { result ->
-                        result.stages.any { it.failureKind == ProbeFailureKind.PERMISSION_DENIED }
-                    }
-                    mutableState.value = if (permissionDenied && probe.lenses.none {
-                            it.probeResult?.previewVerified == true
-                        }
-                    ) {
-                        CameraSessionState.PermissionRequired
-                    } else {
-                        CameraSessionState.Ready(
-                            probe.lenses.count { it.usability.isSelectable },
-                        )
-                    }
-                    mutableSnapshot.value
-                } catch (error: CancellationException) {
-                    throw error
-                } catch (error: Throwable) {
-                    if (error is VirtualMachineError || error is ThreadDeath) throw error
-                    if (closed.get()) return@withLock mutableSnapshot.value
-                    val runtimeError = error.runtimeError(selectedLens)
-                    mutableSnapshot.value = mutableSnapshot.value.copy(lastError = runtimeError)
-                    mutableState.value = stateFor(runtimeError)
-                    mutableSnapshot.value
-                }
+    override suspend fun updateAvailableLenses(lenses: List<LensDescriptor>) =
+        operationMutex.withLock {
+            ensureOpen()
+            val mirroredLenses = lenses.toList()
+            val selectedKey = mutableSnapshot.value.selectedRoutingKey
+                ?: selectedLens?.identity?.routingKey
+            val refreshedSelected = selectedKey?.let { key ->
+                mirroredLenses.firstOrNull { it.identity.routingKey == key }
             }
-        } finally {
-            activeProbeJob.compareAndSet(callingJob, null)
-        }
-    }
+            if (refreshedSelected != null) selectedLens = refreshedSelected
 
-    override suspend fun retryProbe(lens: LensDescriptor): LensDescriptor {
-        val callingJob = currentCoroutineContext()[Job]
-        return try {
-            operationMutex.withLock {
-                activeProbeJob.set(callingJob)
-                ensureOperationActive()
-                closePreviewLocked(updateState = false)
-                livePreviewFailures.remove(lens.identity.routingKey)
-                publishLivePreviewFailureMemory()
-                probeEngine.clearFailureMemory(
-                    routingKey = lens.identity.routingKey,
-                    openCameraId = lens.identity.openCameraId,
-                )
-                mutableState.value = CameraSessionState.Probing(1)
-                val updated = probeEngine.probe(lens)
-                ensureOperationActive()
-                val existing = mutableSnapshot.value
-                val lenses = existing.lenses.map {
-                    if (it.identity.routingKey == updated.identity.routingKey) updated else it
-                }
-                val probe = existing.probe.copy(
-                    lenses = lenses,
-                    resultsByRoutingKey = existing.probe.resultsByRoutingKey +
-                        (updated.identity.routingKey to requireNotNull(updated.probeResult)),
-                    failureMemory = probeEngine.failureMemorySnapshot(),
-                    openFailureMemory = probeEngine.openFailureMemorySnapshot(),
-                    rawFailureMemory = probeEngine.rawFailureMemorySnapshot(),
-                )
-                if (selectedLens?.identity?.routingKey == updated.identity.routingKey) {
-                    selectedLens = updated
-                }
-                mutableSnapshot.value = existing.copy(probe = probe, activePreviewSize = null)
-                mutableState.value = if (updated.probeResult.stages.any {
-                        it.failureKind == ProbeFailureKind.PERMISSION_DENIED
-                    }
-                ) {
-                    CameraSessionState.PermissionRequired
-                } else {
-                    CameraSessionState.Ready(lenses.count { it.usability.isSelectable })
-                }
-                updated
+            // Topology reconciliation is observational from the session owner's perspective. It
+            // must not tear down, reopen, or relabel an active preview.
+            mutableSnapshot.value = mutableSnapshot.value.copy(
+                lenses = mirroredLenses,
+                selectedRoutingKey = selectedKey,
+            )
+            mutableState.value = when (mutableState.value) {
+                CameraSessionState.Idle,
+                is CameraSessionState.Ready,
+                -> CameraSessionState.Ready(mirroredLenses.count { it.usability.isSelectable })
+                else -> mutableState.value
             }
-        } finally {
-            activeProbeJob.compareAndSet(callingJob, null)
         }
-    }
+
+    override suspend fun clearTransientFailureMemory(routingKey: String?) =
+        operationMutex.withLock {
+            ensureOpen()
+            if (routingKey == null) {
+                livePreviewFailures.clear()
+            } else {
+                livePreviewFailures.remove(routingKey)
+            }
+            publishLivePreviewFailureMemory()
+        }
 
     override suspend fun bindPreview(textureView: TextureView) = operationMutex.withLock {
         ensureOpen()
@@ -364,7 +313,6 @@ class DefaultCameraSessionController(
         lifecycleEpoch.incrementAndGet()
         lifecycleActive.set(false)
         mutableState.value = CameraSessionState.Closing(activeLens?.identity?.routingKey)
-        activeProbeJob.getAndSet(null)?.cancel(CancellationException("Camera controller closed"))
         activeOpenJob.getAndSet(null)?.cancel(CancellationException("Camera controller closed"))
         pendingTextureFrame.getAndSet(null)?.fail(
             CancellationException("Camera controller closed before its first preview frame"),
@@ -385,7 +333,6 @@ class DefaultCameraSessionController(
         activeLens = null
         activePreviewConfiguration = null
         callbackThread.close()
-        probeEngine.close()
         mutableSnapshot.value = mutableSnapshot.value.copy(activePreviewSize = null)
         mutableState.value = CameraSessionState.Closed
     }
@@ -411,6 +358,7 @@ class DefaultCameraSessionController(
                     detail = "Automatic live preview retry suppressed after repeated failures",
                     routingKey = lens.identity.routingKey,
                 ),
+                publishValidationFailure = false,
             )
         }
         val fromKey = activeLens?.identity?.routingKey
@@ -481,16 +429,20 @@ class DefaultCameraSessionController(
                 timeoutMillis = policy.openTimeoutMillis,
                 onTerminalFailure = { error -> handleTerminalFailure(lens, error) },
             )
-            ensureOperationActive()
             activeDevice.set(device)
+            mutableSessionEvents.tryEmit(CameraSessionEvent.CameraOpened(lens.identity.routingKey))
+            ensureOperationActive()
             session = device.device.awaitCaptureSession(
                 surface = surface,
                 physicalCameraId = lens.identity.streamPhysicalCameraId,
                 handler = callbackThread.handler,
                 timeoutMillis = policy.sessionTimeoutMillis,
             )
-            ensureOperationActive()
             activeSession.set(session)
+            mutableSessionEvents.tryEmit(
+                CameraSessionEvent.SessionConfigured(lens.identity.routingKey),
+            )
+            ensureOperationActive()
             val gate = PreviewFrameGate(
                 expectedTexture = texture,
                 baselineTimestampNs = textureState.second,
@@ -538,6 +490,9 @@ class DefaultCameraSessionController(
             // Capture-start alone only proves that the HAL accepted a request. Do not publish
             // Previewing until TextureView has latched a newer frame from this stream as well.
             withTimeout(policy.firstFrameTimeoutMillis) { gate.awaitFrame() }
+            mutableSessionEvents.tryEmit(
+                CameraSessionEvent.PreviewVerified(lens.identity.routingKey),
+            )
             ensureOperationActive()
             activeLens = lens
             selectedLens = lens
@@ -567,11 +522,7 @@ class DefaultCameraSessionController(
             rememberLivePreviewFailure(lens, ProbeFailureKind.TIMEOUT, policy)
             if (!closed.get() && lifecycleActive.get()) {
                 val runtimeError = error.runtimeError(lens)
-                mutableSnapshot.value = mutableSnapshot.value.copy(
-                    activePreviewSize = null,
-                    lastError = runtimeError,
-                )
-                mutableState.value = stateFor(runtimeError)
+                setRecoverableError(runtimeError)
             }
         } catch (error: CancellationException) {
             session?.close()
@@ -596,11 +547,7 @@ class DefaultCameraSessionController(
             if (closed.get() || !lifecycleActive.get()) return
             val runtimeError = error.runtimeError(lens)
             rememberLivePreviewFailure(lens, runtimeError.kind, policy)
-            mutableSnapshot.value = mutableSnapshot.value.copy(
-                activePreviewSize = null,
-                lastError = runtimeError,
-            )
-            mutableState.value = stateFor(runtimeError)
+            setRecoverableError(runtimeError)
         } finally {
             frameGate?.let { pendingTextureFrame.compareAndSet(it, null) }
             activeOpenJob.compareAndSet(openingJob, null)
@@ -810,7 +757,6 @@ class DefaultCameraSessionController(
         if (!active) {
             // Preempt long Camera2 waits before joining the serialized state machine. The epoch
             // check below prevents this older request from overwriting a newer resume/pause.
-            activeProbeJob.getAndSet(null)?.cancel(CancellationException("Camera lifecycle paused"))
             activeOpenJob.getAndSet(null)?.cancel(CancellationException("Camera lifecycle paused"))
         }
         operationMutex.withLock {
@@ -845,12 +791,26 @@ class DefaultCameraSessionController(
         }
     }
 
-    private fun setRecoverableError(error: CameraRuntimeError) {
+    private fun setRecoverableError(
+        error: CameraRuntimeError,
+        publishValidationFailure: Boolean = true,
+    ) {
         mutableSnapshot.value = mutableSnapshot.value.copy(
             activePreviewSize = null,
             lastError = error,
         )
         mutableState.value = stateFor(error)
+        val routingKey = error.routingKey
+        if (publishValidationFailure && routingKey != null) {
+            mutableSessionEvents.tryEmit(
+                CameraSessionEvent.PreviewFailed(
+                    routingKey = routingKey,
+                    kind = error.kind,
+                    structural = error.kind.isStructuralPreviewFailure(),
+                    detail = sanitizeValidationDetail(error.detail),
+                ),
+            )
+        }
     }
 
     private fun stateFor(error: CameraRuntimeError): CameraSessionState =
@@ -877,12 +837,25 @@ class DefaultCameraSessionController(
     }
 
     private companion object {
+        const val SESSION_EVENT_BUFFER_CAPACITY = 32
+        const val MAX_VALIDATION_DETAIL_LENGTH = 160
+
         fun defaultEnvironment() = CameraRuntimeEnvironment(
             manufacturer = Build.MANUFACTURER.orEmpty(),
             model = Build.MODEL.orEmpty(),
             sdkInt = Build.VERSION.SDK_INT,
             buildFingerprint = Build.FINGERPRINT.orEmpty(),
         )
+
+        fun ProbeFailureKind.isStructuralPreviewFailure(): Boolean =
+            this == ProbeFailureKind.INVALID_METADATA ||
+                this == ProbeFailureKind.SESSION_CONFIGURATION
+
+        fun sanitizeValidationDetail(detail: String): String = detail
+            .map { character -> if (character.isISOControl()) ' ' else character }
+            .joinToString(separator = "")
+            .trim()
+            .take(MAX_VALIDATION_DETAIL_LENGTH)
     }
 
     private data class PreviewOrientation(
@@ -896,7 +869,7 @@ class DefaultCameraSessionController(
         val kind: ProbeFailureKind,
         val threshold: Int,
     ) {
-        fun snapshot() = ProbeFailureMemoryEntry(
+        fun snapshot() = CameraFailureMemoryEntry(
             consecutiveFailures = count,
             lastFailureKind = kind,
             automaticRetrySuppressed = count >= threshold,

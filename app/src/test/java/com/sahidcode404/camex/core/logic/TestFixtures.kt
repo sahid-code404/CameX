@@ -58,7 +58,7 @@ internal fun testLens(
     sensorHeightMm: Double = 4.2,
     facing: LensFacing = LensFacing.BACK,
     usability: LensUsability = LensUsability.RAW_NATIVE,
-    category: LensCategory = LensCategory.WIDE,
+    category: LensCategory = LensCategory.PHOTOGRAPHIC_WIDE,
     discoveryOrder: Int = 0,
     capabilities: LensCapabilities = testCapabilities(
         focalMm = focalMm,

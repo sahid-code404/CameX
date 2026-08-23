@@ -6,8 +6,6 @@ import com.sahidcode404.camex.core.model.LensCategory
 import com.sahidcode404.camex.core.model.LensDescriptor
 import com.sahidcode404.camex.core.model.LensFacing
 import com.sahidcode404.camex.core.model.LensUsability
-import kotlin.math.abs
-import kotlin.math.max
 
 data class DuplicateLensGroup(
     val representative: LensDescriptor,
@@ -19,7 +17,7 @@ object LensDuplicateFilter {
     fun filterForSelector(lenses: List<LensDescriptor>): List<LensDescriptor> =
         group(
             lenses.filter {
-                it.usability.isSelectable && it.category != LensCategory.AUXILIARY
+                it.usability.isSelectable && it.category.isNormalSelectorCandidate
             },
         ).map { it.representative }
 
@@ -62,6 +60,7 @@ object LensDuplicateFilter {
         if (left.facing != LensFacing.UNKNOWN && right.facing != LensFacing.UNKNOWN &&
             left.facing != right.facing
         ) return false
+        if (left.identity.routingKey == right.identity.routingKey) return true
 
         val leftFingerprint = left.fingerprint
         val rightFingerprint = right.fingerprint
@@ -74,60 +73,9 @@ object LensDuplicateFilter {
         val leftPhysical = left.identity.physicalCameraId?.takeIf(String::isNotBlank)
         val rightPhysical = right.identity.physicalCameraId?.takeIf(String::isNotBlank)
         if (leftPhysical != null && leftPhysical == rightPhysical) return true
-
-        var evidence = 0
-        var coreOpticalEvidence = false
-        representativeFocal(left)?.let { leftFocal ->
-            representativeFocal(right)?.let { rightFocal ->
-                if (!nearlyEqual(leftFocal, rightFocal, 0.015)) return false
-                evidence++
-                coreOpticalEvidence = true
-            }
-        }
-        val leftSensor = left.capabilities.sensorPhysicalSize?.takeIf { it.isValid }
-        val rightSensor = right.capabilities.sensorPhysicalSize?.takeIf { it.isValid }
-        if (leftSensor != null && rightSensor != null) {
-            if (!nearlyEqual(leftSensor.widthMm, rightSensor.widthMm, 0.015) ||
-                !nearlyEqual(leftSensor.heightMm, rightSensor.heightMm, 0.015)
-            ) return false
-            evidence++
-        }
-        val leftPixels = left.capabilities.pixelArraySize?.takeIf { it.isValid }
-        val rightPixels = right.capabilities.pixelArraySize?.takeIf { it.isValid }
-        if (leftPixels != null && rightPixels != null) {
-            if (leftPixels != rightPixels) return false
-            evidence++
-        }
-        val leftActive = left.capabilities.activeArray?.takeIf { it.isValid }
-        val rightActive = right.capabilities.activeArray?.takeIf { it.isValid }
-        if (leftActive != null && rightActive != null) {
-            if (leftActive.size != rightActive.size) return false
-            evidence++
-        }
-        val leftFov = LensMath.fieldOfView(left.capabilities)?.diagonalDegrees
-        val rightFov = LensMath.fieldOfView(right.capabilities)?.diagonalDegrees
-        if (leftFov != null && rightFov != null) {
-            if (abs(leftFov - rightFov) > 1.5) return false
-            evidence++
-            coreOpticalEvidence = true
-        }
-        val leftOrientation = left.capabilities.sensorOrientationDegrees
-        val rightOrientation = right.capabilities.sensorOrientationDegrees
-        if (leftOrientation != null && rightOrientation != null) {
-            if (Math.floorMod(leftOrientation, 360) != Math.floorMod(rightOrientation, 360)) return false
-            evidence++
-        }
-        val leftFormats = left.capabilities.streamConfigurations.orEmpty().map { it.format }.toSet()
-        val rightFormats = right.capabilities.streamConfigurations.orEmpty().map { it.format }.toSet()
-        if (leftFormats.isNotEmpty() && rightFormats.isNotEmpty()) {
-            val overlap = leftFormats.intersect(rightFormats).size.toDouble() /
-                max(leftFormats.size, rightFormats.size)
-            if (overlap >= 0.75) evidence++
-        }
-
-        // Multiple independent matches are required; sparse nodes stay visible rather than being
-        // incorrectly collapsed.
-        return coreOpticalEvidence && evidence >= 3
+        // Canonical topology resolution owns cross-route aliasing. Similar optics alone can still
+        // describe two real sensors, so this UI safety net never performs a second heuristic merge.
+        return false
     }
 
     private val representativeComparator = compareBy<LensDescriptor> { usabilityRank(it.usability) }
@@ -144,6 +92,7 @@ object LensDuplicateFilter {
         LensUsability.RAW_MAX_RESOLUTION -> 5
         LensUsability.PROCESSED_ONLY -> 4
         LensUsability.PREVIEW_ONLY -> 3
+        LensUsability.PHOTOGRAPHIC_CANDIDATE -> 2
         LensUsability.UNKNOWN -> 2
         else -> 0
     }
@@ -160,11 +109,4 @@ object LensDuplicateFilter {
         ).count { it != null }
     }
 
-    private fun representativeFocal(lens: LensDescriptor): Double? = lens.capabilities.focalLengthsMm
-        .orEmpty()
-        .filter { it.isFinite() && it > 0.0 }
-        .minOrNull()
-
-    private fun nearlyEqual(left: Double, right: Double, tolerance: Double): Boolean =
-        abs(left - right) <= max(abs(left), abs(right)) * tolerance
 }

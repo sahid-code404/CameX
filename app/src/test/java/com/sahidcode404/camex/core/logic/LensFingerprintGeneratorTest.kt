@@ -14,7 +14,7 @@ import org.junit.Test
 
 class LensFingerprintGeneratorTest {
     @Test
-    fun stableFingerprintIsDeterministicAndIgnoresCameraId() {
+    fun stableFingerprintIsDeterministicAndDistinguishesHardwareIds() {
         val first = testLens("arbitrary-alpha")
         val second = first.copy(identity = LensIdentity(publicCameraId = "different-runtime-id"))
 
@@ -22,8 +22,8 @@ class LensFingerprintGeneratorTest {
         val secondFingerprint = LensFingerprintGenerator.generate(second)
 
         assertEquals(FingerprintStrategy.STABLE_METADATA, firstFingerprint.strategy)
-        assertEquals(firstFingerprint, secondFingerprint)
-        assertTrue(firstFingerprint.value.matches(Regex("lm1_[0-9a-f]{64}")))
+        assertNotEquals(firstFingerprint, secondFingerprint)
+        assertTrue(firstFingerprint.value.matches(Regex("lm2_[0-9a-f]{64}")))
     }
 
     @Test
@@ -64,7 +64,7 @@ class LensFingerprintGeneratorTest {
         val fingerprint = LensFingerprintGenerator.generate(sparse, context)
 
         assertEquals(FingerprintStrategy.DEVICE_SCOPED_FALLBACK, fingerprint.strategy)
-        assertTrue(fingerprint.value.startsWith("lf1_"))
+        assertTrue(fingerprint.value.startsWith("lf2_"))
         assertEquals(fingerprint, LensFingerprintGenerator.generate(sparse, context))
     }
 

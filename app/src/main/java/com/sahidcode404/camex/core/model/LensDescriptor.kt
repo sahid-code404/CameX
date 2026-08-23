@@ -4,14 +4,40 @@ import kotlinx.serialization.Serializable
 
 @Serializable
 enum class LensCategory {
-    ULTRAWIDE,
-    WIDE,
-    TELEPHOTO,
-    SUPER_TELEPHOTO,
-    FRONT,
-    EXTERNAL,
-    AUXILIARY,
-    UNKNOWN,
+    PHOTOGRAPHIC_ULTRAWIDE,
+    PHOTOGRAPHIC_WIDE,
+    PHOTOGRAPHIC_TELEPHOTO,
+    PHOTOGRAPHIC_SUPER_TELEPHOTO,
+    PHOTOGRAPHIC_MACRO,
+    PHOTOGRAPHIC_MONO,
+    PHOTOGRAPHIC_UNKNOWN,
+    NON_PHOTO_DEPTH,
+    NON_PHOTO_TOF,
+    NON_PHOTO_IR,
+    SYSTEM_ONLY,
+    INACCESSIBLE,
+    BROKEN,
+    ;
+
+    val isNormalSelectorCandidate: Boolean
+        get() = when (this) {
+            PHOTOGRAPHIC_ULTRAWIDE,
+            PHOTOGRAPHIC_WIDE,
+            PHOTOGRAPHIC_TELEPHOTO,
+            PHOTOGRAPHIC_SUPER_TELEPHOTO,
+            PHOTOGRAPHIC_MACRO,
+            PHOTOGRAPHIC_MONO,
+            PHOTOGRAPHIC_UNKNOWN,
+            -> true
+
+            NON_PHOTO_DEPTH,
+            NON_PHOTO_TOF,
+            NON_PHOTO_IR,
+            SYSTEM_ONLY,
+            INACCESSIBLE,
+            BROKEN,
+            -> false
+        }
 }
 
 @Serializable
@@ -33,7 +59,7 @@ data class LensDescriptor(
     val capabilities: LensCapabilities = LensCapabilities(),
     val fingerprint: LensFingerprint? = null,
     val usability: LensUsability = LensUsability.UNKNOWN,
-    val category: LensCategory = LensCategory.UNKNOWN,
+    val category: LensCategory = LensCategory.PHOTOGRAPHIC_UNKNOWN,
     val probeResult: LensProbeResult? = null,
     /** Stable within a discovery pass and used only as a final UI tie-break, never as lens identity. */
     val discoveryOrder: Int = 0,

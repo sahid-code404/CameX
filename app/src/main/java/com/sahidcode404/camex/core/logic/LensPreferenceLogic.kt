@@ -94,6 +94,7 @@ object PreferenceMigration {
             preferences = LensPreferencesState(
                 records = records.associateBy { it.fingerprint }.values.toList(),
                 oneXReferenceFingerprint = reference,
+                lastSelectedFingerprint = lastRear ?: lastFront,
                 lastSelectedRearFingerprint = lastRear,
                 lastSelectedFrontFingerprint = lastFront,
             ),
@@ -115,6 +116,7 @@ object PreferenceMigration {
             schemaVersion = LensPreferencesState.CURRENT_SCHEMA_VERSION,
             records = records,
             oneXReferenceFingerprint = remap(current.oneXReferenceFingerprint),
+            lastSelectedFingerprint = remap(current.lastSelectedFingerprint),
             lastSelectedRearFingerprint = remap(current.lastSelectedRearFingerprint),
             lastSelectedFrontFingerprint = remap(current.lastSelectedFrontFingerprint),
         )

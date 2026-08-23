@@ -75,9 +75,17 @@ class LensSettingsStore(context: Context) {
         val normalized = fingerprint.normalizedFingerprintOrNull() ?: return
         update { current ->
             when (facing) {
-                LensFacing.BACK -> current.copy(lastSelectedRearFingerprint = normalized)
-                LensFacing.FRONT -> current.copy(lastSelectedFrontFingerprint = normalized)
-                LensFacing.EXTERNAL, LensFacing.UNKNOWN -> current
+                LensFacing.BACK -> current.copy(
+                    lastSelectedFingerprint = normalized,
+                    lastSelectedRearFingerprint = normalized,
+                )
+                LensFacing.FRONT -> current.copy(
+                    lastSelectedFingerprint = normalized,
+                    lastSelectedFrontFingerprint = normalized,
+                )
+                LensFacing.EXTERNAL, LensFacing.UNKNOWN -> current.copy(
+                    lastSelectedFingerprint = normalized,
+                )
             }
         }
     }
@@ -133,6 +141,7 @@ class LensSettingsStore(context: Context) {
             .values
             .toList(),
         oneXReferenceFingerprint = oneXReferenceFingerprint.normalizedFingerprintOrNull(),
+        lastSelectedFingerprint = lastSelectedFingerprint.normalizedFingerprintOrNull(),
         lastSelectedRearFingerprint = lastSelectedRearFingerprint.normalizedFingerprintOrNull(),
         lastSelectedFrontFingerprint = lastSelectedFrontFingerprint.normalizedFingerprintOrNull(),
     )

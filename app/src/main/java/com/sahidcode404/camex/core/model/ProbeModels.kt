@@ -71,6 +71,8 @@ enum class LensUsability {
     RAW_MAX_RESOLUTION,
     PROCESSED_ONLY,
     PREVIEW_ONLY,
+    /** Credible photographic metadata; session support is deliberately still unverified. */
+    PHOTOGRAPHIC_CANDIDATE,
     DEPTH_AUXILIARY,
     SYSTEM_ONLY,
     INACCESSIBLE,
@@ -81,7 +83,8 @@ enum class LensUsability {
 
     val isPhotographic: Boolean
         get() = this == RAW_NATIVE || this == RAW_PHYSICAL_STREAM ||
-            this == RAW_MAX_RESOLUTION || this == PROCESSED_ONLY || this == PREVIEW_ONLY
+            this == RAW_MAX_RESOLUTION || this == PROCESSED_ONLY || this == PREVIEW_ONLY ||
+            this == PHOTOGRAPHIC_CANDIDATE
 
     val isSelectable: Boolean get() = isPhotographic && this != DISABLED_BY_USER
 }
