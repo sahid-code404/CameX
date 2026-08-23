@@ -163,9 +163,9 @@ class UpdateViewModel(application: Application) : AndroidViewModel(application) 
 
     private suspend fun installReady() {
         val manifest = currentManifest() ?: return
-        val file = verifiedApk?.takeIf(File::isFile)
-            ?: (mutableState.value as? UpdateState.ReadyToInstall)?.apkPath?.let(::File)?.takeIf(File::isFile)
-            ?: (mutableState.value as? UpdateState.AwaitingInstallPermission)?.apkPath?.let(::File)?.takeIf(File::isFile)
+        val file = verifiedApk?.takeIf { it.isFile }
+            ?: (mutableState.value as? UpdateState.ReadyToInstall)?.apkPath?.let(::File)?.takeIf { it.isFile }
+            ?: (mutableState.value as? UpdateState.AwaitingInstallPermission)?.apkPath?.let(::File)?.takeIf { it.isFile }
             ?: throw UpdateException(UpdateFailureCode.STORAGE, "Verified update APK is missing")
         verifiedApk = file
         when (val result = installer.install(file, manifest.packageName)) {
@@ -226,6 +226,5 @@ class UpdateViewModel(application: Application) : AndroidViewModel(application) 
 
     override fun onCleared() {
         operationJob?.cancel()
-        super.onCleared()
     }
 }
