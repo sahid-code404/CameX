@@ -97,10 +97,7 @@ private fun CameraApplication(
     var promptedVersionCode by rememberSaveable { mutableStateOf<Long?>(null) }
     var showUpdatePrompt by rememberSaveable { mutableStateOf(false) }
 
-    // Match Universal_Camera: on app open, perform the lightweight GitHub check only if 12h elapsed.
-    LaunchedEffect(Unit) {
-        updateViewModel.checkForUpdatesIfDue()
-    }
+    LaunchedEffect(Unit) { updateViewModel.checkForUpdatesIfDue() }
 
     val availableUpdate = (updateState.updateState as? UpdateState.Available)?.update
     LaunchedEffect(availableUpdate?.manifest?.versionCode) {
@@ -193,10 +190,7 @@ private fun CameraApplication(
             onOpenUpdates = { screen = AppScreen.UPDATES },
             onExport = {
                 val report = runCatching {
-                    RawCompatibilityReportJson.append(
-                        viewModel.compatibilityReportJson(),
-                        rawState,
-                    )
+                    RawCompatibilityReportJson.append(viewModel.compatibilityReportJson(), rawState)
                 }.getOrNull()
                 if (report == null) {
                     Toast.makeText(context, "Could not create compatibility report", Toast.LENGTH_LONG)
@@ -236,14 +230,10 @@ private fun CameraApplication(
                         showUpdatePrompt = false
                         screen = AppScreen.UPDATES
                     },
-                ) {
-                    Text("Update")
-                }
+                ) { Text("Update") }
             },
             dismissButton = {
-                TextButton(onClick = { showUpdatePrompt = false }) {
-                    Text("Later")
-                }
+                TextButton(onClick = { showUpdatePrompt = false }) { Text("Later") }
             },
         )
     }
@@ -255,7 +245,10 @@ private fun rawDiagnosticsFields(state: RawCaptureState): List<DiagnosticField> 
     return listOf(
         DiagnosticField("State", state.phase.name),
         DiagnosticField("rawSupported", diagnostics.rawSupported.name),
-        DiagnosticField("availableRawSizes", diagnostics.availableRawSizes.joinToString(::formatSize).ifBlank { "None" }),
+        DiagnosticField(
+            "availableRawSizes",
+            diagnostics.availableRawSizes.joinToString(transform = ::formatSize).ifBlank { "None" },
+        ),
         DiagnosticField("selectedRawSize", diagnostics.selectedRawSize?.let(::formatSize) ?: "None"),
         DiagnosticField("canonicalFingerprint", context?.canonicalFingerprint ?: "None"),
         DiagnosticField("profileFingerprint", context?.profileFingerprint ?: "None"),
@@ -282,13 +275,8 @@ private fun formatSize(size: Size2D): String = "${size.width}×${size.height}"
 @Composable
 private fun CameraPreview(viewModel: CameraViewModel) {
     val context = LocalContext.current
-    val textureView = remember(context) {
-        TextureView(context).apply { isOpaque = true }
-    }
-    AndroidView(
-        factory = { textureView },
-        modifier = Modifier.fillMaxSize(),
-    )
+    val textureView = remember(context) { TextureView(context).apply { isOpaque = true } }
+    AndroidView(factory = { textureView }, modifier = Modifier.fillMaxSize())
     DisposableEffect(textureView, viewModel) {
         viewModel.bindPreview(textureView)
         onDispose { viewModel.unbindPreview() }
