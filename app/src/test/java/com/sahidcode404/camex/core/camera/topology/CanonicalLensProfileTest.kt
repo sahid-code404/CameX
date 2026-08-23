@@ -2,6 +2,7 @@ package com.sahidcode404.camex.core.camera.topology
 
 import com.sahidcode404.camex.core.model.CapabilitySupport
 import com.sahidcode404.camex.core.model.ColorFilterArrangement
+import com.sahidcode404.camex.core.model.FieldOfView
 import com.sahidcode404.camex.core.model.LensCapabilities
 import com.sahidcode404.camex.core.model.LensFacing
 import com.sahidcode404.camex.core.model.PhysicalSize
@@ -55,7 +56,23 @@ class CanonicalLensProfileTest {
     }
 
     @Test
-    fun `different focal lengths remain separate physical lenses`() {
+    fun `different public profile IDs with identical strong optics group`() {
+        val metadata = opticalMetadata(5.0)
+        val topology = resolve(
+            route("public-a", CameraDiscoverySource.JAVA_PUBLIC, CameraRouteKind.PUBLIC_DIRECT, metadata),
+            route("public-b", CameraDiscoverySource.JAVA_PUBLIC, CameraRouteKind.PUBLIC_DIRECT, metadata),
+        )
+
+        assertEquals(1, topology.routes.size)
+        assertEquals(2, topology.routes.single().profiles.size)
+        assertEquals(
+            setOf("public-a", "public-b"),
+            topology.routes.single().profiles.mapTo(mutableSetOf()) { it.openCameraId },
+        )
+    }
+
+    @Test
+    fun `same resolution with different focal length remains separate`() {
         val topology = resolve(
             route("21", CameraDiscoverySource.NDK_DEEP, CameraRouteKind.DEEP_NDK_DIRECT, opticalMetadata(2.4)),
             route("22", CameraDiscoverySource.NDK_DEEP, CameraRouteKind.DEEP_NDK_DIRECT, opticalMetadata(5.0)),
@@ -81,20 +98,59 @@ class CanonicalLensProfileTest {
     }
 
     @Test
-    fun `independent public routes with only identical sparse optics stay conservative`() {
-        val metadata = opticalMetadata(5.0)
+    fun `same approximate FOV with different authoritative CFA remains separate`() {
+        val shared = opticalMetadata(5.0).copy(
+            approximateFieldOfView = FieldOfView(
+                horizontalDegrees = 70.0,
+                verticalDegrees = 55.0,
+                diagonalDegrees = 82.0,
+                focalLengthMm = 5.0,
+            ),
+        )
+        val topology = resolve(
+            route(
+                "cfa-rggb",
+                CameraDiscoverySource.JAVA_PUBLIC,
+                CameraRouteKind.PUBLIC_DIRECT,
+                shared,
+                full = fullCapabilities(ColorFilterArrangement.RGGB),
+            ),
+            route(
+                "cfa-bggr",
+                CameraDiscoverySource.NDK_DEEP,
+                CameraRouteKind.DEEP_NDK_DIRECT,
+                shared,
+                full = fullCapabilities(ColorFilterArrangement.BGGR),
+            ),
+        )
+
+        assertEquals(2, topology.routes.size)
+        assertEquals(
+            OpticalLensMatch.CONFLICT,
+            OpticalLensMatcher.compare(topology.routes[0], topology.routes[1]).match,
+        )
+    }
+
+    @Test
+    fun `insufficient metadata never aggressively merges profiles`() {
+        val sparse = MinimalCameraMetadata(
+            facing = LensFacing.BACK,
+            focalLengthsMm = listOf(5.0),
+        )
         val topology = resolve(
             CameraRouteEvidence(
                 source = CameraDiscoverySource.JAVA_PUBLIC,
-                discoveredCameraId = "public-a",
+                discoveredCameraId = "sparse-a",
                 routeKind = CameraRouteKind.PUBLIC_DIRECT,
-                minimalMetadata = metadata,
+                minimalMetadata = sparse,
+                trust = CameraRouteTrust(metadata = CameraMetadataTrust.METADATA_VALID),
             ),
             CameraRouteEvidence(
-                source = CameraDiscoverySource.JAVA_PUBLIC,
-                discoveredCameraId = "public-b",
-                routeKind = CameraRouteKind.PUBLIC_DIRECT,
-                minimalMetadata = metadata,
+                source = CameraDiscoverySource.NDK_DEEP,
+                discoveredCameraId = "sparse-b",
+                routeKind = CameraRouteKind.DEEP_NDK_DIRECT,
+                minimalMetadata = sparse,
+                trust = CameraRouteTrust(metadata = CameraMetadataTrust.METADATA_VALID),
             ),
         )
 
@@ -246,13 +302,14 @@ class CanonicalLensProfileTest {
         kind: CameraRouteKind,
         metadata: MinimalCameraMetadata,
         trust: CameraRouteTrust = CameraRouteTrust(metadata = CameraMetadataTrust.METADATA_VALID),
+        full: FullCameraCapabilities = fullCapabilities(),
     ) = CameraRouteEvidence(
         source = source,
         discoveredCameraId = id,
         openCameraId = id,
         routeKind = kind,
         minimalMetadata = metadata,
-        fullCapabilities = fullCapabilities(),
+        fullCapabilities = full,
         trust = trust,
     )
 
@@ -286,11 +343,13 @@ class CanonicalLensProfileTest {
         privatePreviewSizes = listOf(Size2D(1920, 1080)),
     )
 
-    private fun fullCapabilities() = FullCameraCapabilities(
+    private fun fullCapabilities(
+        cfa: ColorFilterArrangement = ColorFilterArrangement.RGGB,
+    ) = FullCameraCapabilities(
         capabilities = LensCapabilities(
             sensorOrientationDegrees = 90,
             apertures = listOf(1.8),
-            colorFilterArrangement = ColorFilterArrangement.RGGB,
+            colorFilterArrangement = cfa,
         ),
         complete = false,
     )
