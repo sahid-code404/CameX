@@ -37,7 +37,10 @@ data class RawCapabilityInfo(
 
 object RawCapabilityResolver {
     fun resolve(lens: LensDescriptor): RawCapabilityInfo {
+        // Phase 2 intentionally uses SCALER_STREAM_CONFIGURATION_MAP RAW_SENSOR outputs, not the
+        // maximum-resolution pixel-mode map. Maximum-resolution RAW can be added in a later phase.
         val sizes = lens.capabilities.configurations(StreamFormat.RAW_SENSOR)
+            .filterNot { it.maximumResolution }
             .map { it.size }
             .filter { it.isValid }
             .distinct()
@@ -138,6 +141,9 @@ sealed interface RawCaptureResult {
 
 interface RawCaptureController {
     val rawCaptureState: kotlinx.coroutines.flow.StateFlow<RawCaptureState>
+
+    /** Called by the runtime selection bridge; null immediately invalidates an in-flight frame. */
+    fun updateActiveSelection(selectionGeneration: Long?, routingKey: String?)
 
     suspend fun captureRaw(request: RawCaptureRequest): RawCaptureResult
 }
