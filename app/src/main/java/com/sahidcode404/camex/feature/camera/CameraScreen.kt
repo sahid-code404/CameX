@@ -63,6 +63,7 @@ fun CameraScreen(
     rawState: RawCaptureState,
     previewContent: @Composable () -> Unit,
     permissionPermanentlyDenied: Boolean,
+    modifier: Modifier = Modifier,
     updateAvailable: Boolean = false,
     onRequestPermission: () -> Unit,
     onOpenAppSettings: () -> Unit,
@@ -72,7 +73,6 @@ fun CameraScreen(
     onOpenLensSettings: () -> Unit,
     onOpenDiagnostics: () -> Unit,
     onRetry: () -> Unit,
-    modifier: Modifier = Modifier,
 ) {
     Box(
         modifier = modifier
