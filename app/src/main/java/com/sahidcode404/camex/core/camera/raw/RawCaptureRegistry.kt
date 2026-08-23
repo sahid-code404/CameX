@@ -354,7 +354,8 @@ object RawCaptureRegistry : RawCaptureController {
                 rawAdvertised == null -> "RAW capability metadata is unavailable"
                 else -> null
             }
-            val afModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES).orEmpty()
+            val afModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
+                ?: intArrayOf()
             Inspection(
                 capability = RawCapabilityInfo(
                     support = support,
