@@ -61,7 +61,9 @@ class HttpUpdateTransport : UpdateTransport {
             setRequestProperty("User-Agent", "Camera-Android-Updater")
         }
         try {
-            val total = connection.contentLengthLong.takeIf { it > 0L }
+            val total = connection.getHeaderField("Content-Length")
+                ?.toLongOrNull()
+                ?.takeIf { it > 0L }
             FileOutputStream(destination).use { output ->
                 connection.inputStream.use { input ->
                     val buffer = ByteArray(128 * 1024)
