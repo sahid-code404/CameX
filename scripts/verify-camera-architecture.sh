@@ -17,8 +17,6 @@ else
   exit 2
 fi
 
-# Run the PCRE searches with ripgrep when available. GitHub-hosted runners do not guarantee rg,
-# so fall back to GNU grep using equivalent recursive/include/multiline behavior.
 search_pattern() {
   local output_mode="$1"
   local pattern="$2"
@@ -36,14 +34,10 @@ search_pattern() {
   local multiline=false
   local -a includes=()
   local -a paths=()
-
   while (($# > 0)); do
     case "$1" in
       --glob)
-        if (($# < 2)); then
-          echo "Architecture verifier received --glob without a pattern." >&2
-          return 2
-        fi
+        (($# >= 2)) || { echo "Architecture verifier received --glob without a pattern." >&2; return 2; }
         includes+=("--include=$2")
         shift 2
         ;;
@@ -57,27 +51,16 @@ search_pattern() {
         ;;
     esac
   done
-
-  if ((${#paths[@]} == 0)); then
-    echo "Architecture verifier received no search path." >&2
-    return 2
-  fi
+  ((${#paths[@]} > 0)) || { echo "Architecture verifier received no search path." >&2; return 2; }
 
   local -a grep_args=(-r -P --binary-files=without-match)
-  if [[ "${output_mode}" == "quiet" ]]; then
-    grep_args+=(-q)
-  else
-    grep_args+=(-n -H)
-  fi
-  if [[ "${multiline}" == true ]]; then
-    grep_args+=(-z)
-  fi
+  if [[ "${output_mode}" == "quiet" ]]; then grep_args+=(-q); else grep_args+=(-n -H); fi
+  [[ "${multiline}" == true ]] && grep_args+=(-z)
 
   if [[ "${output_mode}" == "quiet" ]]; then
     grep "${grep_args[@]}" "${includes[@]}" -- "${pattern}" "${paths[@]}"
     return $?
   fi
-
   if [[ "${multiline}" == true ]]; then
     set +e
     grep "${grep_args[@]}" "${includes[@]}" -- "${pattern}" "${paths[@]}" | tr '\0' '\n'
@@ -85,7 +68,6 @@ search_pattern() {
     set -e
     return "${grep_status}"
   fi
-
   grep "${grep_args[@]}" "${includes[@]}" -- "${pattern}" "${paths[@]}"
 }
 
@@ -93,22 +75,18 @@ reject_pattern() {
   local label="$1"
   local pattern="$2"
   shift 2
-
-  local matches
-  local status
+  local matches status
   set +e
   matches="$(search_pattern lines "${pattern}" "$@" 2>&1)"
   status=$?
   set -e
-
   case "${status}" in
     0)
       echo "Architecture violation: ${label}" >&2
       echo "${matches}" >&2
       failures=$((failures + 1))
       ;;
-    1)
-      ;;
+    1) ;;
     *)
       echo "Architecture check failed while searching for: ${label}" >&2
       echo "${matches}" >&2
@@ -121,16 +99,13 @@ require_pattern() {
   local label="$1"
   local pattern="$2"
   shift 2
-
   local status
   set +e
   search_pattern quiet "${pattern}" "$@"
   status=$?
   set -e
-
   case "${status}" in
-    0)
-      ;;
+    0) ;;
     1)
       echo "Architecture requirement missing: ${label}" >&2
       failures=$((failures + 1))
@@ -147,6 +122,13 @@ readonly -a PRODUCTION_ROOTS=(app/src/main native/core/src/main/cpp)
 readonly NATIVE_DISCOVERY=native/core/src/main/cpp/camera_discovery.cpp
 readonly JAVA_DISCOVERY=app/src/main/java/com/sahidcode404/camex/core/camera/discovery/JavaCameraDiscoveryBackend.kt
 readonly SESSION_CONTROLLER=app/src/main/java/com/sahidcode404/camex/core/camera/CameraSessionController.kt
+readonly TOPOLOGY_MODELS=app/src/main/java/com/sahidcode404/camex/core/camera/topology/CameraTopologyModels.kt
+readonly TOPOLOGY_RESOLVER=app/src/main/java/com/sahidcode404/camex/core/camera/topology/CameraTopologyResolver.kt
+readonly OPTICAL_MATCHER=app/src/main/java/com/sahidcode404/camex/core/camera/topology/OpticalLensMatcher.kt
+readonly PROFILE_SELECTOR=app/src/main/java/com/sahidcode404/camex/core/camera/topology/CameraProfileSelector.kt
+readonly FAILOVER_CONTROLLER=app/src/main/java/com/sahidcode404/camex/core/camera/runtime/FailoverCameraSessionController.kt
+readonly RUNTIME_COORDINATOR=app/src/main/java/com/sahidcode404/camex/core/camera/runtime/CameraRuntimeCoordinator.kt
+readonly VIEW_MODEL=app/src/main/java/com/sahidcode404/camex/CameraViewModel.kt
 
 reject_pattern \
   "numeric Camera2 ID used as a dispatch condition" \
@@ -164,20 +146,9 @@ reject_pattern \
   "(?i)\\b(?:if|when)\\s*\\([^\\n)]*(?:Build\\s*\\.\\s*(?:MANUFACTURER|MODEL)|\\b(?:manufacturer|model)\\b)|(?:Build\\s*\\.\\s*(?:MANUFACTURER|MODEL)|\\b(?:manufacturer|model)\\b)\\s*(?:===|!==|==|!=|\\.equals\\s*\\(|\\.contains\\s*\\(|\\.startsWith\\s*\\()|['\"][^'\"]+['\"]\\s*(?:===|!==|==|!=)\\s*(?:Build\\s*\\.\\s*(?:MANUFACTURER|MODEL)|\\b(?:manufacturer|model)\\b)" \
   --glob '*.kt' --glob '*.java' app/src/main
 
-reject_pattern \
-  "blocking Thread.sleep" \
-  '\bThread\s*\.\s*sleep\s*\(' \
-  --glob '*.kt' --glob '*.java' "${KOTLIN_ROOTS[@]}"
-
-reject_pattern \
-  "runBlocking in application source or tests" \
-  '\brunBlocking\s*(?:<[^>]+>)?\s*\(' \
-  --glob '*.kt' --glob '*.java' "${KOTLIN_ROOTS[@]}"
-
-reject_pattern \
-  "global coroutine scope" \
-  '\bGlobalScope\b' \
-  --glob '*.kt' --glob '*.java' "${KOTLIN_ROOTS[@]}"
+reject_pattern "blocking Thread.sleep" '\bThread\s*\.\s*sleep\s*\(' --glob '*.kt' --glob '*.java' "${KOTLIN_ROOTS[@]}"
+reject_pattern "runBlocking in application source or tests" '\brunBlocking\s*(?:<[^>]+>)?\s*\(' --glob '*.kt' --glob '*.java' "${KOTLIN_ROOTS[@]}"
+reject_pattern "global coroutine scope" '\bGlobalScope\b' --glob '*.kt' --glob '*.java' "${KOTLIN_ROOTS[@]}"
 
 reject_pattern \
   "camera open/session API in native metadata discovery" \
@@ -194,6 +165,24 @@ reject_pattern \
   '\bLensCategory\s*\.\s*AUXILIARY\b|\bcategory\s*(?:!=|!==)\s*LensCategory\s*\.\s*[A-Z0-9_]*AUXILIARY\b' \
   --glob '*.kt' --glob '*.java' "${KOTLIN_ROOTS[@]}"
 
+# Phase 1B: profile priority must never derive from numeric/vendor camera IDs.
+reject_pattern \
+  "camera ID based profile priority" \
+  '(?i)(?:discoveredCameraId|openCameraId|streamPhysicalCameraId)[^\n]{0,120}(?:toInt|toLong|priority|score)|(?:priority|score)[^\n]{0,120}(?:discoveredCameraId|openCameraId|streamPhysicalCameraId)' \
+  "${PROFILE_SELECTOR}"
+
+# Phase 1B: the stable optical signature must not contain transport identifiers.
+reject_pattern \
+  "transport ID embedded in stable optical signature" \
+  '(?is)stableOpticalParts\s*\([^)]*\)\s*:\s*String\s*=\s*buildString\s*\{.{0,2200}?\b(?:discoveredCameraId|openCameraId|streamPhysicalCameraId|canonicalRouteId)\b' \
+  --multiline --multiline-dotall "${TOPOLOGY_RESOLVER}"
+
+# Lens switching is local session work; it must never trigger a global camera rediscovery.
+reject_pattern \
+  "global rediscovery during lens switch" \
+  '(?is)fun\s+(?:selectLens|switchFacing)\s*\([^)]*\)\s*\{.{0,1800}?\b(?:normalRescan|deepRescan|reconcile\s*\(|seedPrimaryRoute)\b' \
+  --multiline --multiline-dotall "${VIEW_MODEL}"
+
 require_pattern "runtime coordinator" '\bclass CameraRuntimeCoordinator\b' app/src/main
 require_pattern "discovery coordinator" '\bclass CameraDiscoveryCoordinator\b' app/src/main
 require_pattern "topology repository" '\bclass CameraTopologyRepository\b' app/src/main
@@ -207,6 +196,18 @@ require_pattern "physical-topology backend" '\bobject PhysicalCameraTopologyBack
 require_pattern "advertised NDK backend" '\bclass NativeCameraDiscoveryBackend\b' app/src/main
 require_pattern "deep AUX backend" '\bclass DeepAuxDiscoveryBackend\b' app/src/main
 
+# Phase 1B rigid optical-lens/profile architecture.
+require_pattern "canonical optical lens domain model" '\bdata class CanonicalLens\b' "${TOPOLOGY_MODELS}"
+require_pattern "camera profile domain model" '\bdata class CameraProfile\b' "${TOPOLOGY_MODELS}"
+require_pattern "optical lens signature" '\bdata class OpticalLensSignature\b' "${TOPOLOGY_MODELS}"
+require_pattern "confidence based optical matcher" '\bobject OpticalLensMatcher\b' "${OPTICAL_MATCHER}"
+require_pattern "profile selector" '\bobject CameraProfileSelector\b' "${PROFILE_SELECTOR}"
+require_pattern "bounded profile failover controller" '\bclass FailoverCameraSessionController\b' "${FAILOVER_CONTROLLER}"
+require_pattern "runtime receives profile descriptors" '\bprofileLensDescriptors\s*\(' "${RUNTIME_COORDINATOR}"
+require_pattern "profile-specific trust update" '\bwithProfileTrust\s*\(' app/src/main
+require_pattern "cache schema v2" '\bCACHE_SCHEMA_VERSION\s*=\s*2\b' "${TOPOLOGY_MODELS}"
+require_pattern "topology schema v2" '\bCURRENT_SCHEMA_VERSION\s*=\s*2\b' "${TOPOLOGY_MODELS}"
+
 require_pattern \
   "bounded Java metadata semaphore" \
   '\bmetadataSemaphore\s*=\s*Semaphore\s*\(\s*metadataConcurrencyLimit\s*\)' \
@@ -214,24 +215,11 @@ require_pattern \
 require_pattern \
   "small hard cap on Java metadata concurrency" \
   '(?s)\bmetadataConcurrencyLimit\s*=\s*metadataConcurrency\s*\.\s*coerceIn\s*\(\s*1\s*,\s*DEFAULT_METADATA_CONCURRENCY\s*,?\s*\)' \
-  --multiline --multiline-dotall \
-  "${JAVA_DISCOVERY}"
-require_pattern \
-  "bounded metadata permit acquisition" \
-  '\bmetadataSemaphore\s*\.\s*withPermit\b' \
-  "${JAVA_DISCOVERY}"
-require_pattern \
-  "combined metadata concurrency target of four" \
-  '\bDEFAULT_TOTAL_METADATA_CONCURRENCY\s*=\s*4\b' \
-  "${JAVA_DISCOVERY}"
-require_pattern \
-  "one metadata lane reserved for parallel NDK discovery" \
-  '\bRESERVED_NATIVE_METADATA_CONCURRENCY\s*=\s*1\b' \
-  "${JAVA_DISCOVERY}"
-require_pattern \
-  "session operation mutex" \
-  '\boperationMutex\s*=\s*Mutex\s*\(' \
-  "${SESSION_CONTROLLER}"
+  --multiline --multiline-dotall "${JAVA_DISCOVERY}"
+require_pattern "bounded metadata permit acquisition" '\bmetadataSemaphore\s*\.\s*withPermit\b' "${JAVA_DISCOVERY}"
+require_pattern "combined metadata concurrency target of four" '\bDEFAULT_TOTAL_METADATA_CONCURRENCY\s*=\s*4\b' "${JAVA_DISCOVERY}"
+require_pattern "one metadata lane reserved for parallel NDK discovery" '\bRESERVED_NATIVE_METADATA_CONCURRENCY\s*=\s*1\b' "${JAVA_DISCOVERY}"
+require_pattern "session operation mutex" '\boperationMutex\s*=\s*Mutex\s*\(' "${SESSION_CONTROLLER}"
 require_pattern \
   "camera open serialized by the operation mutex" \
   '(?s)override\s+suspend\s+fun\s+open\s*\([^)]*\)\s*=\s*operationMutex\s*\.\s*withLock' \
