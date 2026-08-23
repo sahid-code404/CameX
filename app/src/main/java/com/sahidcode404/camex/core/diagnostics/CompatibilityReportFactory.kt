@@ -14,6 +14,7 @@ import com.sahidcode404.camex.core.camera.topology.CameraRouteAlias
 import com.sahidcode404.camex.core.camera.topology.CameraRouteFailure
 import com.sahidcode404.camex.core.camera.topology.CameraSessionTrust
 import com.sahidcode404.camex.core.camera.topology.CameraTopology
+import com.sahidcode404.camex.core.camera.topology.OpticalGroupingComparisonRecord
 import com.sahidcode404.camex.core.camera.topology.OpticalLensMatch
 import com.sahidcode404.camex.core.camera.topology.OpticalLensMatcher
 import com.sahidcode404.camex.core.camera.topology.toLensDescriptor
@@ -43,6 +44,7 @@ import com.sahidcode404.camex.core.model.FailureReasonSummaryReport
 import com.sahidcode404.camex.core.model.GraphicsReport
 import com.sahidcode404.camex.core.model.LensDescriptor
 import com.sahidcode404.camex.core.model.LogicalRelationshipReport
+import com.sahidcode404.camex.core.model.OpticalGroupingComparisonReport
 import com.sahidcode404.camex.core.model.RouteTrustReport
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -51,9 +53,10 @@ import java.util.TimeZone
 
 object CompatibilityReportFactory {
     /**
-     * Topology-first schema-v3 export. canonicalLenses[].profiles[] is authoritative; the legacy
-     * cameras[] projection is retained only for older engineering report readers. Export remains
-     * read-only and performs no discovery, probing, validation, camera open, or media access.
+     * Topology-first schema-v4 export. canonicalLenses[].profiles[] is authoritative and
+     * opticalGrouping[] preserves pairwise identity reasoning, including comparisons that did not
+     * merge. Export remains read-only and performs no discovery, probing, validation, camera open,
+     * or media access.
      */
     fun create(
         context: Context,
@@ -69,6 +72,7 @@ object CompatibilityReportFactory {
             compareBy<CameraRoute> { it.lensFingerprint?.value.orEmpty() }
                 .thenBy { it.canonicalRouteId },
         )
+        val groupingReports = topology.groupingComparisons.map(OpticalGroupingComparisonRecord::toReport)
         val lensesByFingerprint = lenses.mapNotNull { lens ->
             lens.fingerprint?.value?.let { it to lens }
         }.toMap()
@@ -80,7 +84,7 @@ object CompatibilityReportFactory {
         val canonicalLensReports = routes.map { route ->
             val lens = route.lensFingerprint?.value?.let(lensesByFingerprint::get)
                 ?: route.toLensDescriptor()
-            route.toCanonicalLensReport(lens)
+            route.toCanonicalLensReport(lens, topology.groupingComparisons)
         }
         val userVisibleRoutes = routes.mapNotNull { route ->
             val lens = route.lensFingerprint?.value?.let(lensesByFingerprint::get)
@@ -136,11 +140,12 @@ object CompatibilityReportFactory {
                 schemaVersion = topology.schemaVersion,
                 routeCount = routes.size,
                 canonicalRouteIds = routes.map { route ->
-                    "cl2_${route.lensFingerprint?.value ?: route.canonicalRouteId}"
+                    "cl3_${route.lensFingerprint?.value ?: route.canonicalRouteId}"
                 },
                 profileCount = routes.sumOf { it.profiles.size },
             ),
             canonicalLenses = canonicalLensReports,
+            opticalGrouping = groupingReports,
             cameras = entries,
             discoveryFailures = javaFailures.map { failure ->
                 DiscoveryFailureReport(
@@ -187,13 +192,24 @@ object CompatibilityReportFactory {
         create(context, topology, discovery, startupTrace, lenses, quirks),
     )
 
-    private fun CameraRoute.toCanonicalLensReport(lens: LensDescriptor): CanonicalLensCompatibilityReport {
+    private fun CameraRoute.toCanonicalLensReport(
+        lens: LensDescriptor,
+        groupingComparisons: List<OpticalGroupingComparisonRecord>,
+    ): CanonicalLensCompatibilityReport {
         val orderedProfiles = profiles.sortedWith(
             compareByDescending<CameraProfile> { CameraProfileSelector.score(it) }
                 .thenBy(CameraProfile::profileFingerprint),
         )
         val preferredId = preferredProfileId ?: orderedProfiles.firstOrNull()?.profileId
+        val canonicalLensId = "cl3_${lens.fingerprint?.value ?: canonicalRouteId}"
         val profileReports = orderedProfiles.mapIndexed { index, profile ->
+            val profileComparisons = groupingComparisons
+                .filter { comparison ->
+                    comparison.leftProfileId == profile.profileId ||
+                        comparison.rightProfileId == profile.profileId
+                }
+                .map(OpticalGroupingComparisonRecord::toReport)
+            val full = profile.fullCapabilities?.capabilities
             CameraProfileCompatibilityReport(
                 profileId = profile.profileId,
                 profileFingerprint = profile.profileFingerprint,
@@ -215,10 +231,23 @@ object CompatibilityReportFactory {
                 previewVerified = profile.sessionTrust == CameraSessionTrust.SESSION_VERIFIED,
                 rawAdvertised = profile.metadata.rawCapabilityAdvertised.name,
                 rawStreamActuallyDeclared = profile.metadata.rawStreamActuallyDeclared.name,
+                assignedCanonicalLensId = canonicalLensId,
+                focalLengthsMm = profile.metadata.focalLengthsMm,
+                fieldOfView = profile.metadata.approximateFieldOfView
+                    ?: full?.let(LensMath::fieldOfView),
+                sensorPhysicalSize = profile.metadata.sensorPhysicalSize ?: full?.sensorPhysicalSize,
+                pixelArraySize = profile.metadata.pixelArraySize ?: full?.pixelArraySize,
+                activeArray = profile.metadata.activeArray ?: full?.activeArray,
+                rawDimensions = profile.metadata.rawSizes,
+                colorFilterArrangement = full?.colorFilterArrangement?.name,
+                sensorOrientationDegrees = profile.metadata.sensorOrientationDegrees
+                    ?: full?.sensorOrientationDegrees,
+                apertures = full?.apertures.orEmpty(),
+                groupingComparisons = profileComparisons,
             )
         }
         return CanonicalLensCompatibilityReport(
-            canonicalLensId = "cl2_${lens.fingerprint?.value ?: canonicalRouteId}",
+            canonicalLensId = canonicalLensId,
             opticalFingerprint = lens.fingerprint,
             facing = lens.facing,
             role = role.name,
@@ -257,6 +286,18 @@ object CompatibilityReportFactory {
             else -> "MIXED_OR_INSUFFICIENT"
         }
     }
+
+    private fun OpticalGroupingComparisonRecord.toReport() = OpticalGroupingComparisonReport(
+        leftProfileId = leftProfileId,
+        rightProfileId = rightProfileId,
+        leftProfileFingerprint = leftProfileFingerprint,
+        rightProfileFingerprint = rightProfileFingerprint,
+        match = match,
+        score = score,
+        evidenceFamilies = evidenceFamilies,
+        positiveReasons = positiveReasons,
+        negativeReasons = negativeReasons,
+    )
 
     private fun CameraEnvironmentFingerprint.toReport(topologySchemaVersion: Int) =
         CameraEnvironmentReport(
