@@ -105,6 +105,10 @@ object TexturePreviewTransform {
         frontFacing: Boolean,
         mirrorHorizontally: Boolean,
     ) {
+        // Camera preview should match the captured sensor orientation. Do not apply a selfie-style
+        // horizontal mirror to the front camera; that was making the live preview disagree with
+        // the saved frame. Keep the argument for compatibility with the controller call site.
+        val effectiveMirror = mirrorHorizontally && !frontFacing
         val transform = calculate(
             viewWidth = textureView.width,
             viewHeight = textureView.height,
@@ -113,7 +117,7 @@ object TexturePreviewTransform {
             sensorOrientationDegrees = sensorOrientationDegrees,
             displayRotationDegrees = displayRotationDegrees,
             frontFacing = frontFacing,
-            mirrorHorizontally = mirrorHorizontally,
+            mirrorHorizontally = effectiveMirror,
         ) ?: return
         textureView.setTransform(transform.toMatrix())
     }
