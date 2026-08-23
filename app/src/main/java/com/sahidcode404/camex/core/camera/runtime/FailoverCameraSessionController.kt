@@ -7,8 +7,9 @@ import com.sahidcode404.camex.core.camera.CameraSessionEvent
 import com.sahidcode404.camex.core.camera.CameraSessionState
 import com.sahidcode404.camex.core.model.LensDescriptor
 import com.sahidcode404.camex.core.model.ProbeFailureKind
-import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -20,76 +21,67 @@ import kotlinx.coroutines.sync.withLock
 /**
  * Profile-aware wrapper around the one authoritative CameraSessionController. It never owns a
  * CameraDevice itself. All profiles for one optical lens share the same optical fingerprint.
- * Structural failure rotates through each credible profile at most once; transient failures do
- * not cause a route storm. Recoverable-error UI is suppressed only while a structural failover is
- * actually available.
+ * Structural failure rotates through each credible profile at most once per explicit selection;
+ * transient failures never cause a sibling-profile sweep.
  */
 class FailoverCameraSessionController(
     private val delegate: CameraSessionController,
     private val scope: CoroutineScope,
 ) : CameraSessionController {
+    private data class SelectionAttempt(
+        val generation: Long,
+        val opticalFingerprint: String,
+        val attemptedRoutingKeys: LinkedHashSet<String>,
+        var activeRoutingKey: String,
+        var completed: Boolean = false,
+    )
+
     private val failoverMutex = Mutex()
-    private val currentOpticalFingerprint = AtomicReference<String?>(null)
+    private val attemptLock = Any()
+    private val closed = AtomicBoolean(false)
     private val mutableState = MutableStateFlow(delegate.state.value)
+
+    @Volatile
     private var availableProfiles: List<LensDescriptor> = emptyList()
-    private val attemptedByOpticalFingerprint = linkedMapOf<String, LinkedHashSet<String>>()
+
+    private var selectionGeneration = 0L
+    private var activeAttempt: SelectionAttempt? = null
 
     override val state: StateFlow<CameraSessionState> = mutableState.asStateFlow()
     override val snapshot: StateFlow<CameraRuntimeSnapshot> = delegate.snapshot
     override val sessionEvents: SharedFlow<CameraSessionEvent> = delegate.sessionEvents
 
     init {
-        scope.launch {
+        // Register synchronously before the wrapper constructor returns. A Camera2 delegate can
+        // publish state/events immediately after the first open; missing that first structural
+        // failure would leave failover stuck on profile A.
+        scope.launch(start = CoroutineStart.UNDISPATCHED) {
             delegate.state.collect { value ->
-                mutableState.value = if (
-                    value is CameraSessionState.ErrorRecoverable &&
-                    value.error.kind.isStructuralProfileFailure() &&
-                    hasUntriedAlternative(value.error.routingKey)
-                ) {
-                    val from = value.error.routingKey
-                    val to = nextAlternative(from)?.identity?.routingKey ?: from.orEmpty()
-                    CameraSessionState.Switching(from, to)
-                } else {
-                    value
-                }
+                mutableState.value = projectDelegateState(value)
             }
         }
-        scope.launch {
+        scope.launch(start = CoroutineStart.UNDISPATCHED) {
             delegate.sessionEvents.collect { event ->
-                when (event) {
-                    is CameraSessionEvent.PreviewVerified -> {
-                        profileForRoutingKey(event.routingKey)?.fingerprint?.value?.let { fingerprint ->
-                            attemptedByOpticalFingerprint.remove(fingerprint)
-                            currentOpticalFingerprint.set(fingerprint)
-                        }
-                    }
-                    is CameraSessionEvent.PreviewFailed -> if (event.structural) {
-                        failoverMutex.withLock { failOverAfter(event.routingKey) }
-                    }
-                    is CameraSessionEvent.CameraOpened,
-                    is CameraSessionEvent.SessionConfigured,
-                    -> Unit
-                }
+                handleDelegateEvent(event)
             }
         }
     }
 
     override suspend fun updateAvailableLenses(lenses: List<LensDescriptor>) {
-        // Runtime supplies profiles in CameraProfileSelector order. Preserve that ranking exactly;
-        // it is the authoritative failover order and does not depend on numeric camera IDs.
-        availableProfiles = lenses.distinctBy { it.identity.routingKey }
-        delegate.updateAvailableLenses(availableProfiles)
+        failoverMutex.withLock {
+            // Runtime supplies exact CameraProfile descriptors in CameraProfileSelector order.
+            // Preserve that ranking exactly; numeric camera IDs never decide failover priority.
+            val rankedProfiles = lenses.distinctBy { it.identity.routingKey }
+            availableProfiles = rankedProfiles
+            delegate.updateAvailableLenses(rankedProfiles)
+        }
     }
 
     override suspend fun clearTransientFailureMemory(routingKey: String?) {
+        // Delegate retry memory and this wrapper's per-selection attempt set are different things.
+        // Clearing transient memory must never make an already-attempted structural profile eligible
+        // again inside the same explicit selection generation.
         delegate.clearTransientFailureMemory(routingKey)
-        if (routingKey == null) {
-            attemptedByOpticalFingerprint.clear()
-        } else {
-            profileForRoutingKey(routingKey)?.let { profile ->
-                attemptedByOpticalFingerprint[opticalKey(profile)]?.remove(routingKey)
-            }
-        }
     }
 
     override suspend fun bindPreview(textureView: TextureView) {
@@ -97,6 +89,7 @@ class FailoverCameraSessionController(
     }
 
     override suspend fun unbindPreview() {
+        completeActiveAttempt()
         delegate.unbindPreview()
     }
 
@@ -109,6 +102,7 @@ class FailoverCameraSessionController(
     }
 
     override suspend fun pause() {
+        completeActiveAttempt()
         delegate.pause()
     }
 
@@ -117,69 +111,167 @@ class FailoverCameraSessionController(
     }
 
     override fun close() {
-        delegate.close()
+        if (closed.compareAndSet(false, true)) {
+            completeActiveAttempt()
+            delegate.close()
+        }
     }
 
+    /** Every public open/switch starts one new bounded failover generation. */
     private suspend fun selectAndOpen(lens: LensDescriptor) = failoverMutex.withLock {
-        val fingerprint = opticalKey(lens)
-        currentOpticalFingerprint.set(fingerprint)
-        attemptedByOpticalFingerprint[fingerprint] = linkedSetOf()
+        if (closed.get()) return@withLock
 
-        // UI consumes one canonical lens descriptor, whose routing key mirrors the preferred
-        // profile. Always replace it with the exact stored profile descriptor before opening so a
-        // profile never inherits merged stream/capability metadata from a sibling alias.
-        val exactPreferred = profileForRoutingKey(lens.identity.routingKey)
-        val candidate = exactPreferred
+        val fingerprint = opticalKey(lens)
+        // UI consumes one canonical lens descriptor whose route mirrors the preferred profile.
+        // Replace it with the exact stored profile descriptor before opening so merged canonical
+        // stream metadata can never leak into the selected transport profile.
+        val candidate = profileForRoutingKey(lens.identity.routingKey)
             ?: availableProfiles.firstOrNull { opticalKey(it) == fingerprint }
             ?: lens
-        openCandidate(candidate, fingerprint)
+        val generation = synchronized(attemptLock) {
+            selectionGeneration += 1L
+            activeAttempt = SelectionAttempt(
+                generation = selectionGeneration,
+                opticalFingerprint = fingerprint,
+                attemptedRoutingKeys = linkedSetOf(candidate.identity.routingKey),
+                activeRoutingKey = candidate.identity.routingKey,
+            )
+            selectionGeneration
+        }
+
+        openCandidate(candidate, generation)
     }
 
-    private suspend fun failOverAfter(failedRoutingKey: String) {
-        val failed = profileForRoutingKey(failedRoutingKey) ?: run {
-            mutableState.value = delegate.state.value
+    private suspend fun handleDelegateEvent(event: CameraSessionEvent) {
+        if (closed.get()) return
+        when (event) {
+            is CameraSessionEvent.PreviewVerified -> {
+                val matched = synchronized(attemptLock) {
+                    val attempt = activeAttempt
+                    if (attempt != null && !attempt.completed &&
+                        attempt.activeRoutingKey == event.routingKey
+                    ) {
+                        attempt.completed = true
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (matched) mutableState.value = projectDelegateState(delegate.state.value)
+            }
+
+            is CameraSessionEvent.PreviewFailed -> {
+                if (event.structural && event.kind.isStructuralProfileFailure()) {
+                    failoverMutex.withLock { failOverAfter(event) }
+                } else {
+                    // A transient/service/lifecycle failure ends this automatic profile-selection
+                    // attempt without poisoning siblings. Recovery may start a new explicit attempt.
+                    val matched = synchronized(attemptLock) {
+                        val attempt = activeAttempt
+                        if (attempt != null && !attempt.completed &&
+                            attempt.activeRoutingKey == event.routingKey
+                        ) {
+                            attempt.completed = true
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    if (matched) mutableState.value = projectDelegateState(delegate.state.value)
+                }
+            }
+
+            is CameraSessionEvent.CameraOpened,
+            is CameraSessionEvent.SessionConfigured,
+            -> Unit
+        }
+    }
+
+    private suspend fun failOverAfter(event: CameraSessionEvent.PreviewFailed) {
+        if (closed.get()) return
+
+        // Events carry a routing key but not a generation token. Requiring the delegate's current
+        // observable state to still be the matching structural error prevents a delayed event from
+        // an older selection from mutating a newer successful/opening attempt, even when the same
+        // routing key is selected again.
+        val delegateError = delegate.state.value as? CameraSessionState.ErrorRecoverable ?: return
+        if (delegateError.error.routingKey != event.routingKey || delegateError.error.kind != event.kind) {
             return
         }
-        val fingerprint = opticalKey(failed)
-        currentOpticalFingerprint.set(fingerprint)
-        attemptedByOpticalFingerprint.getOrPut(fingerprint, ::linkedSetOf).add(failedRoutingKey)
-        val next = nextAlternative(failedRoutingKey)
+
+        val attempt = synchronized(attemptLock) {
+            activeAttempt?.takeIf {
+                !it.completed && it.activeRoutingKey == event.routingKey
+            }
+        } ?: return
+
+        val next = synchronized(attemptLock) { nextAlternative(attempt) }
         if (next == null) {
-            // Every credible profile for this optical lens has been attempted. Only now expose the
-            // delegate's recoverable error to normal camera UI.
+            synchronized(attemptLock) {
+                if (activeAttempt?.generation == attempt.generation) attempt.completed = true
+            }
+            // Only after every credible sibling has been attempted may the structural error reach
+            // normal camera UI. Persistent per-profile trust is updated by CameraRuntimeCoordinator.
             mutableState.value = delegate.state.value
             return
         }
-        openCandidate(next, fingerprint)
+
+        synchronized(attemptLock) {
+            val current = activeAttempt
+            if (current?.generation != attempt.generation || current.completed) return
+            current.attemptedRoutingKeys += next.identity.routingKey
+            current.activeRoutingKey = next.identity.routingKey
+        }
+        openCandidate(next, attempt.generation)
     }
 
-    private suspend fun openCandidate(lens: LensDescriptor, fingerprint: String) {
-        attemptedByOpticalFingerprint.getOrPut(fingerprint, ::linkedSetOf)
-            .add(lens.identity.routingKey)
+    private suspend fun openCandidate(lens: LensDescriptor, generation: Long) {
+        val stillCurrent = synchronized(attemptLock) {
+            val attempt = activeAttempt
+            attempt != null && !attempt.completed && attempt.generation == generation &&
+                attempt.activeRoutingKey == lens.identity.routingKey
+        }
+        if (!stillCurrent || closed.get()) return
+
         delegate.open(lens)
-        val state = delegate.state.value
-        if (state is CameraSessionState.ErrorRecoverable &&
-            state.error.kind.isStructuralProfileFailure() &&
-            !hasUntriedAlternative(state.error.routingKey)
-        ) {
-            mutableState.value = state
+        // Keep transient errors immediately visible and structural errors suppressed as Switching
+        // only while this same generation has an untried sibling profile.
+        mutableState.value = projectDelegateState(delegate.state.value)
+    }
+
+    private fun projectDelegateState(value: CameraSessionState): CameraSessionState {
+        if (value !is CameraSessionState.ErrorRecoverable ||
+            !value.error.kind.isStructuralProfileFailure()
+        ) return value
+
+        val next = synchronized(attemptLock) {
+            val attempt = activeAttempt
+            if (attempt == null || attempt.completed ||
+                attempt.activeRoutingKey != value.error.routingKey
+            ) {
+                null
+            } else {
+                nextAlternative(attempt)
+            }
+        }
+        return next?.let {
+            CameraSessionState.Switching(value.error.routingKey, it.identity.routingKey)
+        } ?: value
+    }
+
+    /** Caller holds [attemptLock]. */
+    private fun nextAlternative(attempt: SelectionAttempt): LensDescriptor? = availableProfiles
+        .asSequence()
+        .filter { opticalKey(it) == attempt.opticalFingerprint }
+        .filter { it.usability.isSelectable }
+        .filterNot { it.identity.routingKey in attempt.attemptedRoutingKeys }
+        .firstOrNull()
+
+    private fun completeActiveAttempt() {
+        synchronized(attemptLock) {
+            activeAttempt?.completed = true
         }
     }
-
-    private fun nextAlternative(failedRoutingKey: String?): LensDescriptor? {
-        val current = failedRoutingKey?.let(::profileForRoutingKey)
-        val fingerprint = current?.let(::opticalKey) ?: currentOpticalFingerprint.get() ?: return null
-        val attempted = attemptedByOpticalFingerprint.getOrPut(fingerprint, ::linkedSetOf)
-        return availableProfiles
-            .asSequence()
-            .filter { opticalKey(it) == fingerprint }
-            .filter { it.usability.isSelectable }
-            .filterNot { it.identity.routingKey in attempted }
-            .firstOrNull()
-    }
-
-    private fun hasUntriedAlternative(failedRoutingKey: String?): Boolean =
-        nextAlternative(failedRoutingKey) != null
 
     private fun profileForRoutingKey(routingKey: String): LensDescriptor? =
         availableProfiles.firstOrNull { it.identity.routingKey == routingKey }
