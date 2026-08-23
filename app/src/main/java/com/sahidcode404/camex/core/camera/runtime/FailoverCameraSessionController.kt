@@ -75,12 +75,21 @@ class FailoverCameraSessionController(
     }
 
     override suspend fun updateAvailableLenses(lenses: List<LensDescriptor>) {
+        // Runtime supplies profiles in CameraProfileSelector order. Preserve that ranking exactly;
+        // it is the authoritative failover order and does not depend on numeric camera IDs.
         availableProfiles = lenses.distinctBy { it.identity.routingKey }
         delegate.updateAvailableLenses(availableProfiles)
     }
 
     override suspend fun clearTransientFailureMemory(routingKey: String?) {
         delegate.clearTransientFailureMemory(routingKey)
+        if (routingKey == null) {
+            attemptedByOpticalFingerprint.clear()
+        } else {
+            profileForRoutingKey(routingKey)?.let { profile ->
+                attemptedByOpticalFingerprint[opticalKey(profile)]?.remove(routingKey)
+            }
+        }
     }
 
     override suspend fun bindPreview(textureView: TextureView) {
@@ -115,7 +124,15 @@ class FailoverCameraSessionController(
         val fingerprint = opticalKey(lens)
         currentOpticalFingerprint.set(fingerprint)
         attemptedByOpticalFingerprint[fingerprint] = linkedSetOf()
-        openCandidate(lens, fingerprint)
+
+        // UI consumes one canonical lens descriptor, whose routing key mirrors the preferred
+        // profile. Always replace it with the exact stored profile descriptor before opening so a
+        // profile never inherits merged stream/capability metadata from a sibling alias.
+        val exactPreferred = profileForRoutingKey(lens.identity.routingKey)
+        val candidate = exactPreferred
+            ?: availableProfiles.firstOrNull { opticalKey(it) == fingerprint }
+            ?: lens
+        openCandidate(candidate, fingerprint)
     }
 
     private suspend fun failOverAfter(failedRoutingKey: String) {
