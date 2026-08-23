@@ -89,6 +89,7 @@ class CameraRuntimeCoordinator(
 
     init {
         RawCaptureRegistry.initialize(context)
+        RawCaptureRegistry.installCaptureOrchestrator { captureRaw() }
         scope.launch {
             mutableActiveSelection.collect { selection ->
                 if (selection?.verified == true) {
@@ -207,7 +208,7 @@ class CameraRuntimeCoordinator(
     suspend fun captureRaw(): RawCaptureResult {
         val initialSelection = mutableActiveSelection.value
         if (initialSelection?.verified != true) {
-            return RawCaptureRegistry.captureCurrent()
+            return RawCaptureRegistry.captureCurrentDirect()
         }
 
         val generation = initialSelection.selectionGeneration
@@ -333,6 +334,7 @@ class CameraRuntimeCoordinator(
     override fun close() {
         selectionIntentEpoch.incrementAndGet()
         reconciliationJob?.cancel()
+        RawCaptureRegistry.clearCaptureOrchestrator()
         RawCaptureRegistry.invalidateSelection()
         session.close()
     }
