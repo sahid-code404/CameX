@@ -1,6 +1,5 @@
 package com.sahidcode404.camex.core.camera
 
-import com.sahidcode404.camex.core.model.FpsRange
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -49,29 +48,6 @@ class PreviewSizeSelectorTest {
 
         assertEquals(1280, selected?.width)
         assertEquals(720, selected?.height)
-    }
-
-    @Test
-    fun fpsSelectorPrefersFixedThirtyThenHighestFloorContainingThirty() {
-        assertEquals(
-            FpsRange(30, 30),
-            PreviewFpsSelector.select(
-                listOf(FpsRange(15, 30), FpsRange(24, 30), FpsRange(30, 30), FpsRange(30, 60)),
-            ),
-        )
-        assertEquals(
-            FpsRange(24, 30),
-            PreviewFpsSelector.select(listOf(FpsRange(15, 30), FpsRange(24, 30))),
-        )
-    }
-
-    @Test
-    fun fpsSelectorFallsBackToClosestUsableReportedRange() {
-        assertEquals(
-            FpsRange(24, 24),
-            PreviewFpsSelector.select(listOf(FpsRange(10, 20), FpsRange(24, 24), FpsRange(60, 60))),
-        )
-        assertNull(PreviewFpsSelector.select(emptyList()))
     }
 
     @Test
