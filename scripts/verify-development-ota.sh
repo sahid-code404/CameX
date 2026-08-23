@@ -81,9 +81,26 @@ require_literal "12-hour automatic checker" '12L * 60L * 60L * 1000L' "$AUTO_CHE
 require_literal "automatic check persistence" 'last_check_ms' "$AUTO_CHECKER"
 require_literal "automatic check on app open" 'updateViewModel.checkForUpdatesIfDue()' "$MAIN_ACTIVITY"
 
-require_literal "tag push trigger" "tags: [ 'v*' ]" "$RELEASE_WORKFLOW"
+trigger_block="$(sed -n '/^on:/,/^permissions:/p' "$RELEASE_WORKFLOW" | sed '$d' | sed '/^[[:space:]]*$/d')"
+expected_trigger_block="$(cat <<'EOF'
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - 'ota-release/v*'
+EOF
+)"
+if [[ "$trigger_block" != "$expected_trigger_block" ]]; then
+  echo 'OTA simplification violation: release workflow trigger must be exactly v* tags plus ota-release/v* branches' >&2
+  failures=$((failures + 1))
+fi
+
 require_literal "release contents permission" 'contents: write' "$RELEASE_WORKFLOW"
 require_literal "run-number versionCode" 'VERSION_CODE="${GITHUB_RUN_NUMBER}"' "$RELEASE_WORKFLOW"
+require_literal "normal tag derivation" 'refs/tags/v*)' "$RELEASE_WORKFLOW"
+require_literal "AI branch derivation" 'refs/heads/ota-release/v*)' "$RELEASE_WORKFLOW"
+require_literal "AI branch strips trigger prefix" 'RELEASE_TAG="${GITHUB_REF#refs/heads/ota-release/}"' "$RELEASE_WORKFLOW"
 require_literal "generic keystore secret" 'secrets.ANDROID_KEYSTORE_BASE64' "$RELEASE_WORKFLOW"
 require_literal "generic keystore password" 'secrets.ANDROID_KEYSTORE_PASSWORD' "$RELEASE_WORKFLOW"
 require_literal "generic key alias" 'secrets.ANDROID_KEY_ALIAS' "$RELEASE_WORKFLOW"
@@ -93,8 +110,11 @@ require_literal "signed APK verification" 'apksigner' "$RELEASE_WORKFLOW"
 require_literal "package verification" 'com.sahidcode404.camex' "$RELEASE_WORKFLOW"
 require_literal "release APK naming" 'Camera-${VERSION_NAME}.apk' "$RELEASE_WORKFLOW"
 require_literal "release manifest" 'release-manifest.json' "$RELEASE_WORKFLOW"
-require_literal "GitHub release creation" 'gh release create' "$RELEASE_WORKFLOW"
+require_literal "existing release guard" 'gh release view "$RELEASE_TAG"' "$RELEASE_WORKFLOW"
+require_literal "GitHub release creation" 'gh release create "$RELEASE_TAG"' "$RELEASE_WORKFLOW"
+require_literal "exact release target" '--target "$GITHUB_SHA"' "$RELEASE_WORKFLOW"
 
+reject_literal "tag verification blocks automatic tag creation" '--verify-tag' "$RELEASE_WORKFLOW"
 reject_literal "manual workflow dispatch" 'workflow_dispatch:' "$RELEASE_WORKFLOW"
 reject_literal "semver versionCode allocator" '1000000' "$RELEASE_WORKFLOW"
 reject_literal "historical version scan" 'max_existing' "$RELEASE_WORKFLOW"
