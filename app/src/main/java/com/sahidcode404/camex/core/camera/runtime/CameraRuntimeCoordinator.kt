@@ -46,6 +46,7 @@ sealed interface CameraRuntimePhase {
 /**
  * Application-camera orchestrator. Discovery owns topology and the wrapped session controller owns
  * all CameraDevice/session work. Phase 1B adds profile failover without adding another camera owner.
+ * Verified active selection is tracked here so UI never has to guess facing from list order.
  */
 class CameraRuntimeCoordinator(
     context: Context,
@@ -57,9 +58,12 @@ class CameraRuntimeCoordinator(
     ),
 ) : Closeable {
     private val startMutex = Mutex()
+    private val selectionRequestMutex = Mutex()
+    private val selectionTracker = ActiveCameraSelectionTracker()
     private val mutablePhase = MutableStateFlow<CameraRuntimePhase>(
         CameraRuntimePhase.BootstrappingCache,
     )
+    private val mutableActiveSelection = MutableStateFlow<ActiveCameraSelection?>(null)
     private var reconciliationJob: Job? = null
     private var permissionGranted = false
     private var preferredRearFingerprint: String? = null
@@ -67,6 +71,7 @@ class CameraRuntimeCoordinator(
 
     val phase: StateFlow<CameraRuntimePhase> = mutablePhase.asStateFlow()
     val topology: StateFlow<CameraTopology> = discovery.topologyRepository.topology
+    val activeSelection: StateFlow<ActiveCameraSelection?> = mutableActiveSelection.asStateFlow()
 
     init {
         scope.launch {
@@ -75,18 +80,33 @@ class CameraRuntimeCoordinator(
                 // profiles belonging to one optical lens share one optical fingerprint.
                 val lenses = value.toProfileLenses()
                 session.updateAvailableLenses(lenses)
+                mutableActiveSelection.value = selectionTracker.reconcile(
+                    sessionState = session.state.value,
+                    sessionSnapshot = session.snapshot.value,
+                    topology = value,
+                )
                 if (value.routes.isNotEmpty()) {
                     discovery.startupTrace.mark(CameraStartupMilestone.UI_LENS_LIST_READY)
                 }
             }
         }
         scope.launch { session.sessionEvents.collect(::handleSessionEvent) }
+        scope.launch {
+            session.state.collect { state ->
+                mutableActiveSelection.value = selectionTracker.updateSessionState(state)
+            }
+        }
     }
 
     suspend fun bootstrapCache(): CameraTopology {
         mutablePhase.value = CameraRuntimePhase.BootstrappingCache
         val topology = discovery.bootstrapCache()
         session.updateAvailableLenses(topology.toProfileLenses())
+        mutableActiveSelection.value = selectionTracker.reconcile(
+            sessionState = session.state.value,
+            sessionSnapshot = session.snapshot.value,
+            topology = topology,
+        )
         mutablePhase.value = CameraRuntimePhase.CacheReady(
             routeCount = topology.routes.size,
             hit = discovery.snapshot.value.cacheHit,
@@ -139,6 +159,12 @@ class CameraRuntimeCoordinator(
                 )
             }
         }
+    }
+
+    /** Explicit canonical-lens request. Automatic sibling-profile failover remains one generation. */
+    suspend fun selectLens(lens: LensDescriptor) = selectionRequestMutex.withLock {
+        selectionTracker.beginSelection(lens)
+        session.switchTo(lens)
     }
 
     suspend fun normalRescan() {
@@ -205,7 +231,8 @@ class CameraRuntimeCoordinator(
         session.close()
     }
 
-    private suspend fun openPrimary(lens: LensDescriptor) {
+    private suspend fun openPrimary(lens: LensDescriptor) = selectionRequestMutex.withLock {
+        selectionTracker.beginSelection(lens)
         discovery.startupTrace.mark(CameraStartupMilestone.PRIMARY_ROUTE_READY)
         mutablePhase.value = CameraRuntimePhase.OpeningPrimary(lens.identity.routingKey)
         discovery.startupTrace.mark(CameraStartupMilestone.CAMERA_OPEN_REQUESTED)
@@ -234,8 +261,12 @@ class CameraRuntimeCoordinator(
     private suspend fun reopenSelectedAfterRecoverableFailure() {
         if (!permissionGranted || session.state.value !is CameraSessionState.ErrorRecoverable) return
         val key = session.snapshot.value.selectedRoutingKey ?: return
-        session.snapshot.value.lenses.firstOrNull { it.identity.routingKey == key }?.let {
-            session.open(it)
+        val selected = session.snapshot.value.lenses
+            .firstOrNull { it.identity.routingKey == key }
+            ?: return
+        selectionRequestMutex.withLock {
+            selectionTracker.beginSelection(selected)
+            session.open(selected)
         }
     }
 
@@ -248,6 +279,12 @@ class CameraRuntimeCoordinator(
             is CameraSessionEvent.PreviewVerified -> {
                 discovery.startupTrace.mark(CameraStartupMilestone.FIRST_PREVIEW_FRAME)
                 mutablePhase.value = CameraRuntimePhase.Previewing(event.routingKey)
+                mutableActiveSelection.value = selectionTracker.previewVerified(
+                    routingKey = event.routingKey,
+                    sessionState = session.state.value,
+                    sessionSnapshot = session.snapshot.value,
+                    topology = topology.value,
+                )
                 routeForRoutingKey(event.routingKey)?.let { route ->
                     CameraRouteValidator.observation(route, event)?.let { observation ->
                         discovery.recordTrust(route.canonicalRouteId, observation)
