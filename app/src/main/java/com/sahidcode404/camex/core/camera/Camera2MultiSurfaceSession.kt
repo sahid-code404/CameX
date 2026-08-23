@@ -6,6 +6,7 @@ import android.hardware.camera2.params.OutputConfiguration
 import android.os.Build
 import android.os.Handler
 import android.view.Surface
+import androidx.annotation.RequiresApi
 import com.sahidcode404.camex.core.model.ProbeFailureKind
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -73,20 +74,17 @@ internal suspend fun CameraDevice.awaitCaptureSession(
 
         try {
             val usesPhysicalRouting = outputs.any { it.physicalCameraId != null }
-            if (usesPhysicalRouting && Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
-                fail(
-                    CameraOperationException(
-                        ProbeFailureKind.SESSION_CONFIGURATION,
-                        "Physical output routing requires API 28",
-                    ),
-                )
-            } else if (usesPhysicalRouting) {
-                val configurations = outputs.map { output ->
-                    OutputConfiguration(output.surface).apply {
-                        output.physicalCameraId?.let(::setPhysicalCameraId)
-                    }
+            if (usesPhysicalRouting) {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+                    fail(
+                        CameraOperationException(
+                            ProbeFailureKind.SESSION_CONFIGURATION,
+                            "Physical output routing requires API 28",
+                        ),
+                    )
+                } else {
+                    createPhysicalCaptureSession(outputs, callback, handler)
                 }
-                createCaptureSessionByOutputConfigurations(configurations, callback, handler)
             } else {
                 createCaptureSession(outputs.map { it.surface }, callback, handler)
             }
@@ -95,4 +93,18 @@ internal suspend fun CameraDevice.awaitCaptureSession(
             fail(error.toCameraOperationException(ProbeFailureKind.SESSION_CONFIGURATION))
         }
     }
+}
+
+@RequiresApi(Build.VERSION_CODES.P)
+private fun CameraDevice.createPhysicalCaptureSession(
+    outputs: List<CameraSessionOutput>,
+    callback: CameraCaptureSession.StateCallback,
+    handler: Handler,
+) {
+    val configurations = outputs.map { output ->
+        OutputConfiguration(output.surface).apply {
+            output.physicalCameraId?.let(::setPhysicalCameraId)
+        }
+    }
+    createCaptureSessionByOutputConfigurations(configurations, callback, handler)
 }
