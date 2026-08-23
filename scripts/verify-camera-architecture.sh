@@ -8,6 +8,87 @@ cd "${REPOSITORY_ROOT}"
 
 failures=0
 
+if command -v rg >/dev/null 2>&1; then
+  readonly SEARCH_BACKEND="rg"
+elif printf 'camex\n' | grep -Pq 'camex' >/dev/null 2>&1; then
+  readonly SEARCH_BACKEND="grep"
+else
+  echo "Camera architecture verification requires either ripgrep (rg) or GNU grep with PCRE support." >&2
+  exit 2
+fi
+
+# Run the PCRE searches with ripgrep when available. GitHub-hosted runners do not guarantee rg,
+# so fall back to GNU grep using equivalent recursive/include/multiline behavior.
+search_pattern() {
+  local output_mode="$1"
+  local pattern="$2"
+  shift 2
+
+  if [[ "${SEARCH_BACKEND}" == "rg" ]]; then
+    if [[ "${output_mode}" == "quiet" ]]; then
+      rg --quiet --pcre2 "${pattern}" "$@"
+    else
+      rg --line-number --color never --pcre2 "${pattern}" "$@"
+    fi
+    return $?
+  fi
+
+  local multiline=false
+  local -a includes=()
+  local -a paths=()
+
+  while (($# > 0)); do
+    case "$1" in
+      --glob)
+        if (($# < 2)); then
+          echo "Architecture verifier received --glob without a pattern." >&2
+          return 2
+        fi
+        includes+=("--include=$2")
+        shift 2
+        ;;
+      --multiline|--multiline-dotall)
+        multiline=true
+        shift
+        ;;
+      *)
+        paths+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if ((${#paths[@]} == 0)); then
+    echo "Architecture verifier received no search path." >&2
+    return 2
+  fi
+
+  local -a grep_args=(-r -P --binary-files=without-match)
+  if [[ "${output_mode}" == "quiet" ]]; then
+    grep_args+=(-q)
+  else
+    grep_args+=(-n -H)
+  fi
+  if [[ "${multiline}" == true ]]; then
+    grep_args+=(-z)
+  fi
+
+  if [[ "${output_mode}" == "quiet" ]]; then
+    grep "${grep_args[@]}" "${includes[@]}" -- "${pattern}" "${paths[@]}"
+    return $?
+  fi
+
+  if [[ "${multiline}" == true ]]; then
+    set +e
+    grep "${grep_args[@]}" "${includes[@]}" -- "${pattern}" "${paths[@]}" | tr '\0' '\n'
+    local grep_status=${PIPESTATUS[0]}
+    set -e
+    return "${grep_status}"
+  fi
+
+  grep "${grep_args[@]}" "${includes[@]}" -- "${pattern}" "${paths[@]}"
+}
+
 reject_pattern() {
   local label="$1"
   local pattern="$2"
@@ -16,7 +97,7 @@ reject_pattern() {
   local matches
   local status
   set +e
-  matches="$(rg --line-number --color never --pcre2 "${pattern}" "$@" 2>&1)"
+  matches="$(search_pattern lines "${pattern}" "$@" 2>&1)"
   status=$?
   set -e
 
@@ -43,7 +124,7 @@ require_pattern() {
 
   local status
   set +e
-  rg --quiet --pcre2 "${pattern}" "$@"
+  search_pattern quiet "${pattern}" "$@"
   status=$?
   set -e
 
@@ -69,18 +150,18 @@ readonly SESSION_CONTROLLER=app/src/main/java/com/sahidcode404/camex/core/camera
 
 reject_pattern \
   "numeric Camera2 ID used as a dispatch condition" \
-  "(?i)\b(?:camera|public|physical|logical)[a-z0-9_]*id\b\s*(?:===|!==|==|!=|\.equals\s*\()\s*['\"][0-9]+['\"]|['\"][0-9]+['\"]\s*(?:===|!==|==|!=)\s*\b(?:camera|public|physical|logical)[a-z0-9_]*id\b|\bopenCamera\s*\(\s*['\"][0-9]+['\"]" \
-  --glob '*.kt' --glob '*.java' --glob '*.{cpp,cc,cxx,h,hpp}' \
+  "(?i)\\b(?:camera|public|physical|logical)[a-z0-9_]*id\\b\\s*(?:===|!==|==|!=|\\.equals\\s*\\()\\s*['\"][0-9]+['\"]|['\"][0-9]+['\"]\\s*(?:===|!==|==|!=)\\s*\\b(?:camera|public|physical|logical)[a-z0-9_]*id\\b|\\bopenCamera\\s*\\(\\s*['\"][0-9]+['\"]" \
+  --glob '*.kt' --glob '*.java' --glob '*.cpp' --glob '*.cc' --glob '*.cxx' --glob '*.h' --glob '*.hpp' \
   "${PRODUCTION_ROOTS[@]}"
 
 reject_pattern \
   "numeric Camera2 ID used as a when branch" \
-  "(?is)\bwhen\s*\(\s*[a-z0-9_.]*(?:camera|public|physical|logical)[a-z0-9_]*id\s*\)\s*\{.{0,400}?['\"][0-9]+['\"]\s*->" \
+  "(?is)\\bwhen\\s*\\(\\s*[a-z0-9_.]*(?:camera|public|physical|logical)[a-z0-9_]*id\\s*\\)\\s*\\{.{0,400}?['\"][0-9]+['\"]\\s*->" \
   --multiline --multiline-dotall --glob '*.kt' app/src/main
 
 reject_pattern \
   "manufacturer/model used as a camera dispatch branch" \
-  "(?i)\b(?:if|when)\s*\([^\n)]*(?:Build\s*\.\s*(?:MANUFACTURER|MODEL)|\b(?:manufacturer|model)\b)|(?:Build\s*\.\s*(?:MANUFACTURER|MODEL)|\b(?:manufacturer|model)\b)\s*(?:===|!==|==|!=|\.equals\s*\(|\.contains\s*\(|\.startsWith\s*\()|['\"][^'\"]+['\"]\s*(?:===|!==|==|!=)\s*(?:Build\s*\.\s*(?:MANUFACTURER|MODEL)|\b(?:manufacturer|model)\b)" \
+  "(?i)\\b(?:if|when)\\s*\\([^\\n)]*(?:Build\\s*\\.\\s*(?:MANUFACTURER|MODEL)|\\b(?:manufacturer|model)\\b)|(?:Build\\s*\\.\\s*(?:MANUFACTURER|MODEL)|\\b(?:manufacturer|model)\\b)\\s*(?:===|!==|==|!=|\\.equals\\s*\\(|\\.contains\\s*\\(|\\.startsWith\\s*\\()|['\"][^'\"]+['\"]\\s*(?:===|!==|==|!=)\\s*(?:Build\\s*\\.\\s*(?:MANUFACTURER|MODEL)|\\b(?:manufacturer|model)\\b)" \
   --glob '*.kt' --glob '*.java' app/src/main
 
 reject_pattern \
