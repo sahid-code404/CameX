@@ -47,8 +47,9 @@ data class CameraScreenUiState(
     val statusText: String,
     val lenses: List<LensButtonUiModel> = emptyList(),
     val selectedFingerprint: String? = null,
-    val activeFacing: String = "BACK",
+    val activeFacing: String = "UNKNOWN",
     val switchFacingLabel: String = "Switch",
+    val switchFacingEnabled: Boolean = false,
     val previewVisible: Boolean = false,
     val recoverableError: String? = null,
 )
@@ -72,8 +73,6 @@ fun CameraScreen(
             .fillMaxSize()
             .background(Color.Black),
     ) {
-        // The TextureView must exist before the controller can transition from AwaitingSurface to
-        // Previewing. Status/error UI is layered over it while the first session opens.
         if (state.permissionGranted) {
             previewContent()
         }
@@ -110,6 +109,7 @@ fun CameraScreen(
             lenses = state.lenses,
             selectedFingerprint = state.selectedFingerprint,
             switchFacingLabel = state.switchFacingLabel,
+            switchFacingEnabled = state.switchFacingEnabled,
             onSelectLens = onSelectLens,
             onSwitchFacing = onSwitchFacing,
             modifier = Modifier.align(Alignment.BottomCenter),
@@ -207,6 +207,7 @@ private fun CameraBottomControls(
     lenses: List<LensButtonUiModel>,
     selectedFingerprint: String?,
     switchFacingLabel: String,
+    switchFacingEnabled: Boolean,
     onSelectLens: (String) -> Unit,
     onSwitchFacing: () -> Unit,
     modifier: Modifier = Modifier,
@@ -279,10 +280,13 @@ private fun CameraBottomControls(
                         .background(Color.White.copy(alpha = 0.35f), CircleShape),
                 )
             }
-            TextButton(onClick = onSwitchFacing) {
+            TextButton(
+                enabled = switchFacingEnabled,
+                onClick = onSwitchFacing,
+            ) {
                 Text(
                     text = switchFacingLabel,
-                    color = Color.White,
+                    color = if (switchFacingEnabled) Color.White else Color.White.copy(alpha = 0.45f),
                 )
             }
         }
