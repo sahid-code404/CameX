@@ -94,8 +94,9 @@ class RawDngWriter(context: Context) {
 
     private companion object {
         const val DNG_MIME_TYPE = "image/x-adobe-dng"
-        val FILE_TIME_FORMAT = ThreadLocal.withInitial {
-            SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US)
+        val FILE_TIME_FORMAT = object : ThreadLocal<SimpleDateFormat>() {
+            override fun initialValue(): SimpleDateFormat =
+                SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US)
         }
     }
 }
