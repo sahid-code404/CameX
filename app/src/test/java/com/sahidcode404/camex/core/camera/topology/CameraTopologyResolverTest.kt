@@ -136,13 +136,16 @@ class CameraTopologyResolverTest {
     }
 
     @Test
-    fun `different camera IDs with identical optics are conservatively kept distinct`() {
+    fun `different profile IDs with identical strong optics become one canonical lens`() {
         val sameMetadata = metadata(focal = 4.7, rawSizes = listOf(Size2D(4000, 3000)))
         val topology = resolve(java("2", sameMetadata), java("3", sameMetadata))
 
-        assertEquals(2, topology.routes.size)
-        assertEquals(2, topology.routes.map { it.canonicalRouteId }.distinct().size)
-        assertEquals(2, topology.routes.map { it.lensFingerprint }.distinct().size)
+        assertEquals(1, topology.routes.size)
+        val canonicalLens = topology.routes.single()
+        assertEquals(2, canonicalLens.profiles.size)
+        assertEquals(setOf("2", "3"), canonicalLens.profiles.mapTo(mutableSetOf()) { it.openCameraId })
+        assertEquals(1, topology.canonicalLenses.size)
+        assertEquals(canonicalLens.lensFingerprint, topology.canonicalLenses.single().lensFingerprint)
     }
 
     @Test
