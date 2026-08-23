@@ -72,7 +72,9 @@ object CompatibilityReportFactory {
             compareBy<CameraRoute> { it.lensFingerprint?.value.orEmpty() }
                 .thenBy { it.canonicalRouteId },
         )
-        val groupingReports = topology.groupingComparisons.map(OpticalGroupingComparisonRecord::toReport)
+        val groupingReports = topology.groupingComparisons.map { comparison ->
+            comparison.toReport()
+        }
         val lensesByFingerprint = lenses.mapNotNull { lens ->
             lens.fingerprint?.value?.let { it to lens }
         }.toMap()
@@ -208,7 +210,7 @@ object CompatibilityReportFactory {
                     comparison.leftProfileId == profile.profileId ||
                         comparison.rightProfileId == profile.profileId
                 }
-                .map(OpticalGroupingComparisonRecord::toReport)
+                .map { comparison -> comparison.toReport() }
             val full = profile.fullCapabilities?.capabilities
             CameraProfileCompatibilityReport(
                 profileId = profile.profileId,
