@@ -12,6 +12,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.view.Surface
 import androidx.annotation.RequiresApi
+import com.sahidcode404.camex.core.camera.raw.RawCaptureRegistry
 import com.sahidcode404.camex.core.model.ProbeFailureKind
 import java.io.Closeable
 import java.util.concurrent.atomic.AtomicBoolean
@@ -63,11 +64,12 @@ internal class CaptureSessionLease internal constructor(
     private val closeRequested = AtomicBoolean(false)
 
     override fun close() {
-        if (closeRequested.compareAndSet(false, true)) runCatching {
-            session.stopRepeating()
-        }.also {
-            runCatching { session.abortCaptures() }
-            runCatching { session.close() }
+        if (closeRequested.compareAndSet(false, true)) {
+            RawCaptureRegistry.onSessionClosing(session)
+            runCatching { session.stopRepeating() }.also {
+                runCatching { session.abortCaptures() }
+                runCatching { session.close() }
+            }
         }
     }
 
@@ -150,6 +152,60 @@ internal suspend fun CameraDevice.awaitCaptureSession(
     maximumResolution: Boolean = false,
     handler: Handler,
     timeoutMillis: Long,
+): CaptureSessionLease {
+    if (maximumResolution) {
+        return awaitSingleCaptureSession(
+            surface = surface,
+            physicalCameraId = physicalCameraId,
+            maximumResolution = true,
+            handler = handler,
+            timeoutMillis = timeoutMillis,
+        )
+    }
+
+    val preparedRaw = RawCaptureRegistry.prepareOutput(this, physicalCameraId, handler)
+    if (preparedRaw != null) {
+        try {
+            val lease = awaitCaptureSession(
+                outputs = listOf(
+                    CameraSessionOutput(surface, physicalCameraId),
+                    CameraSessionOutput(preparedRaw.reader.surface, physicalCameraId),
+                ),
+                handler = handler,
+                timeoutMillis = timeoutMillis,
+            )
+            RawCaptureRegistry.attach(preparedRaw, this, lease.session, handler)
+            return lease
+        } catch (timeout: TimeoutCancellationException) {
+            RawCaptureRegistry.combinedSessionRejected(
+                preparedRaw,
+                "Preview + RAW session configuration timed out; preview-only fallback is active",
+            )
+        } catch (cancelled: CancellationException) {
+            runCatching { preparedRaw.reader.close() }
+            throw cancelled
+        } catch (error: Throwable) {
+            if (error is VirtualMachineError || error is ThreadDeath) throw error
+            RawCaptureRegistry.combinedSessionRejected(
+                preparedRaw,
+                "Preview + RAW session unsupported; preview-only fallback is active",
+            )
+        }
+    }
+
+    return awaitCaptureSession(
+        outputs = listOf(CameraSessionOutput(surface, physicalCameraId)),
+        handler = handler,
+        timeoutMillis = timeoutMillis,
+    )
+}
+
+private suspend fun CameraDevice.awaitSingleCaptureSession(
+    surface: Surface,
+    physicalCameraId: String?,
+    maximumResolution: Boolean,
+    handler: Handler,
+    timeoutMillis: Long,
 ): CaptureSessionLease = withTimeout(timeoutMillis) {
     suspendCancellableCoroutine { continuation ->
         val configured = AtomicReference<CameraCaptureSession?>(null)
@@ -161,7 +217,11 @@ internal suspend fun CameraDevice.awaitCaptureSession(
             if (continuation.isActive) continuation.resumeWithException(error)
         }
 
-        val callback = object : CameraCaptureSession.StateCallback() {
+        val callback = object : CameraDevice.StateCallback(), CameraCaptureSession.StateCallback() {
+            override fun onOpened(camera: CameraDevice) = Unit
+            override fun onDisconnected(camera: CameraDevice) = Unit
+            override fun onError(camera: CameraDevice, error: Int) = Unit
+
             override fun onConfigured(session: CameraCaptureSession) {
                 configured.set(session)
                 val lease = CaptureSessionLease(session, closedSignal)
