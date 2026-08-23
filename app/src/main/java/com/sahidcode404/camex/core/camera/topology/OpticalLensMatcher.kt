@@ -16,39 +16,56 @@ enum class OpticalLensMatch {
     CONFLICT,
 }
 
+/** Independent identity families. Correlated observations inside one family count only once. */
+enum class OpticalEvidenceFamily {
+    OPTICAL,
+    SENSOR,
+    GEOMETRY,
+    TOPOLOGY,
+}
+
 data class OpticalLensComparison(
     val match: OpticalLensMatch,
     val score: Int,
+    /** Number of independent evidence families, not raw metadata-field matches. */
     val evidenceCount: Int,
     val reasons: List<String>,
+    val evidenceFamilies: Set<OpticalEvidenceFamily> = emptySet(),
+    val positiveReasons: List<String> = reasons,
+    val negativeReasons: List<String> = emptyList(),
 )
 
 /**
- * Pure metadata matcher used only for optical identity. Camera IDs, route kinds and discovery
- * sources are intentionally absent from the decision: they describe transport/profile endpoints,
- * not physical glass. Strong sensor/optical evidence may therefore group two completely different
- * vendor route IDs into one CanonicalLens.
+ * Conservative optical-identity matcher.
  *
- * Vendor aliases can expose cropped/binned variants, so exact geometry is strong evidence while
- * small numeric tolerances and common integer binning relationships remain conservative. Any
- * authoritative conflict (facing, focal length, sensor geometry, CFA, orientation or FOV) prevents
- * grouping regardless of how similar the transport routes look.
+ * Camera IDs, route kinds and discovery sources never become ordinary optical evidence. The one
+ * exception is an authoritative logical/physical relationship: two profiles explicitly naming the
+ * same physical member of the same logical camera are the same hardware member, while two distinct
+ * physical members of that same logical camera are different hardware members.
+ *
+ * Evidence is scored by family. Pixel array, active array and RAW dimensions are deliberately one
+ * GEOMETRY family, because vendor HALs frequently clone or derive these values together. A normal
+ * cross-route STRONG_MATCH requires a strong optical anchor (focal length or FOV) plus at least one
+ * independent corroborating family. Generic dimensions, facing and orientation can never prove
+ * optical identity by themselves.
  */
 object OpticalLensMatcher {
-    private const val FOCAL_STRONG_RELATIVE_TOLERANCE = 0.015
-    private const val FOCAL_PROBABLE_RELATIVE_TOLERANCE = 0.03
-    private const val FOCAL_CONFLICT_RELATIVE_DELTA = 0.07
-    private const val PHYSICAL_STRONG_RELATIVE_TOLERANCE = 0.02
-    private const val PHYSICAL_PROBABLE_RELATIVE_TOLERANCE = 0.04
-    private const val PHYSICAL_CONFLICT_RELATIVE_DELTA = 0.08
+    // Camera2 reports focal length in millimetres. Keep automatic alias tolerance deliberately
+    // narrow: 4.70 vs 4.72 is strong, while ~3% disagreement is ambiguous and >3.5% conflicts.
+    private const val FOCAL_STRONG_RELATIVE_TOLERANCE = 0.0125
+    private const val FOCAL_PROBABLE_RELATIVE_TOLERANCE = 0.02
+    private const val FOCAL_CONFLICT_RELATIVE_DELTA = 0.035
+
+    private const val PHYSICAL_STRONG_RELATIVE_TOLERANCE = 0.015
+    private const val PHYSICAL_PROBABLE_RELATIVE_TOLERANCE = 0.03
+    private const val PHYSICAL_CONFLICT_RELATIVE_DELTA = 0.06
+
     private const val FOV_STRONG_DEGREES = 2.0
     private const val FOV_PROBABLE_DEGREES = 4.0
-    private const val FOV_CONFLICT_DEGREES = 10.0
+    private const val FOV_CONFLICT_DEGREES = 8.0
+
     private const val APERTURE_STRONG_RELATIVE_TOLERANCE = 0.05
     private const val APERTURE_CONFLICT_RELATIVE_DELTA = 0.20
-    private const val STRONG_SCORE = 75
-    private const val PROBABLE_SCORE = 55
-    private const val MINIMUM_EVIDENCE_COUNT = 4
 
     fun signature(route: CameraRoute): OpticalLensSignature =
         signature(route.minimalMetadata, route.fullCapabilities?.capabilities)
@@ -59,61 +76,93 @@ object OpticalLensMatcher {
     private fun signature(
         metadata: MinimalCameraMetadata,
         capabilities: LensCapabilities?,
-    ): OpticalLensSignature = OpticalLensSignature(
-        facing = metadata.facing,
-        focalLengthMm = metadata.focalLengthsMm
+    ): OpticalLensSignature {
+        val focalValues = metadata.focalLengthsMm
             .filter { it.isFinite() && it > 0.0 }
-            .minOrNull(),
-        sensorPhysicalSize = metadata.sensorPhysicalSize,
-        activeArraySize = metadata.activeArray?.let { rect ->
-            Size2D(rect.right - rect.left, rect.bottom - rect.top).takeIf(Size2D::isValid)
-        },
-        pixelArraySize = metadata.pixelArraySize,
-        rawSizes = metadata.rawSizes.filter(Size2D::isValid).distinct(),
-        colorFilterArrangement = capabilities?.colorFilterArrangement,
-        sensorOrientationDegrees = metadata.sensorOrientationDegrees
-            ?: capabilities?.sensorOrientationDegrees,
-        aperture = capabilities?.apertures.orEmpty()
-            .filter { it.isFinite() && it > 0.0 }
-            .minOrNull(),
-        diagonalFieldOfViewDegrees = metadata.approximateFieldOfView?.diagonalDegrees
-            ?.takeIf { it.isFinite() && it > 0.0 && it < 180.0 },
-    )
+            .distinct()
+            .sorted()
+        return OpticalLensSignature(
+            facing = metadata.facing,
+            // A logical/composite route may advertise multiple focal lengths. Picking the minimum
+            // would incorrectly pretend the route itself is one physical lens, so only a single
+            // unambiguous value becomes a focal identity anchor.
+            focalLengthMm = focalValues.singleOrNull(),
+            sensorPhysicalSize = metadata.sensorPhysicalSize,
+            activeArraySize = metadata.activeArray?.let { rect ->
+                Size2D(rect.right - rect.left, rect.bottom - rect.top).takeIf(Size2D::isValid)
+            },
+            pixelArraySize = metadata.pixelArraySize,
+            rawSizes = metadata.rawSizes.filter(Size2D::isValid).distinct(),
+            colorFilterArrangement = capabilities?.colorFilterArrangement,
+            sensorOrientationDegrees = metadata.sensorOrientationDegrees
+                ?: capabilities?.sensorOrientationDegrees,
+            aperture = capabilities?.apertures.orEmpty()
+                .filter { it.isFinite() && it > 0.0 }
+                .minOrNull(),
+            diagonalFieldOfViewDegrees = metadata.approximateFieldOfView?.diagonalDegrees
+                ?.takeIf { it.isFinite() && it > 0.0 && it < 180.0 },
+        )
+    }
 
-    /** Transport/profile identity is deliberately not consulted here. */
-    fun compare(left: CameraRoute, right: CameraRoute): OpticalLensComparison =
-        compare(signature(left), signature(right))
+    /** Transport/profile identity is deliberately not consulted as ordinary optical evidence. */
+    fun compare(left: CameraRoute, right: CameraRoute): OpticalLensComparison {
+        val optical = compare(signature(left), signature(right))
+        return applyAuthoritativeTopology(
+            optical,
+            left.streamPhysicalCameraId,
+            left.logicalParentCameraId,
+            right.streamPhysicalCameraId,
+            right.logicalParentCameraId,
+        )
+    }
 
-    /** Profile IDs are deliberately not consulted here. */
-    fun compare(left: CameraProfile, right: CameraProfile): OpticalLensComparison =
-        compare(signature(left), signature(right))
+    /** Profile IDs are deliberately not consulted as ordinary optical evidence. */
+    fun compare(left: CameraProfile, right: CameraProfile): OpticalLensComparison {
+        val optical = compare(signature(left), signature(right))
+        return applyAuthoritativeTopology(
+            optical,
+            left.streamPhysicalCameraId,
+            left.logicalParentCameraId,
+            right.streamPhysicalCameraId,
+            right.logicalParentCameraId,
+        )
+    }
 
     fun compare(left: OpticalLensSignature, right: OpticalLensSignature): OpticalLensComparison {
-        val reasons = mutableListOf<String>()
-        var score = 0
-        var evidence = 0
+        val positive = mutableListOf<String>()
+        val negative = mutableListOf<String>()
+        val familyScores = linkedMapOf<OpticalEvidenceFamily, Int>()
+        var strongOpticalAnchor = false
+        var probableOpticalAnchor = false
+        var focalDisagreementBlocksAutomaticMerge = false
 
         if (left.facing != LensFacing.UNKNOWN && right.facing != LensFacing.UNKNOWN) {
             if (left.facing != right.facing) return conflict("different facing")
-            score += 5
-            evidence++
-            reasons += "facing agrees"
+            positive += "facing agrees (context only)"
         }
 
-        compareRelative(
+        val focalRelation = compareRelative(
             left.focalLengthMm,
             right.focalLengthMm,
             FOCAL_STRONG_RELATIVE_TOLERANCE,
             FOCAL_PROBABLE_RELATIVE_TOLERANCE,
             FOCAL_CONFLICT_RELATIVE_DELTA,
-        )?.let { relation ->
-            if (relation.conflict) return conflict("meaningfully different focal length")
-            score += if (relation.strong) 30 else 18
-            evidence++
-            reasons += if (relation.strong) {
-                "focal length strongly agrees"
-            } else {
-                "focal length probably agrees"
+        )
+        when {
+            focalRelation?.conflict == true -> return conflict("meaningfully different focal length")
+            focalRelation?.strong == true -> {
+                familyScores.raise(OpticalEvidenceFamily.OPTICAL, 50)
+                strongOpticalAnchor = true
+                positive += "focal length strongly agrees"
+            }
+            focalRelation != null -> {
+                familyScores.raise(OpticalEvidenceFamily.OPTICAL, 30)
+                probableOpticalAnchor = true
+                positive += "focal length probably agrees"
+            }
+            validPair(left.focalLengthMm, right.focalLengthMm) -> {
+                focalDisagreementBlocksAutomaticMerge = true
+                negative += "focal lengths differ outside alias tolerance"
             }
         }
 
@@ -127,26 +176,35 @@ object OpticalLensMatcher {
                 delta > PHYSICAL_CONFLICT_RELATIVE_DELTA ->
                     return conflict("meaningfully different physical sensor size")
                 delta <= PHYSICAL_STRONG_RELATIVE_TOLERANCE -> {
-                    score += 25
-                    evidence++
-                    reasons += "physical sensor size strongly agrees"
+                    familyScores.raise(OpticalEvidenceFamily.SENSOR, 25)
+                    positive += "physical sensor size strongly agrees"
                 }
                 delta <= PHYSICAL_PROBABLE_RELATIVE_TOLERANCE -> {
-                    score += 14
-                    evidence++
-                    reasons += "physical sensor size probably agrees"
+                    familyScores.raise(OpticalEvidenceFamily.SENSOR, 14)
+                    positive += "physical sensor size probably agrees"
                 }
+                else -> negative += "physical sensor size differs outside corroboration tolerance"
             }
         }
 
+        val leftCfa = knownCfa(left.colorFilterArrangement)
+        val rightCfa = knownCfa(right.colorFilterArrangement)
+        if (leftCfa != null && rightCfa != null) {
+            if (leftCfa != rightCfa) return conflict("different authoritative CFA")
+            familyScores.raise(OpticalEvidenceFamily.SENSOR, 20)
+            positive += "CFA agrees"
+        }
+
+        val geometryReasons = mutableListOf<String>()
+        val geometryNegative = mutableListOf<String>()
+        var geometryScore = 0
+
         geometryEvidence(left.pixelArraySize, right.pixelArraySize)?.let { relation ->
-            if (relation.conflict && leftPhysical == null && rightPhysical == null) {
-                return conflict("different full pixel-array geometry")
-            }
-            if (!relation.conflict) {
-                score += if (relation.strong) 15 else 7
-                evidence++
-                reasons += if (relation.strong) {
+            if (relation.conflict) {
+                geometryNegative += "pixel arrays differ"
+            } else {
+                geometryScore = max(geometryScore, if (relation.strong) 18 else 8)
+                geometryReasons += if (relation.strong) {
                     "pixel array agrees"
                 } else {
                     "pixel array is binning-compatible"
@@ -155,13 +213,11 @@ object OpticalLensMatcher {
         }
 
         geometryEvidence(left.activeArraySize, right.activeArraySize)?.let { relation ->
-            if (relation.conflict && leftPhysical == null && rightPhysical == null) {
-                return conflict("different active-array geometry")
-            }
-            if (!relation.conflict) {
-                score += if (relation.strong) 14 else 6
-                evidence++
-                reasons += if (relation.strong) {
+            if (relation.conflict) {
+                geometryNegative += "active arrays differ"
+            } else {
+                geometryScore = max(geometryScore, if (relation.strong) 18 else 8)
+                geometryReasons += if (relation.strong) {
                     "active array agrees"
                 } else {
                     "active array is crop/binning-compatible"
@@ -176,37 +232,29 @@ object OpticalLensMatcher {
             }
             when {
                 exact -> {
-                    score += 20
-                    evidence++
-                    reasons += "RAW dimensions agree"
+                    geometryScore = max(geometryScore, 18)
+                    geometryReasons += "RAW dimensions agree"
                 }
                 compatible -> {
-                    score += 8
-                    evidence++
-                    reasons += "RAW dimensions are binning-compatible"
+                    geometryScore = max(geometryScore, 8)
+                    geometryReasons += "RAW dimensions are binning-compatible"
                 }
-                leftPhysical == null && rightPhysical == null ->
-                    return conflict("different RAW sensor geometry")
-                else -> reasons += "RAW dimensions differ; stronger physical evidence retained"
+                else -> geometryNegative += "RAW dimensions differ"
             }
         }
-
-        val leftCfa = knownCfa(left.colorFilterArrangement)
-        val rightCfa = knownCfa(right.colorFilterArrangement)
-        if (leftCfa != null && rightCfa != null) {
-            if (leftCfa != rightCfa) return conflict("different authoritative CFA")
-            score += 15
-            evidence++
-            reasons += "CFA agrees"
+        if (geometryScore > 0) {
+            familyScores.raise(OpticalEvidenceFamily.GEOMETRY, geometryScore)
+            // Preserve field-level evidence for diagnostics, but count only one GEOMETRY family.
+            positive += geometryReasons
         }
+        negative += geometryNegative
 
         if (left.sensorOrientationDegrees != null && right.sensorOrientationDegrees != null) {
             if (left.sensorOrientationDegrees != right.sensorOrientationDegrees) {
-                return conflict("different sensor orientation")
+                negative += "sensor orientation differs (context only)"
+            } else {
+                positive += "sensor orientation agrees (context only)"
             }
-            score += 6
-            evidence++
-            reasons += "sensor orientation agrees"
         }
 
         compareRelative(
@@ -217,9 +265,8 @@ object OpticalLensMatcher {
             APERTURE_CONFLICT_RELATIVE_DELTA,
         )?.let { relation ->
             if (relation.conflict) return conflict("meaningfully different aperture")
-            score += if (relation.strong) 7 else 3
-            evidence++
-            reasons += "aperture agrees"
+            familyScores.raise(OpticalEvidenceFamily.OPTICAL, if (relation.strong) 12 else 6)
+            positive += if (relation.strong) "aperture strongly agrees" else "aperture probably agrees"
         }
 
         if (left.diagonalFieldOfViewDegrees != null && right.diagonalFieldOfViewDegrees != null) {
@@ -227,36 +274,83 @@ object OpticalLensMatcher {
             when {
                 delta > FOV_CONFLICT_DEGREES -> return conflict("clearly different field of view")
                 delta <= FOV_STRONG_DEGREES -> {
-                    score += 10
-                    evidence++
-                    reasons += "field of view strongly agrees"
+                    familyScores.raise(OpticalEvidenceFamily.OPTICAL, 42)
+                    strongOpticalAnchor = true
+                    positive += "field of view strongly agrees"
                 }
                 delta <= FOV_PROBABLE_DEGREES -> {
-                    score += 5
-                    evidence++
-                    reasons += "field of view probably agrees"
+                    familyScores.raise(OpticalEvidenceFamily.OPTICAL, 24)
+                    probableOpticalAnchor = true
+                    positive += "field of view probably agrees"
                 }
+                else -> negative += "field of view differs outside alias tolerance"
             }
         }
 
+        val corroboratingFamilies = familyScores.keys - OpticalEvidenceFamily.OPTICAL
+        val score = familyScores.values.sum().coerceAtMost(100)
         val match = when {
-            evidence >= MINIMUM_EVIDENCE_COUNT && score >= STRONG_SCORE ->
-                OpticalLensMatch.STRONG_MATCH
-            evidence >= MINIMUM_EVIDENCE_COUNT && score >= PROBABLE_SCORE ->
+            !focalDisagreementBlocksAutomaticMerge &&
+                strongOpticalAnchor && corroboratingFamilies.isNotEmpty() -> OpticalLensMatch.STRONG_MATCH
+            (strongOpticalAnchor || probableOpticalAnchor) && corroboratingFamilies.isNotEmpty() ->
                 OpticalLensMatch.PROBABLE_MATCH
+            strongOpticalAnchor || probableOpticalAnchor -> OpticalLensMatch.PROBABLE_MATCH
             else -> OpticalLensMatch.INSUFFICIENT_EVIDENCE
         }
-        return OpticalLensComparison(match, score, evidence, reasons)
+        return OpticalLensComparison(
+            match = match,
+            score = score,
+            evidenceCount = familyScores.size,
+            reasons = positive + negative,
+            evidenceFamilies = familyScores.keys.toSet(),
+            positiveReasons = positive,
+            negativeReasons = negative,
+        )
     }
 
     fun shouldGroup(left: CameraRoute, right: CameraRoute): Boolean =
         compare(left, right).match == OpticalLensMatch.STRONG_MATCH
+
+    private fun applyAuthoritativeTopology(
+        base: OpticalLensComparison,
+        leftPhysicalId: String?,
+        leftParentId: String?,
+        rightPhysicalId: String?,
+        rightParentId: String?,
+    ): OpticalLensComparison {
+        val leftPhysical = leftPhysicalId?.trim()?.takeIf(String::isNotEmpty)
+        val rightPhysical = rightPhysicalId?.trim()?.takeIf(String::isNotEmpty)
+        val leftParent = leftParentId?.trim()?.takeIf(String::isNotEmpty)
+        val rightParent = rightParentId?.trim()?.takeIf(String::isNotEmpty)
+        if (leftPhysical == null || rightPhysical == null || leftParent == null || rightParent == null ||
+            leftParent != rightParent
+        ) return base
+
+        if (leftPhysical != rightPhysical) {
+            return conflict("different authoritative physical members of the same logical camera")
+        }
+        if (base.match == OpticalLensMatch.CONFLICT) return base
+
+        val positives = base.positiveReasons + "authoritative topology names the same physical member"
+        val families = base.evidenceFamilies + OpticalEvidenceFamily.TOPOLOGY
+        return base.copy(
+            match = OpticalLensMatch.STRONG_MATCH,
+            score = (base.score + 50).coerceAtMost(100),
+            evidenceCount = families.size,
+            reasons = positives + base.negativeReasons,
+            evidenceFamilies = families,
+            positiveReasons = positives,
+        )
+    }
 
     private fun conflict(reason: String) = OpticalLensComparison(
         OpticalLensMatch.CONFLICT,
         score = Int.MIN_VALUE,
         evidenceCount = 0,
         reasons = listOf(reason),
+        evidenceFamilies = emptySet(),
+        positiveReasons = emptyList(),
+        negativeReasons = listOf(reason),
     )
 
     private fun knownCfa(value: ColorFilterArrangement?): ColorFilterArrangement? =
@@ -269,10 +363,8 @@ object OpticalLensMatcher {
         probableTolerance: Double,
         conflictDelta: Double,
     ): RelativeRelation? {
-        if (left == null || right == null || !left.isFinite() || !right.isFinite() ||
-            left <= 0 || right <= 0
-        ) return null
-        val delta = relativeDelta(left, right)
+        if (!validPair(left, right)) return null
+        val delta = relativeDelta(requireNotNull(left), requireNotNull(right))
         return when {
             delta > conflictDelta -> RelativeRelation(strong = false, conflict = true)
             delta <= strongTolerance -> RelativeRelation(strong = true, conflict = false)
@@ -280,6 +372,9 @@ object OpticalLensMatcher {
             else -> null
         }
     }
+
+    private fun validPair(left: Double?, right: Double?): Boolean =
+        left != null && right != null && left.isFinite() && right.isFinite() && left > 0 && right > 0
 
     private fun geometryEvidence(left: Size2D?, right: Size2D?): RelativeRelation? {
         if (left?.isValid != true || right?.isValid != true) return null
@@ -304,6 +399,13 @@ object OpticalLensMatcher {
 
     private fun relativeDelta(left: Double, right: Double): Double =
         abs(left - right) / max(abs(left), abs(right)).coerceAtLeast(1e-9)
+
+    private fun MutableMap<OpticalEvidenceFamily, Int>.raise(
+        family: OpticalEvidenceFamily,
+        score: Int,
+    ) {
+        this[family] = max(this[family] ?: 0, score)
+    }
 
     private data class RelativeRelation(val strong: Boolean, val conflict: Boolean)
 }
