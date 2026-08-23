@@ -37,10 +37,10 @@ class RawDngWriter(context: Context) {
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
             put(MediaStore.MediaColumns.MIME_TYPE, DNG_MIME_TYPE)
-            put(
-                MediaStore.MediaColumns.RELATIVE_PATH,
-                Environment.DIRECTORY_PICTURES + "/Camera/",
-            )
+            // Use the standard Android camera-roll location so gallery/media apps discover captures
+            // in the same place as normal camera photos instead of a separate Pictures/Camera tree.
+            put(MediaStore.MediaColumns.RELATIVE_PATH, CAMERA_ROLL_RELATIVE_PATH)
+            put(MediaStore.Images.ImageColumns.DATE_TAKEN, nowEpochMs)
             put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
 
@@ -94,6 +94,7 @@ class RawDngWriter(context: Context) {
 
     private companion object {
         const val DNG_MIME_TYPE = "image/x-adobe-dng"
+        val CAMERA_ROLL_RELATIVE_PATH = Environment.DIRECTORY_DCIM + "/Camera/"
         val FILE_TIME_FORMAT = object : ThreadLocal<SimpleDateFormat>() {
             override fun initialValue(): SimpleDateFormat =
                 SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US)
