@@ -25,8 +25,7 @@ class PreviewPreferenceRegistryTest {
     }
 
     @Test
-    fun storedFpsThresholdsDoNotApplyUntilOverrideIsEnabled() {
-        val original = listOf(FpsRange(15, 30), FpsRange(30, 60))
+    fun autoModeLeavesAeFpsUnconstrainedEvenWhenThresholdsAreStored() {
         PreviewPreferenceRegistry.replace(
             listOf(
                 LensPreferenceRecord(
@@ -39,11 +38,13 @@ class PreviewPreferenceRegistryTest {
             ),
         )
 
-        val projected = PreviewPreferenceRegistry.projectForSession(lens(*original.toTypedArray()))
+        val projected = PreviewPreferenceRegistry.projectForSession(
+            lens(FpsRange(15, 30), FpsRange(30, 60), FpsRange(60, 60)),
+        )
 
         assertFalse(PreviewPreferenceRegistry.fpsOverrideEnabled.value)
         assertEquals(FpsRange(20, 50), PreviewPreferenceRegistry.globalFpsRange.value)
-        assertEquals(original, projected.capabilities.previewFpsRanges)
+        assertTrue(projected.capabilities.previewFpsRanges.orEmpty().isEmpty())
     }
 
     @Test
@@ -69,8 +70,7 @@ class PreviewPreferenceRegistryTest {
     }
 
     @Test
-    fun unsupportedEnabledRangeFallsBackToProfileAutoRanges() {
-        val original = listOf(FpsRange(15, 30), FpsRange(30, 30))
+    fun unsupportedEnabledRangeFallsBackToHalAutoInsteadOfForcingAnotherRange() {
         PreviewPreferenceRegistry.replace(
             listOf(
                 LensPreferenceRecord(
@@ -83,9 +83,11 @@ class PreviewPreferenceRegistryTest {
             ),
         )
 
-        val projected = PreviewPreferenceRegistry.projectForSession(lens(*original.toTypedArray()))
+        val projected = PreviewPreferenceRegistry.projectForSession(
+            lens(FpsRange(15, 30), FpsRange(30, 30)),
+        )
 
-        assertEquals(original, projected.capabilities.previewFpsRanges)
+        assertTrue(projected.capabilities.previewFpsRanges.orEmpty().isEmpty())
     }
 
     @Test
@@ -126,7 +128,7 @@ class PreviewPreferenceRegistryTest {
     }
 
     @Test
-    fun highResolutionViewfinderKeepsHighestRegularLiveConfigurationPerFormat() {
+    fun highResolutionViewfinderChoosesLargestStreamThatSustainsSmoothAutoCadence() {
         PreviewPreferenceRegistry.replace(
             listOf(
                 LensPreferenceRecord(
@@ -136,10 +138,26 @@ class PreviewPreferenceRegistryTest {
             ),
         )
         val descriptor = lensWithStreams(
-            StreamConfiguration(StreamFormat.PRIVATE, Size2D(1280, 720)),
-            StreamConfiguration(StreamFormat.PRIVATE, Size2D(2560, 1440)),
-            StreamConfiguration(StreamFormat.YUV_420_888, Size2D(640, 480)),
-            StreamConfiguration(StreamFormat.YUV_420_888, Size2D(1920, 1080)),
+            StreamConfiguration(
+                StreamFormat.PRIVATE,
+                Size2D(1920, 1080),
+                minFrameDurationNs = 33_333_333L,
+            ),
+            StreamConfiguration(
+                StreamFormat.PRIVATE,
+                Size2D(2560, 1440),
+                minFrameDurationNs = 66_666_667L,
+            ),
+            StreamConfiguration(
+                StreamFormat.YUV_420_888,
+                Size2D(1280, 720),
+                minFrameDurationNs = 33_333_333L,
+            ),
+            StreamConfiguration(
+                StreamFormat.YUV_420_888,
+                Size2D(1920, 1080),
+                minFrameDurationNs = 50_000_000L,
+            ),
             StreamConfiguration(StreamFormat.JPEG, Size2D(4000, 3000)),
             StreamConfiguration(
                 StreamFormat.PRIVATE,
@@ -153,12 +171,12 @@ class PreviewPreferenceRegistryTest {
 
         assertTrue(PreviewPreferenceRegistry.highResolutionViewfinder.value)
         assertEquals(
-            listOf(Size2D(2560, 1440)),
+            listOf(Size2D(1920, 1080)),
             configurations.filter { it.format == StreamFormat.PRIVATE && !it.maximumResolution }
                 .map { it.size },
         )
         assertEquals(
-            listOf(Size2D(1920, 1080)),
+            listOf(Size2D(1280, 720)),
             configurations.filter { it.format == StreamFormat.YUV_420_888 && !it.maximumResolution }
                 .map { it.size },
         )
@@ -170,6 +188,49 @@ class PreviewPreferenceRegistryTest {
             },
         )
         assertTrue(configurations.any { it.format == StreamFormat.JPEG })
+    }
+
+    @Test
+    fun highResolutionViewfinderUsesOverrideCadenceWhenOverrideIsEnabled() {
+        PreviewPreferenceRegistry.replace(
+            listOf(
+                LensPreferenceRecord(
+                    fingerprint = PreviewPreferenceRegistry.GLOBAL_PREVIEW_FPS_FINGERPRINT,
+                    preview = PreviewPreference(
+                        fpsRange = FpsRange(60, 60),
+                        fpsOverrideEnabled = true,
+                        highResolutionViewfinder = true,
+                    ),
+                ),
+            ),
+        )
+        val descriptor = LensDescriptor(
+            identity = LensIdentity("camera-alpha"),
+            fingerprint = LensFingerprint(TEST_FINGERPRINT, FingerprintStrategy.STABLE_METADATA),
+            capabilities = LensCapabilities(
+                previewFpsRanges = listOf(FpsRange(30, 30), FpsRange(60, 60)),
+                streamConfigurations = listOf(
+                    StreamConfiguration(
+                        StreamFormat.PRIVATE,
+                        Size2D(1920, 1080),
+                        minFrameDurationNs = 33_333_333L,
+                    ),
+                    StreamConfiguration(
+                        StreamFormat.PRIVATE,
+                        Size2D(1280, 720),
+                        minFrameDurationNs = 16_666_667L,
+                    ),
+                ),
+            ),
+        )
+
+        val projected = PreviewPreferenceRegistry.projectForSession(descriptor)
+
+        assertEquals(
+            listOf(Size2D(1280, 720)),
+            projected.capabilities.configurations(StreamFormat.PRIVATE).map { it.size },
+        )
+        assertEquals(listOf(FpsRange(60, 60)), projected.capabilities.previewFpsRanges)
     }
 
     @Test
@@ -209,11 +270,12 @@ class PreviewPreferenceRegistryTest {
                 ),
             ),
         )
-        val original = listOf(FpsRange(15, 30), FpsRange(30, 30))
-        val projected = PreviewPreferenceRegistry.projectForSession(lens(*original.toTypedArray()))
+        val projected = PreviewPreferenceRegistry.projectForSession(
+            lens(FpsRange(15, 30), FpsRange(30, 30)),
+        )
 
         assertNull(PreviewPreferenceRegistry.globalFpsRange.value)
-        assertEquals(original, projected.capabilities.previewFpsRanges)
+        assertTrue(projected.capabilities.previewFpsRanges.orEmpty().isEmpty())
     }
 
     private fun lens(vararg ranges: FpsRange) = LensDescriptor(
