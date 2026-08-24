@@ -95,7 +95,7 @@ class PreviewSizeSelectorTest {
     }
 
     @Test
-    fun autoFpsUsesHighestReportedNormalPreviewRange() {
+    fun autoFpsIsThirtyFirstInsteadOfHighestReportedRange() {
         val target = requireNotNull(
             PreviewFpsSelector.preferredTargetFps(
                 listOf(
@@ -104,10 +104,12 @@ class PreviewSizeSelectorTest {
                     FpsRange(30, 30),
                     FpsRange(30, 60),
                     FpsRange(60, 60),
+                    FpsRange(120, 120),
                 ),
             ),
         )
-        assertEquals(60.0, target, 0.0)
+
+        assertEquals(30.0, target, 0.0)
         assertNull(PreviewFpsSelector.preferredTargetFps(emptyList()))
     }
 
@@ -156,13 +158,33 @@ class PreviewSizeSelectorTest {
     }
 
     @Test
-    fun unknownStreamDurationUsesBestRangeActuallyReportedByCamera() {
+    fun unknownStreamDurationPrefersThirtyFpsPhotoPreviewRange() {
         val selected = PreviewFpsSelector.selectForStream(
-            ranges = listOf(FpsRange(15, 30), FpsRange(30, 60), FpsRange(60, 60)),
+            ranges = listOf(
+                FpsRange(15, 30),
+                FpsRange(30, 30),
+                FpsRange(30, 60),
+                FpsRange(60, 60),
+                FpsRange(120, 120),
+            ),
             minimumFrameDurationNanos = null,
         )
 
-        assertEquals(FpsRange(60, 60), selected)
+        assertEquals(FpsRange(30, 30), selected)
+    }
+
+    @Test
+    fun variableThirtyRangeBeatsSixtyWhenFixedThirtyIsUnavailable() {
+        val selected = PreviewFpsSelector.selectForStream(
+            ranges = listOf(
+                FpsRange(15, 30),
+                FpsRange(30, 60),
+                FpsRange(60, 60),
+            ),
+            minimumFrameDurationNanos = null,
+        )
+
+        assertEquals(FpsRange(15, 30), selected)
     }
 
     @Test
