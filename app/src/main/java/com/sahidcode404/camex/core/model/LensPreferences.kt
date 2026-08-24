@@ -2,12 +2,25 @@ package com.sahidcode404.camex.core.model
 
 import kotlinx.serialization.Serializable
 
+/**
+ * Per-canonical-lens live-preview preference. Null fields mean Auto and are intentionally
+ * capability-driven at runtime. Values are never camera IDs and stale values fall back safely.
+ */
+@Serializable
+data class PreviewPreference(
+    val size: Size2D? = null,
+    val fpsRange: FpsRange? = null,
+) {
+    val isAuto: Boolean get() = size == null && fpsRange == null
+}
+
 @Serializable
 data class LensPreferenceRecord(
     val fingerprint: String,
     val visible: Boolean = true,
     val displayName: String? = null,
     val position: Int? = null,
+    val preview: PreviewPreference = PreviewPreference(),
 )
 
 @Serializable
@@ -21,7 +34,7 @@ data class LensPreferencesState(
     val lastSelectedFrontFingerprint: String? = null,
 ) {
     companion object {
-        const val CURRENT_SCHEMA_VERSION = 3
+        const val CURRENT_SCHEMA_VERSION = 4
     }
 }
 
