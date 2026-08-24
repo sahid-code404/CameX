@@ -63,4 +63,9 @@ data class LensDescriptor(
     val probeResult: LensProbeResult? = null,
     /** Stable within a discovery pass and used only as a final UI tie-break, never as lens identity. */
     val discoveryOrder: Int = 0,
+    /**
+     * Session-only requested live stream. Discovery/topology descriptors leave this null; the
+     * PreviewPreferenceRegistry projection sets it only after validating it against this profile.
+     */
+    val previewStreamFormat: StreamFormat? = null,
 )

@@ -3,11 +3,13 @@ package com.sahidcode404.camex
 import android.app.Application
 import android.net.Uri
 import android.util.Log
+import android.view.TextureView
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.sahidcode404.camex.core.camera.CameraRuntimeSnapshot
 import com.sahidcode404.camex.core.camera.CameraSessionController
 import com.sahidcode404.camex.core.camera.CameraSessionState
+import com.sahidcode404.camex.core.camera.PreviewPreferenceRegistry
 import com.sahidcode404.camex.core.camera.diagnostics.CameraStartupTraceSnapshot
 import com.sahidcode404.camex.core.camera.discovery.HybridCameraDiscoverySnapshot
 import com.sahidcode404.camex.core.camera.runtime.ActiveCameraSelection
@@ -29,12 +31,15 @@ import com.sahidcode404.camex.core.logic.LensPreferenceOrdering
 import com.sahidcode404.camex.core.logic.PrimaryLensSelector
 import com.sahidcode404.camex.core.model.ActiveCameraSelectionReport
 import com.sahidcode404.camex.core.model.CameraUiSelectionReport
+import com.sahidcode404.camex.core.model.FpsRange
 import com.sahidcode404.camex.core.model.LensCategory
 import com.sahidcode404.camex.core.model.LensDescriptor
 import com.sahidcode404.camex.core.model.LensFacing
 import com.sahidcode404.camex.core.model.LensFingerprint
 import com.sahidcode404.camex.core.model.LensPreferenceRecord
 import com.sahidcode404.camex.core.model.LensPreferencesState
+import com.sahidcode404.camex.core.model.Size2D
+import com.sahidcode404.camex.core.model.StreamFormat
 import com.sahidcode404.camex.core.settings.LensSettingsStore
 import com.sahidcode404.camex.feature.camera.CameraScreenUiState
 import com.sahidcode404.camex.feature.camera.LensButtonUiModel
@@ -44,6 +49,7 @@ import com.sahidcode404.camex.feature.diagnostics.DiagnosticsUiState
 import com.sahidcode404.camex.feature.diagnostics.LensDiagnosticsUiModel
 import com.sahidcode404.camex.feature.lenssettings.LensSettingsUiModel
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -54,6 +60,8 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 data class CameraAppUiState(
@@ -114,6 +122,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         LensPreferencesState(),
     )
     private val platform = PlatformDiagnostics.collect(appContext)
+    private val previewBindingMutex = Mutex()
+    private val boundPreviewView = AtomicReference<TextureView?>(null)
     private var discoveryJob: Job? = null
     private var hasStarted = false
 
@@ -145,6 +155,13 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     init {
         launchSafely { runtimeCoordinator.bootstrapCache() }
+        launchSafely {
+            settings.collect { preferences ->
+                // One atomic in-memory projection feeds the camera hot path. No DataStore reads are
+                // performed while opening/switching a lens.
+                PreviewPreferenceRegistry.replace(preferences.records)
+            }
+        }
         launchSafely {
             runtimeCoordinator.activeSelection.collect { selection ->
                 if (selection?.verified == true &&
@@ -185,13 +202,26 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         launchSafely { runtimeCoordinator.resetDiscoveryCache() }
     }
 
-    /** Surface lifecycle never chooses a camera. The controller reuses its exact selected profile. */
-    fun bindPreview(view: android.view.TextureView) {
-        launchSafely { controller.bindPreview(view) }
+    /**
+     * Preview surface operations are serialized and identity-guarded. A stale Compose disposal from
+     * an older TextureView can therefore never unbind a newer surface after app resume.
+     */
+    fun bindPreview(view: TextureView) {
+        boundPreviewView.set(view)
+        launchSafely {
+            previewBindingMutex.withLock {
+                if (boundPreviewView.get() === view) controller.bindPreview(view)
+            }
+        }
     }
 
-    fun unbindPreview() {
-        launchSafely { controller.unbindPreview() }
+    fun unbindPreview(view: TextureView) {
+        if (!boundPreviewView.compareAndSet(view, null)) return
+        launchSafely {
+            previewBindingMutex.withLock {
+                if (boundPreviewView.get() == null) controller.unbindPreview()
+            }
+        }
     }
 
     fun onBackground() {
@@ -251,6 +281,14 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun renameLens(fingerprint: String, label: String?) {
         launchSafely { settingsStore.rename(fingerprint, label) }
+    }
+
+    fun setPreviewSize(fingerprint: String, size: Size2D?) {
+        launchSafely { settingsStore.setPreviewSize(fingerprint, size) }
+    }
+
+    fun setPreviewFps(fingerprint: String, fpsRange: FpsRange?) {
+        launchSafely { settingsStore.setPreviewFps(fingerprint, fpsRange) }
     }
 
     fun moveLens(from: Int, to: Int) {
@@ -320,6 +358,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     override fun onCleared() {
+        boundPreviewView.set(null)
         runtimeCoordinator.close()
     }
 
@@ -327,6 +366,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         discoveryJob?.cancel()
         discoveryJob = launchSafely {
             val preferences = settingsStore.state.first()
+            PreviewPreferenceRegistry.replace(preferences.records)
             runtimeCoordinator.start(
                 preferredRearFingerprint = preferences.lastSelectedRearFingerprint,
                 oneXReferenceFingerprint = preferences.oneXReferenceFingerprint,
@@ -435,12 +475,20 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         val unique = LensDuplicateFilter.filterForSelector(runtime.lenses)
         val resolved = LensPreferenceOrdering.resolve(unique, preferences, includeHidden = true)
         val reference = referenceLens(unique, preferences)
+        val records = preferences.records.associateBy { it.fingerprint }
+        val routesByFingerprint = runtime.topology.routes
+            .mapNotNull { route -> route.lensFingerprint?.value?.let { it to route } }
+            .toMap()
         val advancedFingerprints = runtime.topology.routes
             .filter { it.isAdvancedPhotographicCandidate }
             .mapNotNullTo(mutableSetOf()) { it.lensFingerprint?.value }
         return resolved.map { preference ->
             val lens = preference.lens
             val fingerprint = lens.fingerprint?.value ?: lens.identity.routingKey
+            val topologyRoute = routesByFingerprint[fingerprint]
+            val previewSizes = previewSizes(topologyRoute, lens)
+            val previewFpsRanges = previewFpsRanges(topologyRoute, lens)
+            val savedPreview = records[fingerprint]?.preview
             LensSettingsUiModel(
                 fingerprint = fingerprint,
                 defaultLabel = defaultLensName(lens, reference),
@@ -450,9 +498,52 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 isOneXReference = lens.fingerprint?.value == reference?.fingerprint?.value,
                 supportsOneXReference = lens.facing == LensFacing.BACK,
                 advanced = fingerprint in advancedFingerprints,
+                previewSizes = previewSizes,
+                previewFpsRanges = previewFpsRanges,
+                selectedPreviewSize = savedPreview?.size?.takeIf(previewSizes::contains),
+                selectedPreviewFpsRange = savedPreview?.fpsRange?.takeIf(previewFpsRanges::contains),
             )
         }
     }
+
+    private fun previewSizes(route: CameraRoute?, lens: LensDescriptor): List<Size2D> = buildList {
+        addAll(
+            lens.capabilities.configurations(StreamFormat.PRIVATE)
+                .filterNot { it.maximumResolution }
+                .map { it.size },
+        )
+        route?.profiles.orEmpty().forEach { profile ->
+            val full = profile.fullCapabilities?.capabilities
+            if (full != null) {
+                addAll(
+                    full.configurations(StreamFormat.PRIVATE)
+                        .filterNot { it.maximumResolution }
+                        .map { it.size },
+                )
+            } else {
+                addAll(profile.metadata.privatePreviewSizes)
+            }
+        }
+    }.asSequence()
+        .filter(Size2D::isValid)
+        .distinct()
+        .sortedWith(
+            compareByDescending<Size2D> { it.area ?: 0L }
+                .thenByDescending { it.width }
+                .thenByDescending { it.height },
+        )
+        .toList()
+
+    private fun previewFpsRanges(route: CameraRoute?, lens: LensDescriptor): List<FpsRange> = buildList {
+        addAll(lens.capabilities.previewFpsRanges.orEmpty())
+        route?.profiles.orEmpty().forEach { profile ->
+            addAll(profile.fullCapabilities?.capabilities?.previewFpsRanges.orEmpty())
+        }
+    }.asSequence()
+        .filter { it.isValid && it.max > 0 }
+        .distinct()
+        .sortedWith(compareByDescending<FpsRange> { it.max }.thenByDescending { it.min })
+        .toList()
 
     private fun diagnosticsState(
         runtime: CameraUiRuntime,
@@ -511,6 +602,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 DiagnosticField(
                     "Active session routing key",
                     runtime.activeSelection?.activeProfileRoutingKey ?: "None",
+                ),
+                DiagnosticField(
+                    "Active preview size",
+                    runtime.session.activePreviewSize?.sizeText() ?: "None",
                 ),
                 DiagnosticField(
                     "Active canonical fingerprint",
@@ -844,7 +939,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             .ifBlank { "None" }
     }
 
-    private fun com.sahidcode404.camex.core.model.Size2D?.sizeText(): String =
+    private fun Size2D?.sizeText(): String =
         this?.takeIf { it.isValid }?.let { "${it.width}×${it.height}" } ?: "Unknown"
 
     private fun Set<String>?.listText(): String = this.orEmpty().joinToString().ifBlank { "Unknown" }

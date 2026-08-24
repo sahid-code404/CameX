@@ -29,7 +29,7 @@ class TexturePreviewTransformTest {
     }
 
     @Test
-    fun portraitTransformUndoesStretchAndCenterCropsWithoutDoubleSensorRotation() {
+    fun portraitTransformMatchesHardwareValidatedPhaseOneGeometry() {
         val transform = requireNotNull(
             TexturePreviewTransform.calculate(
                 viewWidth = 1080,
@@ -50,7 +50,7 @@ class TexturePreviewTransformTest {
     }
 
     @Test
-    fun frontMirrorIsRetainedAndInvalidGeometryIsRejected() {
+    fun calculationPreservesRequestedMirrorAndRejectsInvalidGeometry() {
         val front = TexturePreviewTransform.calculate(
             1080,
             2400,

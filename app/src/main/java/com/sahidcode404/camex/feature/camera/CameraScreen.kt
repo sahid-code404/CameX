@@ -19,9 +19,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -34,6 +32,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.sahidcode404.camex.core.camera.raw.RawCapturePhase
+import com.sahidcode404.camex.core.camera.raw.RawCaptureState
 
 data class LensButtonUiModel(
     val fingerprint: String,
@@ -57,23 +57,24 @@ data class CameraScreenUiState(
 @Composable
 fun CameraScreen(
     state: CameraScreenUiState,
+    rawState: RawCaptureState,
     previewContent: @Composable () -> Unit,
-    permissionPermanentlyDenied: Boolean,
+    modifier: Modifier = Modifier,
     updateAvailable: Boolean = false,
-    onRequestPermission: () -> Unit,
-    onOpenAppSettings: () -> Unit,
     onSelectLens: (String) -> Unit,
     onSwitchFacing: () -> Unit,
+    onCapture: () -> Unit,
     onOpenLensSettings: () -> Unit,
     onOpenDiagnostics: () -> Unit,
-    onRetry: () -> Unit,
-    modifier: Modifier = Modifier,
 ) {
     Box(
         modifier = modifier
             .fillMaxSize()
             .background(Color.Black),
     ) {
+        // The camera screen deliberately owns no startup/opening/switching/permission/error modal.
+        // Android owns the runtime permission prompt. Camera2 transient states remain invisible so
+        // the TextureView can become visible as soon as the first frame arrives.
         if (state.permissionGranted) {
             previewContent()
         }
@@ -85,35 +86,16 @@ fun CameraScreen(
             modifier = Modifier.align(Alignment.TopCenter),
         )
 
-        when {
-            !state.permissionGranted -> PermissionPrompt(
-                permanentlyDenied = permissionPermanentlyDenied,
-                onRequestPermission = onRequestPermission,
-                onOpenAppSettings = onOpenAppSettings,
-                modifier = Modifier.align(Alignment.Center),
-            )
-            state.recoverableError != null -> ErrorPrompt(
-                message = state.recoverableError,
-                onRetry = onRetry,
-                modifier = Modifier.align(Alignment.Center),
-            )
-            !state.previewVisible -> Text(
-                text = state.statusText,
-                color = Color.White,
-                textAlign = TextAlign.Center,
-                modifier = Modifier
-                    .align(Alignment.Center)
-                    .padding(32.dp),
-            )
-        }
-
         CameraBottomControls(
             lenses = state.lenses,
             selectedFingerprint = state.selectedFingerprint,
             switchFacingLabel = state.switchFacingLabel,
             switchFacingEnabled = state.switchFacingEnabled,
+            previewVisible = state.previewVisible,
+            rawState = rawState,
             onSelectLens = onSelectLens,
             onSwitchFacing = onSwitchFacing,
+            onCapture = onCapture,
             modifier = Modifier.align(Alignment.BottomCenter),
         )
     }
@@ -160,71 +142,23 @@ private fun CameraTopBar(
 }
 
 @Composable
-private fun PermissionPrompt(
-    permanentlyDenied: Boolean,
-    onRequestPermission: () -> Unit,
-    onOpenAppSettings: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Surface(
-        modifier = modifier.padding(28.dp),
-        color = Color(0xE6212226),
-        shape = RoundedCornerShape(24.dp),
-    ) {
-        Column(
-            modifier = Modifier.padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(
-                text = if (permanentlyDenied) {
-                    "Camera permission is disabled. Open app settings to enable discovery and preview."
-                } else {
-                    "Camera permission is required for discovery and preview. CameX never captures " +
-                        "or saves a photo during Phase 1."
-                },
-                color = Color.White,
-                textAlign = TextAlign.Center,
-            )
-            Spacer(Modifier.height(18.dp))
-            Button(onClick = if (permanentlyDenied) onOpenAppSettings else onRequestPermission) {
-                Text(if (permanentlyDenied) "Open app settings" else "Allow camera")
-            }
-        }
-    }
-}
-
-@Composable
-private fun ErrorPrompt(
-    message: String,
-    onRetry: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Surface(
-        modifier = modifier.padding(28.dp),
-        color = Color(0xE6212226),
-        shape = RoundedCornerShape(24.dp),
-    ) {
-        Column(
-            modifier = Modifier.padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(message, color = Color.White, textAlign = TextAlign.Center)
-            Spacer(Modifier.height(16.dp))
-            Button(onClick = onRetry) { Text("Retry safely") }
-        }
-    }
-}
-
-@Composable
 private fun CameraBottomControls(
     lenses: List<LensButtonUiModel>,
     selectedFingerprint: String?,
     switchFacingLabel: String,
     switchFacingEnabled: Boolean,
+    previewVisible: Boolean,
+    rawState: RawCaptureState,
     onSelectLens: (String) -> Unit,
     onSwitchFacing: () -> Unit,
+    onCapture: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    // The runtime owns capability/failover decisions. Keeping the shutter clickable while a
+    // verified preview is live is important: a profile whose bounded RAW session is rejected must
+    // still be allowed to enter same-canonical failover. Only an in-flight capture disables it.
+    val captureEnabled = previewVisible && !rawState.inProgress
+
     Column(
         modifier = modifier
             .fillMaxWidth()
@@ -284,13 +218,29 @@ private fun CameraBottomControls(
                 modifier = Modifier
                     .size(76.dp)
                     .border(5.dp, Color.White, CircleShape)
-                    .semantics { contentDescription = "Capture unavailable in Phase 1" },
+                    .clickable(
+                        enabled = captureEnabled,
+                        role = Role.Button,
+                        onClick = onCapture,
+                    )
+                    .semantics {
+                        contentDescription = if (captureEnabled) {
+                            "Capture one RAW DNG"
+                        } else if (rawState.inProgress) {
+                            "RAW capture in progress"
+                        } else {
+                            "Camera preview is not ready"
+                        }
+                    },
                 contentAlignment = Alignment.Center,
             ) {
                 Box(
                     Modifier
                         .size(58.dp)
-                        .background(Color.White.copy(alpha = 0.35f), CircleShape),
+                        .background(
+                            Color.White.copy(alpha = if (captureEnabled) 1f else 0.35f),
+                            CircleShape,
+                        ),
                 )
             }
             TextButton(
@@ -303,10 +253,26 @@ private fun CameraBottomControls(
                 )
             }
         }
-        Text(
-            text = "Capture arrives in Phase 2",
-            color = Color.White.copy(alpha = 0.55f),
-            style = MaterialTheme.typography.labelSmall,
-        )
+        rawStatusText(rawState)?.let { status ->
+            Text(
+                text = status,
+                color = Color.White.copy(alpha = 0.72f),
+                style = MaterialTheme.typography.labelSmall,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 2.dp),
+            )
+        }
     }
+}
+
+/**
+ * Normal preview is intentionally preview-only, so sessionReady=false while idle is expected and
+ * must not be shown as an error under the shutter. Only real capture progress/results are surfaced.
+ */
+private fun rawStatusText(state: RawCaptureState): String? = when (state.phase) {
+    RawCapturePhase.CAPTURING -> "Capturing RAW sensor frame…"
+    RawCapturePhase.SAVING -> "Saving DNG…"
+    RawCapturePhase.SAVED -> "DNG saved"
+    RawCapturePhase.FAILED -> state.diagnostics.lastRawError ?: "RAW capture failed"
+    RawCapturePhase.IDLE -> null
 }

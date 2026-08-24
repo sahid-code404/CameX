@@ -4,10 +4,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -30,6 +28,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.sahidcode404.camex.core.update.UpdateChannel
 import com.sahidcode404.camex.core.update.UpdateState
 import com.sahidcode404.camex.core.update.UpdateUiState
 
@@ -45,6 +44,7 @@ fun UpdateScreen(
     onResetFailure: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val isDevelopment = state.channel == UpdateChannel.DEVELOPMENT
     Scaffold(
         modifier = modifier.fillMaxSize(),
         topBar = {
@@ -53,7 +53,7 @@ fun UpdateScreen(
                     Column {
                         Text("Updates", fontWeight = FontWeight.SemiBold)
                         Text(
-                            "Camera software",
+                            if (isDevelopment) "Development channel" else "Stable channel",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -72,9 +72,7 @@ fun UpdateScreen(
             contentPadding = PaddingValues(horizontal = 18.dp, vertical = 14.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            item {
-                CurrentVersionCard(state)
-            }
+            item { CurrentVersionCard(state) }
             item {
                 UpdateStatusCard(
                     state = state,
@@ -87,8 +85,13 @@ fun UpdateScreen(
             }
             item {
                 Text(
-                    text = "Updates are checked from the latest CameX GitHub release. " +
-                        "Downloads stay in Camera's private storage until Android's installer opens.",
+                    text = if (isDevelopment) {
+                        "Development builds check the rolling dev-latest CameX release. " +
+                            "Downloads stay in Camera's private storage until Android's installer opens."
+                    } else {
+                        "Stable builds check the latest CameX GitHub release. " +
+                            "Downloads stay in Camera's private storage until Android's installer opens."
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
@@ -126,6 +129,11 @@ private fun CurrentVersionCard(state: UpdateUiState) {
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            Text(
+                "${state.channel.buildConfigValue.replaceFirstChar(Char::uppercase)} OTA",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }
@@ -139,6 +147,7 @@ private fun UpdateStatusCard(
     onOpenInstallPermissionSettings: () -> Unit,
     onResetFailure: () -> Unit,
 ) {
+    val isDevelopment = state.channel == UpdateChannel.DEVELOPMENT
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(24.dp),
@@ -152,17 +161,25 @@ private fun UpdateStatusCard(
                 UpdateState.Idle -> {
                     StatusHeader(
                         title = "Ready to check",
-                        subtitle = "Look for a newer Camera build on GitHub.",
+                        subtitle = if (isDevelopment) {
+                            "Look for the newest development build on GitHub."
+                        } else {
+                            "Look for a newer stable Camera build on GitHub."
+                        },
                     )
                     Button(onClick = onCheck, modifier = Modifier.fillMaxWidth()) {
-                        Text("Check for updates")
+                        Text("Check now")
                     }
                 }
 
                 UpdateState.Checking -> {
                     StatusHeader(
                         title = "Checking for updates",
-                        subtitle = "Contacting the CameX release channel…",
+                        subtitle = if (isDevelopment) {
+                            "Contacting the CameX development channel…"
+                        } else {
+                            "Contacting the CameX stable channel…"
+                        },
                     )
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                 }
@@ -170,7 +187,11 @@ private fun UpdateStatusCard(
                 UpdateState.UpToDate -> {
                     StatusHeader(
                         title = "You're up to date",
-                        subtitle = "This is the newest Camera version currently available.",
+                        subtitle = if (isDevelopment) {
+                            "This is the newest published development build."
+                        } else {
+                            "This is the newest stable Camera version currently available."
+                        },
                     )
                     FilledTonalButton(onClick = onCheck, modifier = Modifier.fillMaxWidth()) {
                         Text("Check again")
@@ -180,8 +201,17 @@ private fun UpdateStatusCard(
                 is UpdateState.Available -> {
                     val manifest = update.update.manifest
                     StatusHeader(
-                        title = "Camera ${manifest.versionName} is available",
-                        subtitle = "Build ${manifest.versionCode}",
+                        title = if (isDevelopment) {
+                            "Development update available"
+                        } else {
+                            "Camera ${manifest.versionName} is available"
+                        },
+                        subtitle = buildString {
+                            append("Build ${manifest.versionCode}")
+                            manifest.gitSha.takeIf { isDevelopment && it.isNotBlank() }?.let { sha ->
+                                append(" · ${sha.take(12)}")
+                            }
+                        },
                     )
                     if (manifest.changelog.isNotBlank()) {
                         HorizontalDivider()
@@ -255,7 +285,7 @@ private fun UpdateStatusCard(
 
                 is UpdateState.Failed -> {
                     StatusHeader(
-                        title = "Couldn't check for updates",
+                        title = "Update couldn't continue",
                         subtitle = update.message,
                         error = true,
                     )

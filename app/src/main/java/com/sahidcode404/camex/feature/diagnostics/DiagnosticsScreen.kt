@@ -64,13 +64,14 @@ data class DiagnosticsUiState(
 fun DiagnosticsScreen(
     state: DiagnosticsUiState,
     otaSummary: List<DiagnosticField>,
+    modifier: Modifier = Modifier,
+    rawSummary: List<DiagnosticField> = emptyList(),
     onBack: () -> Unit,
     onNormalRescan: () -> Unit,
     onDeepRescan: () -> Unit,
     onResetDiscoveryCache: () -> Unit,
     onOpenUpdates: () -> Unit,
     onExport: () -> Unit,
-    modifier: Modifier = Modifier,
 ) {
     Scaffold(
         modifier = modifier.fillMaxSize(),
@@ -94,8 +95,9 @@ fun DiagnosticsScreen(
                     ) {
                         Text("Compatibility report", fontWeight = FontWeight.SemiBold)
                         Text(
-                            "The JSON report contains camera, Android, graphics and probe data; " +
-                                "it contains no photos, accounts, location, contacts, or tokens.",
+                            "The JSON report contains camera, Android, graphics, probe and RAW " +
+                                "capture diagnostics; it contains no photos, accounts, location, " +
+                                "contacts, or tokens.",
                             style = MaterialTheme.typography.bodySmall,
                         )
                         Button(
@@ -139,6 +141,9 @@ fun DiagnosticsScreen(
             }
             if (otaSummary.isNotEmpty()) {
                 item { DiagnosticSection("Updates", otaSummary) }
+            }
+            if (rawSummary.isNotEmpty()) {
+                item { DiagnosticSection("Single RAW capture", rawSummary) }
             }
             if (state.nativeSummary.isNotEmpty()) {
                 item { DiagnosticSection("Native foundation", state.nativeSummary) }

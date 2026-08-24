@@ -17,14 +17,16 @@ data class CameraRouteFacts(
 
 /**
  * Conservative operation limits. A rule may only override the fields it has evidence for.
+ * Generic operation deliberately does not hard-code a preview resolution cap; the stream selector
+ * uses actual view geometry, per-stream frame-duration metadata, and camera-reported FPS ranges.
  */
 data class CameraOperationPolicy(
     val openTimeoutMillis: Long = 4_000L,
     val sessionTimeoutMillis: Long = 4_000L,
     val firstFrameTimeoutMillis: Long = 3_000L,
     val closeSettleTimeoutMillis: Long = 1_000L,
-    val maximumPreviewArea: Long = 4_194_304L,
-    val maximumPreviewLongEdge: Int = 2_560,
+    val maximumPreviewArea: Long = Long.MAX_VALUE,
+    val maximumPreviewLongEdge: Int = Int.MAX_VALUE,
     val allowPhysicalOutputRouting: Boolean = true,
     val allowRawSessionProbe: Boolean = true,
     val maxAutomaticFailures: Int = 2,

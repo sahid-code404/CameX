@@ -61,6 +61,17 @@ val StreamFormat.isPortableRaw: Boolean
         this == StreamFormat.RAW12 ||
         this == StreamFormat.RAW14
 
+/**
+ * Formats that CameX can safely activate as a repeating viewfinder stream today.
+ *
+ * PRIVATE is the zero-copy SurfaceTexture display transport. YUV_420_888 is an optional live
+ * processing stream that is drained on the camera callback thread while PRIVATE continues to own
+ * the display transport. Capture/stall formats are deliberately excluded even when the HAL reports
+ * them; exposing them as selectable live streams would create fake configuration and vendor hangs.
+ */
+val StreamFormat.isLiveViewfinderStream: Boolean
+    get() = this == StreamFormat.PRIVATE || this == StreamFormat.YUV_420_888
+
 @Serializable
 data class StreamConfiguration(
     val format: StreamFormat,

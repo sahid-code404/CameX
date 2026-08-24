@@ -7,6 +7,10 @@ import kotlin.math.max
 /**
  * TextureView already compensates for sensor mounting orientation. The application transform
  * removes TextureView's non-uniform fill, center-crops uniformly, and compensates display rotation.
+ *
+ * Keep this math aligned with the hardware-validated Phase 1 preview behaviour. Lens switches may
+ * replace the producer buffer geometry, so callers should reset the previous matrix before binding
+ * a new buffer and then apply this transform using the new stream's exact dimensions.
  */
 data class PreviewTransform(
     val scaleX: Float,
@@ -35,9 +39,10 @@ object TexturePreviewTransform {
     }
 
     /**
-     * Implements the platform Camera2 resizable-TextureView scaling model. Relative rotation is
-     * used to determine axis swapping; only display rotation is applied because TextureView's
-     * producer transform already accounts for sensor mounting orientation.
+     * Hardware-validated Phase 1 resizable-TextureView transform.
+     *
+     * Relative rotation determines axis swapping. Only display rotation is applied here because the
+     * TextureView producer transform already accounts for the sensor's mounting orientation.
      */
     fun calculate(
         viewWidth: Int,
@@ -88,12 +93,15 @@ object TexturePreviewTransform {
         return PreviewTransform(
             scaleX = scaleX,
             scaleY = scaleY,
-            // Display.getRotation is counter-clockwise from the user's point of view.
             clockwiseDisplayCompensationDegrees = -displayRotation,
             mirrorHorizontally = mirrorHorizontally,
             pivotX = viewWidth / 2f,
             pivotY = viewHeight / 2f,
         )
+    }
+
+    fun reset(textureView: TextureView) {
+        textureView.setTransform(Matrix())
     }
 
     fun apply(
@@ -105,6 +113,9 @@ object TexturePreviewTransform {
         frontFacing: Boolean,
         mirrorHorizontally: Boolean,
     ) {
+        // Saved RAW/DNG frames are sensor-oriented and not selfie-mirrored. Keep the live front
+        // preview unmirrored so preview geometry agrees with the saved image.
+        val effectiveMirror = mirrorHorizontally && !frontFacing
         val transform = calculate(
             viewWidth = textureView.width,
             viewHeight = textureView.height,
@@ -113,8 +124,11 @@ object TexturePreviewTransform {
             sensorOrientationDegrees = sensorOrientationDegrees,
             displayRotationDegrees = displayRotationDegrees,
             frontFacing = frontFacing,
-            mirrorHorizontally = mirrorHorizontally,
-        ) ?: return
+            mirrorHorizontally = effectiveMirror,
+        ) ?: run {
+            reset(textureView)
+            return
+        }
         textureView.setTransform(transform.toMatrix())
     }
 }

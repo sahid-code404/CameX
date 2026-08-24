@@ -5,9 +5,14 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.sahidcode404.camex.core.model.FpsRange
 import com.sahidcode404.camex.core.model.LensFacing
 import com.sahidcode404.camex.core.model.LensPreferenceRecord
 import com.sahidcode404.camex.core.model.LensPreferencesState
+import com.sahidcode404.camex.core.model.PreviewPreference
+import com.sahidcode404.camex.core.model.Size2D
+import com.sahidcode404.camex.core.model.StreamFormat
+import com.sahidcode404.camex.core.model.isLiveViewfinderStream
 import java.io.IOException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
@@ -21,10 +26,10 @@ private const val STORE_NAME = "lens_settings"
 private val Context.lensSettingsDataStore by preferencesDataStore(name = STORE_NAME)
 
 /**
- * Stores one versioned JSON document inside Preferences DataStore. Preferences are keyed only by
- * [com.sahidcode404.camex.core.model.LensFingerprint] values; Camera2 IDs never become durable
- * keys. Unknown or orphaned records survive firmware updates and are simply ignored by the lens
- * resolver until a deterministic migration alias is available.
+ * Versioned viewfinder/lens preferences. Durable per-camera keys are canonical optical
+ * fingerprints, never Camera2 transport IDs. The one reserved global fingerprint is used only for
+ * viewfinder-wide controls. Every persisted stream/range is treated as a request: if the current
+ * HAL/profile no longer reports it, runtime falls back to Auto instead of rejecting the lens.
  */
 class LensSettingsStore(context: Context) {
     private val dataStore = context.applicationContext.lensSettingsDataStore
@@ -46,6 +51,42 @@ class LensSettingsStore(context: Context) {
     suspend fun rename(fingerprint: String, label: String?) = updateRecord(fingerprint) {
         it.copy(displayName = label?.trim()?.take(48)?.takeIf(String::isNotEmpty))
     }
+
+    /** Retained for schema-v4/source compatibility. v5 UI no longer exposes preview resolution. */
+    suspend fun setPreviewSize(fingerprint: String, size: Size2D?) = updateRecord(fingerprint) {
+        it.copy(
+            preview = it.preview.copy(
+                size = size?.takeIf { candidate -> candidate.isValid },
+            ),
+        )
+    }
+
+    suspend fun setPreviewStream(fingerprint: String, format: StreamFormat?) = updateRecord(fingerprint) {
+        it.copy(
+            preview = it.preview.copy(
+                size = null,
+                streamFormat = format?.takeIf(StreamFormat::isLiveViewfinderStream),
+            ),
+        )
+    }
+
+    suspend fun setPreviewFps(fingerprint: String, fpsRange: FpsRange?) = updateRecord(fingerprint) {
+        it.copy(
+            preview = it.preview.copy(
+                fpsRange = fpsRange?.takeIf { range -> range.isValid && range.max > 0 },
+            ),
+        )
+    }
+
+    suspend fun setPreviewFpsOverrideEnabled(fingerprint: String, enabled: Boolean) =
+        updateRecord(fingerprint) {
+            it.copy(preview = it.preview.copy(fpsOverrideEnabled = enabled))
+        }
+
+    suspend fun setHighResolutionViewfinderEnabled(fingerprint: String, enabled: Boolean) =
+        updateRecord(fingerprint) {
+            it.copy(preview = it.preview.copy(highResolutionViewfinder = enabled))
+        }
 
     suspend fun setOrder(orderedFingerprints: List<String>) {
         val order = orderedFingerprints
@@ -135,6 +176,7 @@ class LensSettingsStore(context: Context) {
                     fingerprint = fingerprint,
                     displayName = record.displayName?.trim()?.take(48)?.takeIf(String::isNotEmpty),
                     position = record.position?.takeIf { it >= 0 },
+                    preview = record.preview.normalized(),
                 )
             }
             .associateBy { it.fingerprint }
@@ -144,6 +186,14 @@ class LensSettingsStore(context: Context) {
         lastSelectedFingerprint = lastSelectedFingerprint.normalizedFingerprintOrNull(),
         lastSelectedRearFingerprint = lastSelectedRearFingerprint.normalizedFingerprintOrNull(),
         lastSelectedFrontFingerprint = lastSelectedFrontFingerprint.normalizedFingerprintOrNull(),
+    )
+
+    private fun PreviewPreference.normalized(): PreviewPreference = PreviewPreference(
+        size = size?.takeIf { it.isValid },
+        fpsRange = fpsRange?.takeIf { it.isValid && it.max > 0 },
+        streamFormat = streamFormat?.takeIf(StreamFormat::isLiveViewfinderStream),
+        fpsOverrideEnabled = fpsOverrideEnabled,
+        highResolutionViewfinder = highResolutionViewfinder,
     )
 
     private fun String?.normalizedFingerprintOrNull(): String? = this

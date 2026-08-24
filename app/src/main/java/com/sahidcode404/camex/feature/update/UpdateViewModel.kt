@@ -3,12 +3,14 @@ package com.sahidcode404.camex.feature.update
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.sahidcode404.camex.BuildConfig
 import com.sahidcode404.camex.core.update.AndroidApkInspector
 import com.sahidcode404.camex.core.update.ApkInstaller
 import com.sahidcode404.camex.core.update.ApkVerifier
 import com.sahidcode404.camex.core.update.GitHubUpdateClient
 import com.sahidcode404.camex.core.update.InstalledAppInfoReader
 import com.sahidcode404.camex.core.update.UpdateAutoChecker
+import com.sahidcode404.camex.core.update.UpdateChannel
 import com.sahidcode404.camex.core.update.UpdateCheckResult
 import com.sahidcode404.camex.core.update.UpdateException
 import com.sahidcode404.camex.core.update.UpdateState
@@ -22,16 +24,17 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
-/** Simple GitHub Release OTA, including the same 12-hour open-time auto-check as Universal_Camera. */
 class UpdateViewModel(application: Application) : AndroidViewModel(application) {
     private val appContext = application.applicationContext
     private val installed = InstalledAppInfoReader.read(appContext)
-    private val client = GitHubUpdateClient(appContext.cacheDir)
-    private val autoChecker = UpdateAutoChecker(appContext, client, installed)
+    private val channel = UpdateChannel.fromBuildConfig(BuildConfig.OTA_CHANNEL)
+    private val client = GitHubUpdateClient(appContext.cacheDir, channel = channel)
+    private val autoChecker = UpdateAutoChecker(appContext, client, installed, channel)
     private val verifier = ApkVerifier(AndroidApkInspector(appContext), installed)
     private val mutableState = MutableStateFlow(
         UpdateUiState(
             installed = installed,
+            channel = channel,
             installPermissionGranted = ApkInstaller.canRequestInstalls(appContext),
         ),
     )
@@ -47,8 +50,8 @@ class UpdateViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     /**
-     * Mirrors Universal_Camera: when the app opens, check only if 12 hours have elapsed.
-     * Only an available update is surfaced; background up-to-date/failure results stay quiet.
+     * Development builds check their rolling dev-latest channel on each app start/resume.
+     * Stable builds keep the 12-hour gate. Background up-to-date/failure results stay quiet.
      */
     fun checkForUpdatesIfDue() {
         if (operationJob?.isActive == true) return

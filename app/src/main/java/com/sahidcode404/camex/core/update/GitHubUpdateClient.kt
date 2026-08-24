@@ -87,21 +87,20 @@ class HttpUpdateTransport : UpdateTransport {
 class GitHubUpdateClient(
     private val cacheRoot: File,
     private val transport: UpdateTransport = HttpUpdateTransport(),
+    private val channel: UpdateChannel = UpdateChannel.STABLE,
 ) {
     private val json = Json { ignoreUnknownKeys = true }
 
     suspend fun check(installed: InstalledAppInfo): UpdateCheckResult = runCatching {
         val releaseText = try {
-            transport.readText(LATEST_RELEASE_URL)
+            transport.readText(channel.releaseUrl)
         } catch (_: FileNotFoundException) {
-            // GitHub returns HTTP 404 for /releases/latest when the repository has no
-            // published release yet. That is a normal "nothing to update" state, not
-            // an error that should leak a raw URL into the UI.
+            // GitHub returns HTTP 404 before a channel has published its first release.
             return UpdateCheckResult.UpToDate
         }
         val release = json.decodeFromString<GitHubRelease>(releaseText)
-        val manifestAsset = release.assets.firstOrNull { it.name == MANIFEST_ASSET_NAME }
-            ?: error("release-manifest.json is missing")
+        val manifestAsset = release.assets.firstOrNull { it.name == channel.manifestAssetName }
+            ?: error("${channel.manifestAssetName} is missing")
         val manifest = json.decodeFromString<ReleaseManifest>(
             transport.readText(manifestAsset.browserDownloadUrl),
         )
@@ -157,6 +156,9 @@ class GitHubUpdateClient(
     companion object {
         const val LATEST_RELEASE_URL =
             "https://api.github.com/repos/sahid-code404/CameX/releases/latest"
+        const val DEVELOPMENT_RELEASE_URL =
+            "https://api.github.com/repos/sahid-code404/CameX/releases/tags/dev-latest"
         const val MANIFEST_ASSET_NAME = "release-manifest.json"
+        const val DEVELOPMENT_MANIFEST_ASSET_NAME = "dev-manifest.json"
     }
 }

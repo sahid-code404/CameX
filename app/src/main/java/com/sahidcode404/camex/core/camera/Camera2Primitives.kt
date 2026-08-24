@@ -12,12 +12,14 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.view.Surface
 import androidx.annotation.RequiresApi
+import com.sahidcode404.camex.core.camera.raw.RawCaptureRegistry
+import com.sahidcode404.camex.core.camera.raw.RawSessionMode
 import com.sahidcode404.camex.core.model.ProbeFailureKind
 import java.io.Closeable
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeout
@@ -63,11 +65,12 @@ internal class CaptureSessionLease internal constructor(
     private val closeRequested = AtomicBoolean(false)
 
     override fun close() {
-        if (closeRequested.compareAndSet(false, true)) runCatching {
-            session.stopRepeating()
-        }.also {
-            runCatching { session.abortCaptures() }
-            runCatching { session.close() }
+        if (closeRequested.compareAndSet(false, true)) {
+            RawCaptureRegistry.onSessionClosing(session)
+            runCatching { session.stopRepeating() }.also {
+                runCatching { session.abortCaptures() }
+                runCatching { session.close() }
+            }
         }
     }
 
@@ -144,10 +147,83 @@ internal suspend fun CameraManager.awaitOpenCamera(
     }
 }
 
+/**
+ * Configures the display preview plus an optional already-created live processing surface. RAW is
+ * still admitted only for the bounded shutter transaction. Keeping all outputs in this one helper
+ * prevents a second CameraDevice/session owner from appearing as viewfinder formats evolve.
+ */
 internal suspend fun CameraDevice.awaitCaptureSession(
     surface: Surface,
     physicalCameraId: String?,
     maximumResolution: Boolean = false,
+    additionalPreviewSurface: Surface? = null,
+    handler: Handler,
+    timeoutMillis: Long,
+): CaptureSessionLease {
+    if (maximumResolution) {
+        require(additionalPreviewSurface == null) {
+            "Maximum-resolution single-output session cannot include an auxiliary viewfinder"
+        }
+        return awaitSingleCaptureSession(
+            surface = surface,
+            physicalCameraId = physicalCameraId,
+            maximumResolution = true,
+            handler = handler,
+            timeoutMillis = timeoutMillis,
+        )
+    }
+
+    val previewOutputs = buildList {
+        add(CameraSessionOutput(surface, physicalCameraId))
+        additionalPreviewSurface?.let {
+            add(CameraSessionOutput(it, physicalCameraId))
+        }
+    }
+
+    // A live preview must never depend on the device accepting a full-resolution RAW output at the
+    // same time. RAW is admitted only for the shutter transaction; rejection falls back to the
+    // exact viewfinder outputs that were already working before the shutter was pressed.
+    if (RawSessionMode.isRequested()) {
+        val preparedRaw = RawCaptureRegistry.prepareOutput(this, physicalCameraId, handler)
+        if (preparedRaw != null) {
+            try {
+                val lease = awaitCaptureSession(
+                    outputs = previewOutputs +
+                        CameraSessionOutput(preparedRaw.reader.surface, physicalCameraId),
+                    handler = handler,
+                    timeoutMillis = timeoutMillis,
+                )
+                RawCaptureRegistry.attach(preparedRaw, this, lease.session, handler)
+                return lease
+            } catch (timeout: TimeoutCancellationException) {
+                RawCaptureRegistry.combinedSessionRejected(
+                    preparedRaw,
+                    "Viewfinder + RAW session configuration timed out; viewfinder-only fallback is active",
+                )
+            } catch (cancelled: CancellationException) {
+                runCatching { preparedRaw.reader.close() }
+                throw cancelled
+            } catch (error: Throwable) {
+                if (error is VirtualMachineError || error is ThreadDeath) throw error
+                RawCaptureRegistry.combinedSessionRejected(
+                    preparedRaw,
+                    "Viewfinder + RAW session unsupported; viewfinder-only fallback is active",
+                )
+            }
+        }
+    }
+
+    return awaitCaptureSession(
+        outputs = previewOutputs,
+        handler = handler,
+        timeoutMillis = timeoutMillis,
+    )
+}
+
+private suspend fun CameraDevice.awaitSingleCaptureSession(
+    surface: Surface,
+    physicalCameraId: String?,
+    maximumResolution: Boolean,
     handler: Handler,
     timeoutMillis: Long,
 ): CaptureSessionLease = withTimeout(timeoutMillis) {
