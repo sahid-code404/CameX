@@ -15,6 +15,7 @@ import com.sahidcode404.camex.core.camera.raw.RawFailureKind
 import com.sahidcode404.camex.core.camera.raw.RawProfileRetry
 import com.sahidcode404.camex.core.camera.raw.RawProfileTrustObserver
 import com.sahidcode404.camex.core.camera.raw.RawSameCanonicalFailoverExecutor
+import com.sahidcode404.camex.core.camera.raw.RawSessionMode
 import com.sahidcode404.camex.core.camera.raw.mayTriggerProfileFailover
 import com.sahidcode404.camex.core.camera.topology.CameraProfile
 import com.sahidcode404.camex.core.camera.topology.CameraRoute
@@ -72,6 +73,7 @@ class CameraRuntimeCoordinator(
 ) : Closeable {
     private val startMutex = Mutex()
     private val selectionRequestMutex = Mutex()
+    private val rawCaptureMutex = Mutex()
     private val selectionTracker = ActiveCameraSelectionTracker()
     private val selectionIntentEpoch = AtomicLong(0L)
     private val mutablePhase = MutableStateFlow<CameraRuntimePhase>(
@@ -194,6 +196,7 @@ class CameraRuntimeCoordinator(
     /** Explicit canonical-lens request. Automatic sibling-profile failover remains one generation. */
     suspend fun selectLens(lens: LensDescriptor) {
         selectionIntentEpoch.incrementAndGet()
+        RawSessionMode.clear()
         selectionRequestMutex.withLock {
             RawCaptureRegistry.invalidateSelection()
             selectionTracker.beginSelection(lens)
@@ -202,70 +205,98 @@ class CameraRuntimeCoordinator(
     }
 
     /**
-     * One shutter operation. The first attempt uses the verified active profile; only a structural
-     * RAW incompatibility may rotate through other ranked profiles of the same canonical lens.
+     * One shutter operation. Normal camera operation remains preview-only. A RAW-capable combined
+     * session is armed only for this bounded transaction, then the exact active profile is returned
+     * to a normal PRIVATE preview session. Structural RAW incompatibility may still rotate only
+     * through transport profiles of the same canonical optical lens.
      */
-    suspend fun captureRaw(): RawCaptureResult {
+    suspend fun captureRaw(): RawCaptureResult = rawCaptureMutex.withLock {
         val initialSelection = mutableActiveSelection.value
         if (initialSelection?.verified != true) {
-            return RawCaptureRegistry.captureCurrentDirect()
+            return@withLock RawCaptureRegistry.captureCurrentDirect()
         }
 
         val generation = initialSelection.selectionGeneration
         val intentEpoch = selectionIntentEpoch.get()
         val canonicalFingerprint = initialSelection.canonicalLensFingerprint
-        val initialProfileFingerprint = initialSelection.activeProfileFingerprint
-            ?: profileFingerprintForRoutingKey(
-                initialSelection.activeProfileRoutingKey,
-                canonicalFingerprint,
-            )
+        val initialRoutingKey = initialSelection.activeProfileRoutingKey
 
-        RawCaptureRegistry.updateActiveSelectionDetails(
-            selectionGeneration = generation,
-            routingKey = initialSelection.activeProfileRoutingKey,
-            canonicalFingerprint = canonicalFingerprint?.value,
-            profileFingerprint = initialProfileFingerprint,
-        )
-        val initialResult = RawCaptureRegistry.captureRaw(
-            RawCaptureRequest(
+        RawSessionMode.request()
+        try {
+            val preparedSelection = prepareRawSession(initialSelection, intentEpoch)
+            if (preparedSelection == null) {
+                val failed = if (!permissionGranted || selectionIntentEpoch.get() != intentEpoch) {
+                    staleRawFailure("Camera selection changed while preparing RAW capture")
+                } else {
+                    RawCaptureResult.Failed(
+                        reason = "Timed out preparing the RAW capture session",
+                        structural = false,
+                        diagnostics = RawCaptureRegistry.rawCaptureState.value.diagnostics.copy(
+                            lastRawError = "RAW session preparation timeout",
+                        ),
+                        failureKind = RawFailureKind.TIMEOUT,
+                    )
+                }
+                RawCaptureRegistry.publishResult(failed)
+                return@withLock failed
+            }
+
+            val initialProfileFingerprint = preparedSelection.activeProfileFingerprint
+                ?: profileFingerprintForRoutingKey(
+                    preparedSelection.activeProfileRoutingKey,
+                    canonicalFingerprint,
+                )
+
+            RawCaptureRegistry.updateActiveSelectionDetails(
                 selectionGeneration = generation,
+                routingKey = preparedSelection.activeProfileRoutingKey,
                 canonicalFingerprint = canonicalFingerprint?.value,
                 profileFingerprint = initialProfileFingerprint,
-            ),
-        )
-        recordRawProfileTrust(initialSelection.activeProfileRoutingKey, initialResult)
+            )
+            val initialResult = RawCaptureRegistry.captureRaw(
+                RawCaptureRequest(
+                    selectionGeneration = generation,
+                    canonicalFingerprint = canonicalFingerprint?.value,
+                    profileFingerprint = initialProfileFingerprint,
+                ),
+            )
+            recordRawProfileTrust(preparedSelection.activeProfileRoutingKey, initialResult)
 
-        if (!initialResult.mayTriggerProfileFailover() ||
-            canonicalFingerprint == null || initialProfileFingerprint == null
-        ) {
-            return initialResult
+            if (!initialResult.mayTriggerProfileFailover() ||
+                canonicalFingerprint == null || initialProfileFingerprint == null
+            ) {
+                return@withLock initialResult
+            }
+
+            val executor = RawSameCanonicalFailoverExecutor(
+                routes = topology.value.routes,
+                canonicalFingerprint = canonicalFingerprint,
+                initialProfileFingerprint = initialProfileFingerprint,
+            )
+            val execution = executor.recover(
+                initialResult = initialResult,
+                isSelectionCurrent = {
+                    isOriginalRawSelectionCurrent(generation, canonicalFingerprint, intentEpoch)
+                },
+                retry = { candidate, _ ->
+                    retryRawOnSameCanonicalProfile(
+                        candidate = candidate,
+                        canonicalFingerprint = canonicalFingerprint,
+                        generation = generation,
+                        intentEpoch = intentEpoch,
+                    )
+                },
+            )
+            RawCaptureRegistry.publishResult(execution.result)
+            execution.result
+        } finally {
+            restorePreviewOnlyAfterRaw(initialRoutingKey)
         }
-
-        val executor = RawSameCanonicalFailoverExecutor(
-            routes = topology.value.routes,
-            canonicalFingerprint = canonicalFingerprint,
-            initialProfileFingerprint = initialProfileFingerprint,
-        )
-        val execution = executor.recover(
-            initialResult = initialResult,
-            isSelectionCurrent = {
-                isOriginalRawSelectionCurrent(generation, canonicalFingerprint, intentEpoch)
-            },
-            retry = { candidate, _ ->
-                retryRawOnSameCanonicalProfile(
-                    candidate = candidate,
-                    canonicalFingerprint = canonicalFingerprint,
-                    generation = generation,
-                    intentEpoch = intentEpoch,
-                )
-            },
-        )
-        RawCaptureRegistry.publishResult(execution.result)
-        return execution.result
     }
 
     suspend fun normalRescan() {
         selectionIntentEpoch.incrementAndGet()
+        RawSessionMode.clear()
         RawCaptureRegistry.invalidateSelection()
         reconciliationJob?.cancel()
         session.clearTransientFailureMemory()
@@ -287,6 +318,7 @@ class CameraRuntimeCoordinator(
 
     suspend fun deepRescan() {
         selectionIntentEpoch.incrementAndGet()
+        RawSessionMode.clear()
         RawCaptureRegistry.invalidateSelection()
         reconciliationJob?.cancel()
         session.clearTransientFailureMemory()
@@ -308,6 +340,7 @@ class CameraRuntimeCoordinator(
 
     suspend fun resetDiscoveryCache() {
         selectionIntentEpoch.incrementAndGet()
+        RawSessionMode.clear()
         reconciliationJob?.cancel()
         discovery.resetDiscoveryCache()
         session.clearTransientFailureMemory()
@@ -320,6 +353,7 @@ class CameraRuntimeCoordinator(
     suspend fun pause() {
         selectionIntentEpoch.incrementAndGet()
         permissionGranted = false
+        RawSessionMode.clear()
         reconciliationJob?.cancel()
         RawCaptureRegistry.invalidateSelection()
         session.pause()
@@ -333,10 +367,61 @@ class CameraRuntimeCoordinator(
 
     override fun close() {
         selectionIntentEpoch.incrementAndGet()
+        RawSessionMode.clear()
         reconciliationJob?.cancel()
         RawCaptureRegistry.clearCaptureOrchestrator()
         RawCaptureRegistry.invalidateSelection()
         session.close()
+    }
+
+    private suspend fun prepareRawSession(
+        expected: ActiveCameraSelection,
+        intentEpoch: Long,
+    ): ActiveCameraSelection? {
+        if (!permissionGranted || selectionIntentEpoch.get() != intentEpoch) return null
+
+        // Reuse the authoritative session owner instead of opening a second CameraDevice. Pausing
+        // closes the normal preview session; resume reopens the exact selected profile while the
+        // RAW mode gate is armed, so Camera2Primitives adds the RAW_SENSOR output only here.
+        session.pause()
+        if (!permissionGranted || selectionIntentEpoch.get() != intentEpoch) return null
+        session.resume()
+
+        return withTimeoutOrNull(RAW_PROFILE_VERIFY_TIMEOUT_MILLIS) {
+            activeSelection.first { selection ->
+                selection?.verified == true &&
+                    selection.selectionGeneration == expected.selectionGeneration &&
+                    selection.activeProfileRoutingKey == expected.activeProfileRoutingKey &&
+                    sameCanonicalFingerprint(
+                        selection.canonicalLensFingerprint,
+                        expected.canonicalLensFingerprint,
+                    )
+            }
+        }
+    }
+
+    private suspend fun restorePreviewOnlyAfterRaw(initialRoutingKey: String) {
+        val rawSessionAttached = RawCaptureRegistry.rawCaptureState.value.capability.sessionReady
+        RawSessionMode.clear()
+        if (!rawSessionAttached || !permissionGranted) return
+
+        try {
+            // Strip the RAW output after capture. The delegate retains whichever exact profile is
+            // now selected (including a same-canonical failover profile) and reopens it preview-only.
+            session.pause()
+            if (permissionGranted) session.resume()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (fatal: VirtualMachineError) {
+            throw fatal
+        } catch (fatal: ThreadDeath) {
+            throw fatal
+        } catch (error: Throwable) {
+            mutablePhase.value = CameraRuntimePhase.ErrorRecoverable(
+                "Preview restore failed after RAW capture (${initialRoutingKey.take(48)}): " +
+                    error.javaClass.simpleName,
+            )
+        }
     }
 
     private suspend fun retryRawOnSameCanonicalProfile(
@@ -617,6 +702,13 @@ class CameraRuntimeCoordinator(
     private fun ProbeFailureKind?.isStructuralProfileFailure(): Boolean =
         this == ProbeFailureKind.INVALID_METADATA ||
             this == ProbeFailureKind.SESSION_CONFIGURATION
+
+    private fun sameCanonicalFingerprint(left: LensFingerprint?, right: LensFingerprint?): Boolean =
+        when {
+            left == null && right == null -> true
+            left == null || right == null -> false
+            else -> left.value == right.value
+        }
 
     private companion object {
         const val RAW_PROFILE_VERIFY_TIMEOUT_MILLIS = 3_000L
