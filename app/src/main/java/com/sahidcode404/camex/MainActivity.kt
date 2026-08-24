@@ -1,10 +1,7 @@
 package com.sahidcode404.camex
 
 import android.Manifest
-import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
-import android.provider.Settings
 import android.view.TextureView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -15,13 +12,8 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -37,7 +29,6 @@ import com.sahidcode404.camex.core.camera.raw.RawCaptureRegistry
 import com.sahidcode404.camex.core.camera.raw.RawCaptureState
 import com.sahidcode404.camex.core.camera.raw.RawCompatibilityReportJson
 import com.sahidcode404.camex.core.model.Size2D
-import com.sahidcode404.camex.core.update.UpdateChannel
 import com.sahidcode404.camex.core.update.UpdateState
 import com.sahidcode404.camex.feature.camera.CameraScreen
 import com.sahidcode404.camex.feature.diagnostics.DiagnosticField
@@ -51,6 +42,12 @@ import kotlinx.coroutines.launch
 class MainActivity : ComponentActivity() {
     private val viewModel: CameraViewModel by viewModels()
     private val updateViewModel: UpdateViewModel by viewModels()
+    private var cameraPermissionRequestedThisActivity = false
+    private val cameraPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        viewModel.onCameraPermission(granted)
+    }
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
@@ -64,15 +61,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        updateViewModel.refreshInstallPermission()
-        updateViewModel.checkForUpdatesIfDue()
+        requestCameraPermissionImmediatelyIfNeeded()
     }
 
     override fun onResume() {
         super.onResume()
         // Standard Camera2 ownership: acquire only while interactive. The TextureView itself remains
         // stable, so returning from another camera app reuses one surface while Camera2 rebuilds its
-        // producer/session geometry and transform from current capabilities.
+        // producer/session geometry and transform from current cached capabilities.
         viewModel.onCameraPermission(hasCameraPermission())
     }
 
@@ -81,6 +77,12 @@ class MainActivity : ComponentActivity() {
         // Do not recreate the TextureView here; only the Camera2 producer/session is cycled.
         viewModel.onBackground()
         super.onPause()
+    }
+
+    private fun requestCameraPermissionImmediatelyIfNeeded() {
+        if (hasCameraPermission() || cameraPermissionRequestedThisActivity) return
+        cameraPermissionRequestedThisActivity = true
+        cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
     }
 
     private fun hasCameraPermission(): Boolean = ContextCompat.checkSelfPermission(
@@ -103,26 +105,14 @@ private fun CameraApplication(
     val rawState by RawCaptureRegistry.rawCaptureState.collectAsStateWithLifecycle()
     var screen by rememberSaveable { mutableStateOf(AppScreen.CAMERA) }
     var pendingReport by remember { mutableStateOf<String?>(null) }
-    var permissionRequested by rememberSaveable { mutableStateOf(false) }
-    var promptedVersionCode by rememberSaveable { mutableStateOf<Long?>(null) }
-    var showUpdatePrompt by rememberSaveable { mutableStateOf(false) }
 
+    // Startup is camera-only: do not perform network update checks or show update dialogs while the
+    // user is waiting for the first preview frame. Updates remain explicit from Diagnostics.
     val availableUpdate = (updateState.updateState as? UpdateState.Available)?.update
-    LaunchedEffect(availableUpdate?.manifest?.versionCode) {
-        val update = availableUpdate ?: return@LaunchedEffect
-        if (promptedVersionCode != update.manifest.versionCode) {
-            promptedVersionCode = update.manifest.versionCode
-            showUpdatePrompt = true
-        }
-    }
 
     BackHandler(enabled = screen != AppScreen.CAMERA) {
         screen = if (screen == AppScreen.UPDATES) AppScreen.DIAGNOSTICS else AppScreen.CAMERA
     }
-
-    val permissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) { granted -> viewModel.onCameraPermission(granted) }
 
     val reportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/json"),
@@ -146,22 +136,7 @@ private fun CameraApplication(
             state = state.camera,
             rawState = rawState,
             previewContent = { CameraPreview(viewModel) },
-            permissionPermanentlyDenied = !state.camera.permissionGranted &&
-                permissionRequested &&
-                !activity.shouldShowRequestPermissionRationale(Manifest.permission.CAMERA),
             updateAvailable = availableUpdate != null,
-            onRequestPermission = {
-                permissionRequested = true
-                permissionLauncher.launch(Manifest.permission.CAMERA)
-            },
-            onOpenAppSettings = {
-                context.startActivity(
-                    Intent(
-                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                        Uri.fromParts("package", context.packageName, null),
-                    ),
-                )
-            },
             onSelectLens = viewModel::selectLens,
             onSwitchFacing = viewModel::switchFacing,
             onCapture = {
@@ -169,7 +144,6 @@ private fun CameraApplication(
             },
             onOpenLensSettings = { screen = AppScreen.LENS_SETTINGS },
             onOpenDiagnostics = { screen = AppScreen.DIAGNOSTICS },
-            onRetry = viewModel::rescanCameras,
         )
         AppScreen.LENS_SETTINGS -> LensSettingsScreen(
             lenses = state.lensSettings,
@@ -198,7 +172,10 @@ private fun CameraApplication(
             onNormalRescan = viewModel::rescanCameras,
             onDeepRescan = viewModel::deepRescanCameras,
             onResetDiscoveryCache = viewModel::resetDiscoveryCache,
-            onOpenUpdates = { screen = AppScreen.UPDATES },
+            onOpenUpdates = {
+                updateViewModel.refreshInstallPermission()
+                screen = AppScreen.UPDATES
+            },
             onExport = {
                 val report = runCatching {
                     RawCompatibilityReportJson.append(viewModel.compatibilityReportJson(), rawState)
@@ -221,52 +198,6 @@ private fun CameraApplication(
             onInstall = updateViewModel::installUpdate,
             onOpenInstallPermissionSettings = updateViewModel::openInstallPermissionSettings,
             onResetFailure = updateViewModel::resetFailure,
-        )
-    }
-
-    if (showUpdatePrompt && availableUpdate != null && screen == AppScreen.CAMERA) {
-        val manifest = availableUpdate.manifest
-        val isDevelopment = updateState.channel == UpdateChannel.DEVELOPMENT
-        AlertDialog(
-            onDismissRequest = { showUpdatePrompt = false },
-            title = {
-                Text(
-                    if (isDevelopment) {
-                        "Development update available"
-                    } else {
-                        "Camera ${manifest.versionName} is available"
-                    },
-                )
-            },
-            text = {
-                Text(
-                    if (isDevelopment) {
-                        buildString {
-                            append("Build: ${manifest.versionName}")
-                            manifest.gitSha.takeIf { it.isNotBlank() }?.let { sha ->
-                                append("\nCommit: ${sha.take(12)}")
-                            }
-                            manifest.changelog.takeIf { it.isNotBlank() }?.let { changelog ->
-                                append("\n\n$changelog")
-                            }
-                        }
-                    } else {
-                        manifest.changelog.takeIf { it.isNotBlank() }
-                            ?: "A newer version of Camera is ready to download."
-                    },
-                )
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        showUpdatePrompt = false
-                        screen = AppScreen.UPDATES
-                    },
-                ) { Text("Update") }
-            },
-            dismissButton = {
-                TextButton(onClick = { showUpdatePrompt = false }) { Text("Later") }
-            },
         )
     }
 }
