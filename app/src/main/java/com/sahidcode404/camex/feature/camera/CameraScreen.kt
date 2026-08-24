@@ -89,6 +89,10 @@ fun CameraScreen(
             modifier = Modifier.align(Alignment.TopCenter),
         )
 
+        // Opening and lens switching are transient camera states, not user-facing modal states.
+        // Keep the last TextureView frame visible and never cover it with an "Opening/Switching"
+        // prompt. Only permission, real recoverable failures, or an actually empty lens list deserve
+        // an overlay.
         when {
             !state.permissionGranted -> PermissionPrompt(
                 permanentlyDenied = permissionPermanentlyDenied,
@@ -101,7 +105,7 @@ fun CameraScreen(
                 onRetry = onRetry,
                 modifier = Modifier.align(Alignment.Center),
             )
-            !state.previewVisible -> Text(
+            state.lenses.isEmpty() -> Text(
                 text = state.statusText,
                 color = Color.White,
                 textAlign = TextAlign.Center,
