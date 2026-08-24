@@ -14,6 +14,7 @@ import androidx.activity.viewModels
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -105,9 +106,18 @@ private fun CameraApplication(
     val rawState by RawCaptureRegistry.rawCaptureState.collectAsStateWithLifecycle()
     var screen by rememberSaveable { mutableStateOf(AppScreen.CAMERA) }
     var pendingReport by remember { mutableStateOf<String?>(null) }
+    var automaticUpdateCheckStarted by rememberSaveable { mutableStateOf(false) }
 
-    // Startup is camera-only: do not perform network update checks or show update dialogs while the
-    // user is waiting for the first preview frame. Updates remain explicit from Diagnostics.
+    // Keep launch camera-only. The automatic OTA check is deferred until the first verified preview
+    // so networking cannot compete with Camera2 startup. It runs once per activity, never per lens
+    // switch, and never opens a modal. This is an in-process coroutine, not a Service.
+    LaunchedEffect(state.camera.previewVisible, automaticUpdateCheckStarted) {
+        if (state.camera.previewVisible && !automaticUpdateCheckStarted) {
+            automaticUpdateCheckStarted = true
+            updateViewModel.checkForUpdatesIfDue()
+        }
+    }
+
     val availableUpdate = (updateState.updateState as? UpdateState.Available)?.update
 
     BackHandler(enabled = screen != AppScreen.CAMERA) {
