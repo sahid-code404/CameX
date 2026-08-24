@@ -23,6 +23,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -31,6 +32,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import com.sahidcode404.camex.core.camera.raw.RawCaptureRegistry
@@ -55,7 +59,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        viewModel.onCameraPermission(hasCameraPermission())
         setContent {
             CameraTheme(darkTheme = true) {
                 CameraApplication(viewModel, updateViewModel, this@MainActivity)
@@ -65,14 +68,23 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        viewModel.onCameraPermission(hasCameraPermission())
         updateViewModel.refreshInstallPermission()
         updateViewModel.checkForUpdatesIfDue()
     }
 
-    override fun onStop() {
+    override fun onResume() {
+        super.onResume()
+        // Camera ownership starts only while this Activity is actually interactive. Releasing on
+        // onPause avoids fighting another camera app and guarantees a clean HAL/session reacquire.
+        viewModel.onCameraPermission(hasCameraPermission())
+    }
+
+    override fun onPause() {
+        // Close CameraDevice/session before another foreground app can acquire the camera. Waiting
+        // for onStop leaves a real overlap window on activity switches and can preserve stale
+        // SurfaceTexture producer geometry on some HALs.
         viewModel.onBackground()
-        super.onStop()
+        super.onPause()
     }
 
     private fun hasCameraPermission(): Boolean = ContextCompat.checkSelfPermission(
@@ -170,6 +182,8 @@ private fun CameraApplication(
             onRename = viewModel::renameLens,
             onMove = viewModel::moveLens,
             onSetOneXReference = viewModel::setOneXReference,
+            onSetPreviewSize = viewModel::setPreviewSize,
+            onSetPreviewFps = viewModel::setPreviewFps,
         )
         AppScreen.DIAGNOSTICS -> DiagnosticsScreen(
             state = state.diagnostics,
@@ -297,10 +311,27 @@ private fun formatSize(size: Size2D): String = "${size.width}×${size.height}"
 @Composable
 private fun CameraPreview(viewModel: CameraViewModel) {
     val context = LocalContext.current
-    val textureView = remember(context) { TextureView(context).apply { isOpaque = true } }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var surfaceEpoch by remember { mutableIntStateOf(0) }
+
+    // Recreate the producer surface after every pause/resume boundary. A TextureView can retain the
+    // previous camera producer's default buffer geometry even after its Matrix is reset; a fresh
+    // SurfaceTexture generation removes that stale HAL/buffer-queue state instead of compensating
+    // with device-specific transform hacks.
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) surfaceEpoch += 1
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    val textureView = remember(context, surfaceEpoch) {
+        TextureView(context).apply { isOpaque = true }
+    }
     AndroidView(factory = { textureView }, modifier = Modifier.fillMaxSize())
     DisposableEffect(textureView, viewModel) {
         viewModel.bindPreview(textureView)
-        onDispose { viewModel.unbindPreview() }
+        onDispose { viewModel.unbindPreview(textureView) }
     }
 }
