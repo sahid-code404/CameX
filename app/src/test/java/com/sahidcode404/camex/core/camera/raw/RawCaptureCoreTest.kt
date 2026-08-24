@@ -17,6 +17,18 @@ import org.junit.Test
 
 class RawCaptureCoreTest {
     @Test
+    fun rawSessionModeIsPreviewOnlyByDefaultAndExplicitlyBounded() {
+        RawSessionMode.clear()
+        assertFalse(RawSessionMode.isRequested())
+
+        RawSessionMode.request()
+        assertTrue(RawSessionMode.isRequested())
+
+        RawSessionMode.clear()
+        assertFalse(RawSessionMode.isRequested())
+    }
+
+    @Test
     fun rawSupportedSelectsLargestStandardRawSensorSize() {
         val lens = lens(
             raw = CapabilitySupport.SUPPORTED,
