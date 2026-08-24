@@ -137,6 +137,7 @@ readonly DUPLICATE_FILTER=app/src/main/java/com/sahidcode404/camex/core/logic/Le
 readonly DIAGNOSTICS_SCREEN=app/src/main/java/com/sahidcode404/camex/feature/diagnostics/DiagnosticsScreen.kt
 readonly COMPATIBILITY_REPORT=app/src/main/java/com/sahidcode404/camex/core/model/CompatibilityReport.kt
 readonly COMPATIBILITY_FACTORY=app/src/main/java/com/sahidcode404/camex/core/diagnostics/CompatibilityReportFactory.kt
+readonly PREVIEW_PREFERENCES=app/src/main/java/com/sahidcode404/camex/core/camera/PreviewPreferenceRegistry.kt
 
 reject_pattern \
   "numeric Camera2 ID used as a dispatch condition" \
@@ -188,6 +189,11 @@ reject_pattern \
 reject_pattern \
   "global rediscovery during lens switch" \
   '(?is)fun\s+(?:selectLens|switchFacing)\s*\([^)]*\)\s*\{.{0,1800}?\b(?:normalRescan|deepRescan|reconcile\s*\(|seedPrimaryRoute)\b' \
+  --multiline --multiline-dotall "${VIEW_MODEL}"
+
+reject_pattern \
+  "preview surface binding chooses or rediscovers a camera" \
+  '(?is)fun\s+bindPreview\s*\([^)]*\)\s*\{.{0,1600}?\b(?:selectLens|switchFacing|normalRescan|deepRescan|reconcile\s*\(|seedPrimaryRoute)\b' \
   --multiline --multiline-dotall "${VIEW_MODEL}"
 
 reject_pattern \
@@ -248,8 +254,12 @@ require_pattern "canonical fingerprint collision guard" '\bfun\s+CameraTopology\
 require_pattern "topology repository repairs collisions before publish" '\bwithUniqueCanonicalFingerprints\s*\(' "${TOPOLOGY_REPOSITORY}"
 require_pattern \
   "selection-neutral preview bind" \
-  '(?s)fun\s+bindPreview\s*\(\s*view:\s*android\.view\.TextureView\s*\)\s*\{\s*launchSafely\s*\{\s*controller\.bindPreview\s*\(\s*view\s*\)\s*\}\s*\}' \
+  '(?s)fun\s+bindPreview\s*\(\s*view:\s*TextureView\s*\)\s*\{.{0,1200}?controller\.bindPreview\s*\(\s*view\s*\)' \
   --multiline --multiline-dotall "${VIEW_MODEL}"
+require_pattern "identity-guarded preview binding" '\bboundPreviewView\b' "${VIEW_MODEL}"
+require_pattern "serialized preview binding" '\bpreviewBindingMutex\s*\.\s*withLock\b' "${VIEW_MODEL}"
+require_pattern "canonical preview preference cache" '\bobject\s+PreviewPreferenceRegistry\b' "${PREVIEW_PREFERENCES}"
+require_pattern "preview preferences keyed by optical fingerprint" '\blens\.fingerprint\b' "${PREVIEW_PREFERENCES}"
 require_pattern "canonical last-selection persistence" 'settingsStore\.setLastSelected\s*\(\s*selection\.facing\s*,\s*fingerprint\s*\)' "${VIEW_MODEL}"
 require_pattern "profile diagnostics UI model" '\bdata class CameraProfileDiagnosticsUiModel\b' "${DIAGNOSTICS_SCREEN}"
 require_pattern "nested canonical lens compatibility report" '\bdata class CanonicalLensCompatibilityReport\b' "${COMPATIBILITY_REPORT}"
