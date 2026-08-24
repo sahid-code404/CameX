@@ -55,7 +55,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        viewModel.onCameraPermission(hasCameraPermission())
         setContent {
             CameraTheme(darkTheme = true) {
                 CameraApplication(viewModel, updateViewModel, this@MainActivity)
@@ -65,14 +64,23 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        viewModel.onCameraPermission(hasCameraPermission())
         updateViewModel.refreshInstallPermission()
         updateViewModel.checkForUpdatesIfDue()
     }
 
-    override fun onStop() {
+    override fun onResume() {
+        super.onResume()
+        // Standard Camera2 ownership: acquire only while interactive. The TextureView itself remains
+        // stable, so returning from another camera app reuses one surface while Camera2 rebuilds its
+        // producer/session geometry and transform from current capabilities.
+        viewModel.onCameraPermission(hasCameraPermission())
+    }
+
+    override fun onPause() {
+        // Release CameraDevice/session promptly so another camera app never has to race this process.
+        // Do not recreate the TextureView here; only the Camera2 producer/session is cycled.
         viewModel.onBackground()
-        super.onStop()
+        super.onPause()
     }
 
     private fun hasCameraPermission(): Boolean = ContextCompat.checkSelfPermission(
