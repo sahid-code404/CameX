@@ -19,9 +19,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -61,23 +59,22 @@ fun CameraScreen(
     state: CameraScreenUiState,
     rawState: RawCaptureState,
     previewContent: @Composable () -> Unit,
-    permissionPermanentlyDenied: Boolean,
     modifier: Modifier = Modifier,
     updateAvailable: Boolean = false,
-    onRequestPermission: () -> Unit,
-    onOpenAppSettings: () -> Unit,
     onSelectLens: (String) -> Unit,
     onSwitchFacing: () -> Unit,
     onCapture: () -> Unit,
     onOpenLensSettings: () -> Unit,
     onOpenDiagnostics: () -> Unit,
-    onRetry: () -> Unit,
 ) {
     Box(
         modifier = modifier
             .fillMaxSize()
             .background(Color.Black),
     ) {
+        // The camera screen deliberately owns no startup/opening/switching/permission/error modal.
+        // Android owns the runtime permission prompt. Camera2 transient states remain invisible so
+        // the TextureView can become visible as soon as the first frame arrives.
         if (state.permissionGranted) {
             previewContent()
         }
@@ -88,32 +85,6 @@ fun CameraScreen(
             onOpenDiagnostics = onOpenDiagnostics,
             modifier = Modifier.align(Alignment.TopCenter),
         )
-
-        // Opening and lens switching are transient camera states, not user-facing modal states.
-        // Keep the last TextureView frame visible and never cover it with an "Opening/Switching"
-        // prompt. Only permission, real recoverable failures, or an actually empty lens list deserve
-        // an overlay.
-        when {
-            !state.permissionGranted -> PermissionPrompt(
-                permanentlyDenied = permissionPermanentlyDenied,
-                onRequestPermission = onRequestPermission,
-                onOpenAppSettings = onOpenAppSettings,
-                modifier = Modifier.align(Alignment.Center),
-            )
-            state.recoverableError != null -> ErrorPrompt(
-                message = state.recoverableError,
-                onRetry = onRetry,
-                modifier = Modifier.align(Alignment.Center),
-            )
-            state.lenses.isEmpty() -> Text(
-                text = state.statusText,
-                color = Color.White,
-                textAlign = TextAlign.Center,
-                modifier = Modifier
-                    .align(Alignment.Center)
-                    .padding(32.dp),
-            )
-        }
 
         CameraBottomControls(
             lenses = state.lenses,
@@ -166,61 +137,6 @@ private fun CameraTopBar(
                     )
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun PermissionPrompt(
-    permanentlyDenied: Boolean,
-    onRequestPermission: () -> Unit,
-    onOpenAppSettings: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Surface(
-        modifier = modifier.padding(28.dp),
-        color = Color(0xE6212226),
-        shape = RoundedCornerShape(24.dp),
-    ) {
-        Column(
-            modifier = Modifier.padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(
-                text = if (permanentlyDenied) {
-                    "Camera permission is disabled. Open app settings to enable discovery and preview."
-                } else {
-                    "Camera permission is required for discovery, preview, and RAW capture."
-                },
-                color = Color.White,
-                textAlign = TextAlign.Center,
-            )
-            Spacer(Modifier.height(18.dp))
-            Button(onClick = if (permanentlyDenied) onOpenAppSettings else onRequestPermission) {
-                Text(if (permanentlyDenied) "Open app settings" else "Allow camera")
-            }
-        }
-    }
-}
-
-@Composable
-private fun ErrorPrompt(
-    message: String,
-    onRetry: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Surface(
-        modifier = modifier.padding(28.dp),
-        color = Color(0xE6212226),
-        shape = RoundedCornerShape(24.dp),
-    ) {
-        Column(
-            modifier = Modifier.padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(message, color = Color.White, textAlign = TextAlign.Center)
-            Spacer(Modifier.height(16.dp))
-            Button(onClick = onRetry) { Text("Retry safely") }
         }
     }
 }
