@@ -1,5 +1,6 @@
 package com.sahidcode404.camex.feature.lenssettings
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -9,10 +10,10 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -33,13 +34,17 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.sahidcode404.camex.core.camera.PreviewPreferenceRegistry
+import com.sahidcode404.camex.core.camera.ViewfinderFormatCapability
 import com.sahidcode404.camex.core.model.FpsRange
 import com.sahidcode404.camex.core.model.Size2D
+import com.sahidcode404.camex.core.model.StreamFormat
+import kotlin.math.abs
 
 data class LensSettingsUiModel(
     val fingerprint: String,
@@ -51,12 +56,14 @@ data class LensSettingsUiModel(
     val supportsOneXReference: Boolean,
     val advanced: Boolean = false,
     val previewSizes: List<Size2D> = emptyList(),
-    /** Reported ranges are retained here only to build the one centralized FPS selector. */
+    /** Reported ranges feed the one centralized viewfinder FPS override. */
     val previewFpsRanges: List<FpsRange> = emptyList(),
     val selectedPreviewSize: Size2D? = null,
-    /** Legacy UI projection; FPS selection is now centralized and this is intentionally not shown. */
+    /** Kept for source compatibility with the existing ViewModel projection; no per-lens FPS UI. */
     val selectedPreviewFpsRange: FpsRange? = null,
 )
+
+private enum class ThresholdKind { LOWER, HIGH }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -72,27 +79,45 @@ fun LensSettingsScreen(
     modifier: Modifier = Modifier,
 ) {
     var editing by remember { mutableStateOf<LensSettingsUiModel?>(null) }
-    var previewSizeEditing by remember { mutableStateOf<LensSettingsUiModel?>(null) }
-    var previewFpsEditing by remember { mutableStateOf(false) }
-    val globalFpsTarget by PreviewPreferenceRegistry.globalFpsTarget.collectAsState()
-    val globalFpsOptions = remember(lenses) {
+    var viewfinderEditing by remember { mutableStateOf<LensSettingsUiModel?>(null) }
+    var thresholdEditing by remember { mutableStateOf<ThresholdKind?>(null) }
+
+    val globalFpsRange by PreviewPreferenceRegistry.globalFpsRange.collectAsState()
+    val viewfinderCapabilities by PreviewPreferenceRegistry.viewfinderCapabilities.collectAsState()
+    val reportedFpsRanges = remember(lenses) {
         lenses.asSequence()
             .flatMap { it.previewFpsRanges.asSequence() }
             .filter { it.isValid && it.max > 0 }
-            .map { it.max }
             .distinct()
-            .sortedDescending()
+            .sortedWith(compareBy<FpsRange> { it.min }.thenBy { it.max })
             .toList()
     }
+    val lowerThresholdOptions = remember(reportedFpsRanges, globalFpsRange) {
+        (reportedFpsRanges.map { it.min } + listOfNotNull(globalFpsRange?.min))
+            .filter { it >= 0 }
+            .distinct()
+            .sorted()
+    }
+    val highThresholdOptions = remember(reportedFpsRanges, globalFpsRange) {
+        (reportedFpsRanges.map { it.max } + listOfNotNull(globalFpsRange?.max))
+            .filter { it > 0 }
+            .distinct()
+            .sorted()
+    }
+
     val indexedLenses = lenses.withIndex().toList()
     val normalLenses = indexedLenses.filterNot { it.value.advanced }
     val advancedLenses = indexedLenses.filter { it.value.advanced }
+
+    fun persistGlobalRange(range: FpsRange?) {
+        onSetPreviewFps(PreviewPreferenceRegistry.GLOBAL_PREVIEW_FPS_FINGERPRINT, range)
+    }
 
     Scaffold(
         modifier = modifier.fillMaxSize(),
         topBar = {
             TopAppBar(
-                title = { Text("Lens settings") },
+                title = { Text("Camera settings") },
                 navigationIcon = { TextButton(onClick = onBack) { Text("Back") } },
             )
         },
@@ -103,17 +128,50 @@ fun LensSettingsScreen(
             contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
         ) {
             item {
-                Text(
-                    text = "Preview stream selection is per optical lens. Frame rate is one global target. Every option comes from Camera2 metadata; unsupported or stale choices fall back to Auto instead of breaking a lens.",
-                    style = MaterialTheme.typography.bodySmall,
+                SettingsSectionHeader("VIEWFINDER")
+            }
+            item {
+                ViewfinderFrameRateCard(
+                    range = globalFpsRange,
+                    availableRanges = reportedFpsRanges,
+                    onOverrideChanged = { enabled ->
+                        if (!enabled) {
+                            persistGlobalRange(null)
+                        } else {
+                            recommendedGlobalRange(reportedFpsRanges)?.let(::persistGlobalRange)
+                        }
+                    },
+                    onEditLower = { thresholdEditing = ThresholdKind.LOWER },
+                    onEditHigh = { thresholdEditing = ThresholdKind.HIGH },
                 )
             }
             item {
-                GlobalPreviewFpsCard(
-                    options = globalFpsOptions,
-                    selectedFps = globalFpsTarget,
-                    onEdit = { previewFpsEditing = true },
+                Text(
+                    text = "Per-lens viewfinder stream",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(top = 6.dp),
                 )
+            }
+            item {
+                Text(
+                    text = "Each lens keeps its own Camera2 PRIVATE stream size. Auto is the default. The detail page also shows every other stream format the camera reports, without pretending capture-only outputs are zero-copy viewfinder backends.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            itemsIndexed(
+                items = lenses,
+                key = { _, lens -> "viewfinder:${lens.fingerprint}" },
+            ) { _, lens ->
+                ViewfinderLensRow(
+                    lens = lens,
+                    capability = viewfinderCapabilities[lens.fingerprint],
+                    onClick = { viewfinderEditing = lens },
+                )
+            }
+
+            item {
+                SettingsSectionHeader("LENS MANAGEMENT")
             }
             item {
                 LensSettingsSectionHeader(
@@ -124,7 +182,7 @@ fun LensSettingsScreen(
             }
             itemsIndexed(
                 items = normalLenses,
-                key = { _, indexed -> indexed.value.fingerprint },
+                key = { _, indexed -> "manage:${indexed.value.fingerprint}" },
             ) { sectionIndex, indexed ->
                 LensPreferenceCard(
                     lens = indexed.value,
@@ -132,7 +190,6 @@ fun LensSettingsScreen(
                     canMoveDown = sectionIndex < normalLenses.lastIndex,
                     onSetVisible = { onSetVisible(indexed.value.fingerprint, it) },
                     onEditName = { editing = indexed.value },
-                    onEditPreviewSize = { previewSizeEditing = indexed.value },
                     onMoveUp = {
                         onMove(indexed.index, normalLenses[sectionIndex - 1].index)
                     },
@@ -154,7 +211,7 @@ fun LensSettingsScreen(
             }
             itemsIndexed(
                 items = advancedLenses,
-                key = { _, indexed -> indexed.value.fingerprint },
+                key = { _, indexed -> "advanced:${indexed.value.fingerprint}" },
             ) { sectionIndex, indexed ->
                 LensPreferenceCard(
                     lens = indexed.value,
@@ -162,7 +219,6 @@ fun LensSettingsScreen(
                     canMoveDown = sectionIndex < advancedLenses.lastIndex,
                     onSetVisible = { onSetVisible(indexed.value.fingerprint, it) },
                     onEditName = { editing = indexed.value },
-                    onEditPreviewSize = { previewSizeEditing = indexed.value },
                     onMoveUp = {
                         onMove(indexed.index, advancedLenses[sectionIndex - 1].index)
                     },
@@ -187,62 +243,300 @@ fun LensSettingsScreen(
             },
         )
     }
-    previewSizeEditing?.let { lens ->
-        PreviewSizeDialog(
+
+    viewfinderEditing?.let { lens ->
+        ViewfinderStreamDialog(
             lens = lens,
-            onDismiss = { previewSizeEditing = null },
-            onSelect = { size ->
+            reportedCapabilities = viewfinderCapabilities[lens.fingerprint].orEmpty(),
+            onDismiss = { viewfinderEditing = null },
+            onSelectPrivateSize = { size ->
                 onSetPreviewSize(lens.fingerprint, size)
-                previewSizeEditing = null
+                viewfinderEditing = null
             },
         )
     }
-    if (previewFpsEditing) {
-        GlobalPreviewFpsDialog(
-            options = globalFpsOptions,
-            selectedFps = globalFpsTarget,
-            onDismiss = { previewFpsEditing = false },
-            onSelect = { fps ->
-                onSetPreviewFps(
-                    PreviewPreferenceRegistry.GLOBAL_PREVIEW_FPS_FINGERPRINT,
-                    fps?.let { FpsRange(it, it) },
-                )
-                previewFpsEditing = false
+
+    thresholdEditing?.let { kind ->
+        val current = globalFpsRange ?: recommendedGlobalRange(reportedFpsRanges)
+        ThresholdDialog(
+            title = if (kind == ThresholdKind.LOWER) "Lower threshold" else "High threshold",
+            options = if (kind == ThresholdKind.LOWER) lowerThresholdOptions else highThresholdOptions,
+            selected = if (kind == ThresholdKind.LOWER) current?.min else current?.max,
+            onDismiss = { thresholdEditing = null },
+            onSelect = { value ->
+                val basis = current ?: FpsRange(value, value)
+                val next = if (kind == ThresholdKind.LOWER) {
+                    FpsRange(value, basis.max.coerceAtLeast(value))
+                } else {
+                    FpsRange(basis.min.coerceAtMost(value), value)
+                }
+                persistGlobalRange(next)
+                thresholdEditing = null
             },
         )
     }
 }
 
 @Composable
-private fun GlobalPreviewFpsCard(
-    options: List<Int>,
-    selectedFps: Int?,
-    onEdit: () -> Unit,
+private fun ViewfinderFrameRateCard(
+    range: FpsRange?,
+    availableRanges: List<FpsRange>,
+    onOverrideChanged: (Boolean) -> Unit,
+    onEditLower: () -> Unit,
+    onEditHigh: () -> Unit,
 ) {
     Card(Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(5.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text("Preview frame rate", fontWeight = FontWeight.SemiBold)
-            val available = selectedFps == null || selectedFps in options
-            Text(
-                when {
-                    selectedFps == null -> "Auto (recommended)"
-                    available -> "$selectedFps fps target"
-                    else -> "Auto · saved $selectedFps fps target is unavailable"
-                },
-                style = MaterialTheme.typography.bodySmall,
-            )
-            Text(
-                "One setting for every lens. Each camera maps the target only to an FPS range it actually reports.",
-                style = MaterialTheme.typography.bodySmall,
-            )
-            TextButton(onClick = onEdit, enabled = options.isNotEmpty()) {
-                Text("Choose frame rate")
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("Viewfinder frame rate", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "One centralized override for every lens. Each active profile maps it only to a range that Camera2 actually reports.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Switch(
+                    checked = range != null,
+                    onCheckedChange = onOverrideChanged,
+                    enabled = availableRanges.isNotEmpty(),
+                )
             }
+
+            SettingValueRow(
+                title = "Lower threshold",
+                value = range?.min?.let { "$it fps" } ?: "Auto",
+                enabled = range != null,
+                onClick = onEditLower,
+            )
+            SettingValueRow(
+                title = "High threshold",
+                value = range?.max?.let { "$it fps" } ?: "Auto",
+                enabled = range != null,
+                onClick = onEditHigh,
+            )
         }
     }
+}
+
+@Composable
+private fun ViewfinderLensRow(
+    lens: LensSettingsUiModel,
+    capability: List<ViewfinderFormatCapability>?,
+    onClick: () -> Unit,
+) {
+    val privateReported = capability.orEmpty().any {
+        it.format == StreamFormat.PRIVATE && it.regularSizes.isNotEmpty()
+    } || lens.previewSizes.isNotEmpty()
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(
+                enabled = privateReported,
+                role = Role.Button,
+                onClick = onClick,
+            ),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(lens.customLabel ?: lens.defaultLabel, fontWeight = FontWeight.SemiBold)
+                Text(
+                    buildString {
+                        append("Camera2 PRIVATE")
+                        append(" · ")
+                        append(lens.selectedPreviewSize?.let(::sizeLabel) ?: "Auto")
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                val otherCount = capability.orEmpty().count { it.format != StreamFormat.PRIVATE }
+                if (otherCount > 0) {
+                    Text(
+                        "$otherCount other reported Camera2 output format${if (otherCount == 1) "" else "s"}",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+            Text(if (privateReported) "Open" else "Unavailable")
+        }
+    }
+}
+
+@Composable
+private fun ViewfinderStreamDialog(
+    lens: LensSettingsUiModel,
+    reportedCapabilities: List<ViewfinderFormatCapability>,
+    onDismiss: () -> Unit,
+    onSelectPrivateSize: (Size2D?) -> Unit,
+) {
+    val privateSizes = (lens.previewSizes + reportedCapabilities
+        .firstOrNull { it.format == StreamFormat.PRIVATE }
+        ?.regularSizes
+        .orEmpty())
+        .asSequence()
+        .filter(Size2D::isValid)
+        .distinct()
+        .sortedWith(sizeComparator())
+        .toList()
+    val otherFormats = reportedCapabilities
+        .filter { it.format != StreamFormat.PRIVATE }
+        .sortedBy { it.format.ordinal }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Viewfinder · ${lens.customLabel ?: lens.defaultLabel}") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .heightIn(max = 560.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    "Active live backend: Camera2 PRIVATE / SurfaceTexture. This is the zero-copy path used for the normal viewfinder and physical/AUX routing.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Text("Camera2 PRIVATE", fontWeight = FontWeight.SemiBold)
+                ChoiceRow(
+                    selected = lens.selectedPreviewSize == null,
+                    label = "Auto (recommended)",
+                    onClick = { onSelectPrivateSize(null) },
+                )
+                privateSizes.forEach { size ->
+                    ChoiceRow(
+                        selected = lens.selectedPreviewSize == size,
+                        label = sizeLabel(size),
+                        onClick = { onSelectPrivateSize(size) },
+                    )
+                }
+
+                if (otherFormats.isNotEmpty()) {
+                    Text(
+                        "Other outputs reported by this lens",
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                    Text(
+                        "These are shown exactly from Camera2 metadata. They are not silently substituted for the PRIVATE TextureView path: JPEG/HEIC/RAW are capture outputs, and YUV requires its own renderer before it can safely become a selectable live backend.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    otherFormats.forEach { capability ->
+                        ReportedOutputBlock(capability)
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
+}
+
+@Composable
+private fun ReportedOutputBlock(capability: ViewfinderFormatCapability) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Text(streamFormatLabel(capability.format), fontWeight = FontWeight.Medium)
+        capability.regularSizes.forEach { size ->
+            Text("• ${sizeLabel(size)}", style = MaterialTheme.typography.bodySmall)
+        }
+        capability.maximumResolutionSizes.forEach { size ->
+            Text(
+                "• ${sizeLabel(size)} · maximum-resolution path",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        if (capability.regularSizes.isEmpty() && capability.maximumResolutionSizes.isEmpty()) {
+            Text("Reported without a valid size", style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+@Composable
+private fun ThresholdDialog(
+    title: String,
+    options: List<Int>,
+    selected: Int?,
+    onDismiss: () -> Unit,
+    onSelect: (Int) -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column(
+                modifier = Modifier
+                    .heightIn(max = 460.dp)
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                options.forEach { value ->
+                    ChoiceRow(
+                        selected = selected == value,
+                        label = "$value fps",
+                        onClick = { onSelect(value) },
+                    )
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun SettingValueRow(
+    title: String,
+    value: String,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            title,
+            modifier = Modifier.weight(1f),
+            color = if (enabled) {
+                MaterialTheme.colorScheme.onSurface
+            } else {
+                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f)
+            },
+        )
+        Text(
+            value,
+            color = if (enabled) {
+                MaterialTheme.colorScheme.primary
+            } else {
+                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f)
+            },
+        )
+    }
+}
+
+@Composable
+private fun SettingsSectionHeader(title: String) {
+    Text(
+        text = title,
+        style = MaterialTheme.typography.titleMedium,
+        fontWeight = FontWeight.Bold,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(top = 4.dp, bottom = 2.dp),
+    )
 }
 
 @Composable
@@ -275,7 +569,6 @@ private fun LensPreferenceCard(
     canMoveDown: Boolean,
     onSetVisible: (Boolean) -> Unit,
     onEditName: () -> Unit,
-    onEditPreviewSize: () -> Unit,
     onMoveUp: () -> Unit,
     onMoveDown: () -> Unit,
     onSetOneXReference: () -> Unit,
@@ -321,22 +614,6 @@ private fun LensPreferenceCard(
                 }
             }
 
-            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text("Preview stream", style = MaterialTheme.typography.labelMedium)
-                Text(
-                    lens.selectedPreviewSize?.let(::sizeLabel) ?: "Auto (recommended)",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                Text(
-                    "${lens.previewSizes.size} supported Camera2 PRIVATE stream${if (lens.previewSizes.size == 1) "" else "s"}",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                TextButton(
-                    onClick = onEditPreviewSize,
-                    enabled = lens.previewSizes.isNotEmpty(),
-                ) { Text("Choose preview stream") }
-            }
-
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = onEditName) { Text("Rename") }
                 TextButton(onClick = onMoveUp, enabled = canMoveUp) { Text("Move up") }
@@ -347,96 +624,19 @@ private fun LensPreferenceCard(
 }
 
 @Composable
-private fun PreviewSizeDialog(
-    lens: LensSettingsUiModel,
-    onDismiss: () -> Unit,
-    onSelect: (Size2D?) -> Unit,
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Preview stream · ${lens.customLabel ?: lens.defaultLabel}") },
-        text = {
-            Column(
-                Modifier
-                    .heightIn(max = 480.dp)
-                    .verticalScroll(rememberScrollState()),
-            ) {
-                Text(
-                    "Only stream sizes reported for this optical lens are shown.",
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(bottom = 8.dp),
-                )
-                ChoiceRow(
-                    selected = lens.selectedPreviewSize == null,
-                    label = "Auto (recommended)",
-                    onClick = { onSelect(null) },
-                )
-                lens.previewSizes.forEach { size ->
-                    ChoiceRow(
-                        selected = lens.selectedPreviewSize == size,
-                        label = sizeLabel(size),
-                        onClick = { onSelect(size) },
-                    )
-                }
-            }
-        },
-        confirmButton = {},
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
-}
-
-@Composable
-private fun GlobalPreviewFpsDialog(
-    options: List<Int>,
-    selectedFps: Int?,
-    onDismiss: () -> Unit,
-    onSelect: (Int?) -> Unit,
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Preview frame rate") },
-        text = {
-            Column(
-                Modifier
-                    .heightIn(max = 480.dp)
-                    .verticalScroll(rememberScrollState()),
-            ) {
-                Text(
-                    "This is one global target. A lens that cannot report or sustain it automatically uses its own Auto range.",
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(bottom = 8.dp),
-                )
-                ChoiceRow(
-                    selected = selectedFps == null || selectedFps !in options,
-                    label = "Auto (recommended)",
-                    onClick = { onSelect(null) },
-                )
-                options.forEach { fps ->
-                    ChoiceRow(
-                        selected = selectedFps == fps,
-                        label = "$fps fps",
-                        onClick = { onSelect(fps) },
-                    )
-                }
-            }
-        },
-        confirmButton = {},
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
-}
-
-@Composable
 private fun ChoiceRow(
     selected: Boolean,
     label: String,
     onClick: () -> Unit,
 ) {
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(role = Role.RadioButton, onClick = onClick),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         RadioButton(selected = selected, onClick = onClick)
-        TextButton(onClick = onClick) { Text(label) }
+        Text(label)
     }
 }
 
@@ -469,10 +669,48 @@ private fun RenameLensDialog(
     )
 }
 
-private fun sizeLabel(size: Size2D): String {
-    val divisor = greatestCommonDivisor(size.width, size.height).coerceAtLeast(1)
-    return "${size.width}×${size.height} · ${size.width / divisor}:${size.height / divisor}"
+private fun recommendedGlobalRange(ranges: List<FpsRange>): FpsRange? = ranges
+    .groupingBy { it }
+    .eachCount()
+    .entries
+    .maxWithOrNull(
+        compareBy<Map.Entry<FpsRange, Int>> { it.value }
+            .thenBy { it.key.min }
+            .thenBy { it.key.max },
+    )
+    ?.key
+
+private fun streamFormatLabel(format: StreamFormat): String = when (format) {
+    StreamFormat.PRIVATE -> "Camera2 PRIVATE"
+    StreamFormat.YUV_420_888 -> "Camera2 YUV_420_888"
+    StreamFormat.JPEG -> "Camera2 JPEG"
+    StreamFormat.HEIC -> "Camera2 HEIC"
+    StreamFormat.RAW_SENSOR -> "Camera2 RAW_SENSOR"
+    StreamFormat.RAW10 -> "Camera2 RAW10"
+    StreamFormat.RAW12 -> "Camera2 RAW12"
+    StreamFormat.RAW14 -> "Camera2 RAW14"
+    StreamFormat.RAW_PRIVATE -> "Camera2 RAW_PRIVATE"
+    StreamFormat.DEPTH16 -> "Camera2 DEPTH16"
+    StreamFormat.DEPTH_POINT_CLOUD -> "Camera2 DEPTH_POINT_CLOUD"
+    StreamFormat.DEPTH_JPEG -> "Camera2 DEPTH_JPEG"
+    StreamFormat.UNKNOWN -> "Camera2 UNKNOWN"
+}
+
+private fun sizeLabel(size: Size2D): String =
+    "${size.width}×${size.height} · ${aspectRatioLabel(size)}"
+
+private fun aspectRatioLabel(size: Size2D): String {
+    val width = abs(size.width)
+    val height = abs(size.height)
+    if (width == 0 || height == 0) return "unknown"
+    val divisor = greatestCommonDivisor(width, height)
+    return "${width / divisor}:${height / divisor}"
 }
 
 private tailrec fun greatestCommonDivisor(a: Int, b: Int): Int =
-    if (b == 0) kotlin.math.abs(a) else greatestCommonDivisor(b, a % b)
+    if (b == 0) a.coerceAtLeast(1) else greatestCommonDivisor(b, a % b)
+
+private fun sizeComparator(): Comparator<Size2D> =
+    compareByDescending<Size2D> { it.area ?: 0L }
+        .thenByDescending { it.width }
+        .thenByDescending { it.height }
