@@ -152,13 +152,12 @@ object PreviewFpsSelector {
             valid.firstOrNull { it == wanted && compatible(it) }?.let { return it }
         }
 
-        val compatible = valid.filter(::compatible)
-        val pool = compatible.ifEmpty {
-            if (estimatedMax == null) {
-                valid
-            } else {
-                valid.filter { it.min.toDouble() <= estimatedMax + FPS_TOLERANCE }.ifEmpty { valid }
-            }
+        val pool = if (estimatedMax == null) {
+            valid
+        } else {
+            // Do not ask a stream to run outside its own advertised minimum-frame-duration bound.
+            // If metadata cannot prove any range is compatible, leave AE unconstrained.
+            valid.filter(::compatible).takeIf(List<FpsRange>::isNotEmpty) ?: return null
         }
         return pool.maxWithOrNull(autoComparator())
     }
