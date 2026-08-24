@@ -1,9 +1,13 @@
 package com.sahidcode404.camex.core.camera
 
 import com.sahidcode404.camex.core.model.FpsRange
+import com.sahidcode404.camex.core.model.PreviewPreference
+import com.sahidcode404.camex.core.model.Size2D
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PreviewSizeSelectorTest {
@@ -62,6 +66,35 @@ class PreviewSizeSelectorTest {
     }
 
     @Test
+    fun manualPreviewSizeIsExactAndStaleChoiceFallsBackToAuto() {
+        val candidates = listOf(
+            PreviewStreamCandidate(1280, 720, 16_666_667L),
+            PreviewStreamCandidate(1920, 1080, 33_333_333L),
+        )
+        val request = PreviewSelectionRequest(1080, 1920, preferredMinimumFps = 60.0)
+
+        val manual = PreviewPreferenceResolver.selectStream(
+            candidates,
+            request,
+            PreviewPreference(size = Size2D(1920, 1080)),
+        )
+        assertEquals(1920, manual?.width)
+        assertEquals(1080, manual?.height)
+        assertFalse(
+            PreviewPreferenceResolver.didFallbackSize(
+                candidates,
+                PreviewPreference(size = Size2D(1920, 1080)),
+            ),
+        )
+
+        val stalePreference = PreviewPreference(size = Size2D(2222, 1111))
+        val fallback = PreviewPreferenceResolver.selectStream(candidates, request, stalePreference)
+        assertEquals(1280, fallback?.width)
+        assertEquals(720, fallback?.height)
+        assertTrue(PreviewPreferenceResolver.didFallbackSize(candidates, stalePreference))
+    }
+
+    @Test
     fun autoFpsUsesHighestReportedNormalPreviewRange() {
         val target = requireNotNull(
             PreviewFpsSelector.preferredTargetFps(
@@ -76,6 +109,35 @@ class PreviewSizeSelectorTest {
         )
         assertEquals(60.0, target, 0.0)
         assertNull(PreviewFpsSelector.preferredTargetFps(emptyList()))
+    }
+
+    @Test
+    fun requestedFpsMustBeReportedAndSustainableBySelectedStream() {
+        val ranges = listOf(FpsRange(15, 30), FpsRange(30, 30), FpsRange(60, 60))
+
+        assertEquals(
+            FpsRange(30, 30),
+            PreviewFpsSelector.selectForStream(
+                ranges = ranges,
+                minimumFrameDurationNanos = 33_333_333L,
+                requested = FpsRange(30, 30),
+            ),
+        )
+        assertNull(
+            PreviewFpsSelector.selectForStream(
+                ranges = listOf(FpsRange(60, 60)),
+                minimumFrameDurationNanos = 33_333_333L,
+                requested = FpsRange(60, 60),
+            ),
+        )
+        assertEquals(
+            FpsRange(30, 30),
+            PreviewFpsSelector.selectForStream(
+                ranges = ranges,
+                minimumFrameDurationNanos = 33_333_333L,
+                requested = FpsRange(24, 24),
+            ),
+        )
     }
 
     @Test
