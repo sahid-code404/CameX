@@ -9,6 +9,7 @@ import com.sahidcode404.camex.core.model.StreamConfiguration
 import com.sahidcode404.camex.core.model.StreamFormat
 import com.sahidcode404.camex.core.model.isLiveViewfinderStream
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.abs
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -30,6 +31,9 @@ data class ViewfinderFormatCapability(
  */
 object PreviewPreferenceRegistry {
     const val GLOBAL_PREVIEW_FPS_FINGERPRINT = "global_preview_fps"
+
+    private const val DEFAULT_RESPONSIVE_PREVIEW_FPS = 30.0
+    private const val FPS_TOLERANCE = 0.75
 
     private val snapshot = AtomicReference<Map<String, PreviewPreference>>(emptyMap())
     private val mutablePreferences = MutableStateFlow<Map<String, PreviewPreference>>(emptyMap())
@@ -74,10 +78,14 @@ object PreviewPreferenceRegistry {
     /**
      * Builds the descriptor consumed only by the live Camera2 session owner.
      *
-     * High-resolution viewfinder means the largest *regular* stream configuration the active
-     * profile reports for each live viewfinder format. It intentionally does not force Camera2's
-     * maximum-resolution sensor-pixel mode, because many devices cannot sustain that mode as a
-     * repeating preview and doing so would violate the universal safe-fallback contract.
+     * Auto frame rate deliberately leaves CONTROL_AE_TARGET_FPS_RANGE unconstrained so the active
+     * HAL can use its own preview-tuned cadence, matching the behavior users expect from GCam-like
+     * photo preview. Only the explicit global override is projected as a Camera2 FPS range.
+     *
+     * High-resolution viewfinder is also cadence-aware: it picks the largest regular live stream
+     * that can sustain the requested cadence (30 fps in Auto, or the override upper threshold).
+     * If no stream can sustain that cadence, it picks the fastest reported stream rather than
+     * blindly selecting the largest slow stream.
      */
     fun projectForSession(lens: LensDescriptor): LensDescriptor {
         recordReportedCapabilities(lens)
@@ -85,21 +93,34 @@ object PreviewPreferenceRegistry {
         val preference = forLens(lens)
         val selectedStream = selectLiveStream(capabilities.streamConfigurations, preference.streamFormat)
 
+        val responsiveTargetFps = if (mutableFpsOverrideEnabled.value) {
+            mutableGlobalFpsRange.value?.max?.toDouble()
+                ?.takeIf { it.isFinite() && it > 0.0 }
+                ?: DEFAULT_RESPONSIVE_PREVIEW_FPS
+        } else {
+            DEFAULT_RESPONSIVE_PREVIEW_FPS
+        }
+
         val projectedStreams = if (mutableHighResolutionViewfinder.value) {
-            keepHighestRegularLiveStreams(capabilities.streamConfigurations)
+            keepHighestResponsiveLiveStreams(
+                configurations = capabilities.streamConfigurations,
+                targetFps = responsiveTargetFps,
+            )
         } else {
             capabilities.streamConfigurations
         }
 
-        val projectedFps = if (mutableFpsOverrideEnabled.value) {
+        val projectedFps: List<FpsRange>? = if (mutableFpsOverrideEnabled.value) {
             mutableGlobalFpsRange.value
                 ?.let { requested ->
                     selectReportedRangeForRequest(capabilities.previewFpsRanges, requested)
                 }
                 ?.let(::listOf)
-                ?: capabilities.previewFpsRanges
+                ?: emptyList()
         } else {
-            capabilities.previewFpsRanges
+            // Empty means the controller does not set CONTROL_AE_TARGET_FPS_RANGE. This is the
+            // smooth Auto path; reported ranges remain available through settings/diagnostics.
+            emptyList()
         }
 
         if (projectedStreams == capabilities.streamConfigurations &&
@@ -132,27 +153,60 @@ object PreviewPreferenceRegistry {
             ?: StreamFormat.PRIVATE
     }
 
-    private fun keepHighestRegularLiveStreams(
+    private fun keepHighestResponsiveLiveStreams(
         configurations: List<StreamConfiguration>?,
+        targetFps: Double,
     ): List<StreamConfiguration>? {
         configurations ?: return null
-        val highest = configurations.asSequence()
+        val selected = configurations.asSequence()
             .filter { !it.maximumResolution && it.size.isValid && it.format.isLiveViewfinderStream }
             .groupBy { it.format }
             .mapValues { (_, entries) ->
-                entries.maxWithOrNull(
-                    compareBy<StreamConfiguration> { it.size.area ?: 0L }
-                        .thenBy { it.size.width }
-                        .thenBy { it.size.height },
-                )
+                selectHighestResponsiveConfiguration(entries, targetFps)
             }
-        if (highest.isEmpty()) return configurations
+        if (selected.isEmpty()) return configurations
+
         return configurations.filter { configuration ->
             !configuration.format.isLiveViewfinderStream ||
                 configuration.maximumResolution ||
-                highest[configuration.format] === configuration
+                selected[configuration.format] === configuration
         }
     }
+
+    private fun selectHighestResponsiveConfiguration(
+        entries: List<StreamConfiguration>,
+        targetFps: Double,
+    ): StreamConfiguration? {
+        if (entries.isEmpty()) return null
+
+        val known = entries.mapNotNull { configuration ->
+            configuration.estimatedMaximumFps()?.let { fps -> configuration to fps }
+        }
+        val sustainable = known
+            .filter { (_, fps) -> fps + FPS_TOLERANCE >= targetFps }
+            .map { it.first }
+
+        if (sustainable.isNotEmpty()) {
+            return sustainable.maxWithOrNull(resolutionComparator())
+        }
+
+        // Unknown timing is safer than knowingly forcing a stream whose metadata proves it is slow.
+        val unknown = entries.filter { it.estimatedMaximumFps() == null }
+        if (unknown.isNotEmpty()) {
+            return unknown.maxWithOrNull(resolutionComparator())
+        }
+
+        val fastest = known.maxOfOrNull { it.second }
+            ?: return entries.maxWithOrNull(resolutionComparator())
+        return known.asSequence()
+            .filter { (_, fps) -> abs(fps - fastest) <= FPS_TOLERANCE }
+            .map { it.first }
+            .maxWithOrNull(resolutionComparator())
+    }
+
+    private fun StreamConfiguration.estimatedMaximumFps(): Double? = minFrameDurationNs
+        ?.takeIf { it > 0L }
+        ?.let { 1_000_000_000.0 / it.toDouble() }
 
     internal fun selectReportedRangeForRequest(
         ranges: Collection<FpsRange>?,
@@ -172,9 +226,8 @@ object PreviewPreferenceRegistry {
             }
             .minWithOrNull(
                 compareBy<FpsRange> {
-                    kotlin.math.abs(it.min - requested.min) +
-                        kotlin.math.abs(it.max - requested.max)
-                }.thenBy { kotlin.math.abs((it.max - it.min) - (requested.max - requested.min)) }
+                    abs(it.min - requested.min) + abs(it.max - requested.max)
+                }.thenBy { abs((it.max - it.min) - (requested.max - requested.min)) }
                     .thenByDescending { it.min }
                     .thenByDescending { it.max },
             )
@@ -251,6 +304,11 @@ object PreviewPreferenceRegistry {
         compareByDescending<Size2D> { it.area ?: 0L }
             .thenByDescending { it.width }
             .thenByDescending { it.height }
+
+    private fun resolutionComparator(): Comparator<StreamConfiguration> =
+        compareBy<StreamConfiguration> { it.size.area ?: 0L }
+            .thenBy { it.size.width }
+            .thenBy { it.size.height }
 
     internal fun clearForTest() {
         snapshot.set(emptyMap())
