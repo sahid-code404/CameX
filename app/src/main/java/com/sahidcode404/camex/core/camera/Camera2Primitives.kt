@@ -13,6 +13,7 @@ import android.os.HandlerThread
 import android.view.Surface
 import androidx.annotation.RequiresApi
 import com.sahidcode404.camex.core.camera.raw.RawCaptureRegistry
+import com.sahidcode404.camex.core.camera.raw.RawSessionMode
 import com.sahidcode404.camex.core.model.ProbeFailureKind
 import java.io.Closeable
 import java.util.concurrent.atomic.AtomicBoolean
@@ -163,33 +164,38 @@ internal suspend fun CameraDevice.awaitCaptureSession(
         )
     }
 
-    val preparedRaw = RawCaptureRegistry.prepareOutput(this, physicalCameraId, handler)
-    if (preparedRaw != null) {
-        try {
-            val lease = awaitCaptureSession(
-                outputs = listOf(
-                    CameraSessionOutput(surface, physicalCameraId),
-                    CameraSessionOutput(preparedRaw.reader.surface, physicalCameraId),
-                ),
-                handler = handler,
-                timeoutMillis = timeoutMillis,
-            )
-            RawCaptureRegistry.attach(preparedRaw, this, lease.session, handler)
-            return lease
-        } catch (timeout: TimeoutCancellationException) {
-            RawCaptureRegistry.combinedSessionRejected(
-                preparedRaw,
-                "Preview + RAW session configuration timed out; preview-only fallback is active",
-            )
-        } catch (cancelled: CancellationException) {
-            runCatching { preparedRaw.reader.close() }
-            throw cancelled
-        } catch (error: Throwable) {
-            if (error is VirtualMachineError || error is ThreadDeath) throw error
-            RawCaptureRegistry.combinedSessionRejected(
-                preparedRaw,
-                "Preview + RAW session unsupported; preview-only fallback is active",
-            )
+    // A live preview must never depend on the device accepting a full-resolution RAW output at the
+    // same time. This is especially important for legacy/AUX/vendor HAL routes. RAW is admitted only
+    // for the bounded shutter transaction that explicitly arms RawSessionMode.
+    if (RawSessionMode.isRequested()) {
+        val preparedRaw = RawCaptureRegistry.prepareOutput(this, physicalCameraId, handler)
+        if (preparedRaw != null) {
+            try {
+                val lease = awaitCaptureSession(
+                    outputs = listOf(
+                        CameraSessionOutput(surface, physicalCameraId),
+                        CameraSessionOutput(preparedRaw.reader.surface, physicalCameraId),
+                    ),
+                    handler = handler,
+                    timeoutMillis = timeoutMillis,
+                )
+                RawCaptureRegistry.attach(preparedRaw, this, lease.session, handler)
+                return lease
+            } catch (timeout: TimeoutCancellationException) {
+                RawCaptureRegistry.combinedSessionRejected(
+                    preparedRaw,
+                    "Preview + RAW session configuration timed out; preview-only fallback is active",
+                )
+            } catch (cancelled: CancellationException) {
+                runCatching { preparedRaw.reader.close() }
+                throw cancelled
+            } catch (error: Throwable) {
+                if (error is VirtualMachineError || error is ThreadDeath) throw error
+                RawCaptureRegistry.combinedSessionRejected(
+                    preparedRaw,
+                    "Preview + RAW session unsupported; preview-only fallback is active",
+                )
+            }
         }
     }
 
