@@ -40,6 +40,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.sahidcode404.camex.core.camera.PreviewPreferenceRegistry
 import com.sahidcode404.camex.core.camera.ViewfinderFormatCapability
@@ -65,8 +66,6 @@ data class LensSettingsUiModel(
     val selectedPreviewFpsRange: FpsRange? = null,
 )
 
-private enum class ThresholdKind { LOWER, HIGH }
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LensSettingsScreen(
@@ -86,7 +85,6 @@ fun LensSettingsScreen(
 
     var editing by remember { mutableStateOf<LensSettingsUiModel?>(null) }
     var streamEditing by remember { mutableStateOf<LensSettingsUiModel?>(null) }
-    var thresholdEditing by remember { mutableStateOf<ThresholdKind?>(null) }
 
     val globalFpsRange by PreviewPreferenceRegistry.globalFpsRange.collectAsState()
     val fpsOverrideEnabled by PreviewPreferenceRegistry.fpsOverrideEnabled.collectAsState()
@@ -104,17 +102,11 @@ fun LensSettingsScreen(
     }
     val fallbackRange = remember(reportedFpsRanges) { recommendedGlobalRange(reportedFpsRanges) }
     val displayedRange = globalFpsRange ?: fallbackRange
-    val lowerThresholdOptions = remember(reportedFpsRanges, displayedRange) {
-        (reportedFpsRanges.map { it.min } + listOfNotNull(displayedRange?.min))
-            .filter { it >= 0 }
-            .distinct()
-            .sorted()
+    val supportedLowestFps = remember(reportedFpsRanges) {
+        reportedFpsRanges.minOfOrNull { it.min }
     }
-    val highThresholdOptions = remember(reportedFpsRanges, displayedRange) {
-        (reportedFpsRanges.map { it.max } + listOfNotNull(displayedRange?.max))
-            .filter { it > 0 }
-            .distinct()
-            .sorted()
+    val supportedHighestFps = remember(reportedFpsRanges) {
+        reportedFpsRanges.maxOfOrNull { it.max }
     }
 
     val indexedLenses = lenses.withIndex().toList()
@@ -144,7 +136,9 @@ fun LensSettingsScreen(
                 ViewfinderFrameRateCard(
                     overrideEnabled = fpsOverrideEnabled,
                     range = displayedRange,
-                    availableRanges = reportedFpsRanges,
+                    hasReportedRanges = reportedFpsRanges.isNotEmpty(),
+                    supportedLowestFps = supportedLowestFps,
+                    supportedHighestFps = supportedHighestFps,
                     onOverrideChanged = { enabled ->
                         if (enabled && globalFpsRange == null) fallbackRange?.let(::persistGlobalRange)
                         scope.launch {
@@ -154,8 +148,14 @@ fun LensSettingsScreen(
                             )
                         }
                     },
-                    onEditLower = { thresholdEditing = ThresholdKind.LOWER },
-                    onEditHigh = { thresholdEditing = ThresholdKind.HIGH },
+                    onLowerChanged = { value ->
+                        val basis = displayedRange ?: FpsRange(value, value)
+                        persistGlobalRange(FpsRange(value, basis.max.coerceAtLeast(value)))
+                    },
+                    onHighChanged = { value ->
+                        val basis = displayedRange ?: FpsRange(value, value)
+                        persistGlobalRange(FpsRange(basis.min.coerceAtMost(value), value))
+                    },
                 )
             }
             item {
@@ -273,37 +273,23 @@ fun LensSettingsScreen(
             },
         )
     }
-
-    thresholdEditing?.let { kind ->
-        val current = displayedRange
-        ThresholdDialog(
-            title = if (kind == ThresholdKind.LOWER) "Lower threshold" else "High threshold",
-            options = if (kind == ThresholdKind.LOWER) lowerThresholdOptions else highThresholdOptions,
-            selected = if (kind == ThresholdKind.LOWER) current?.min else current?.max,
-            onDismiss = { thresholdEditing = null },
-            onSelect = { value ->
-                val basis = current ?: FpsRange(value, value)
-                val next = if (kind == ThresholdKind.LOWER) {
-                    FpsRange(value, basis.max.coerceAtLeast(value))
-                } else {
-                    FpsRange(basis.min.coerceAtMost(value), value)
-                }
-                persistGlobalRange(next)
-                thresholdEditing = null
-            },
-        )
-    }
 }
 
 @Composable
 private fun ViewfinderFrameRateCard(
     overrideEnabled: Boolean,
     range: FpsRange?,
-    availableRanges: List<FpsRange>,
+    hasReportedRanges: Boolean,
+    supportedLowestFps: Int?,
+    supportedHighestFps: Int?,
     onOverrideChanged: (Boolean) -> Unit,
-    onEditLower: () -> Unit,
-    onEditHigh: () -> Unit,
+    onLowerChanged: (Int) -> Unit,
+    onHighChanged: (Int) -> Unit,
 ) {
+    var lowerText by remember(range?.min) { mutableStateOf(range?.min?.toString().orEmpty()) }
+    var highText by remember(range?.max) { mutableStateOf(range?.max?.toString().orEmpty()) }
+    val fieldsEnabled = overrideEnabled && hasReportedRanges
+
     Card(Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(16.dp),
@@ -316,7 +302,7 @@ private fun ViewfinderFrameRateCard(
                 Column(Modifier.weight(1f)) {
                     Text("Override viewfinder frame rate setting", fontWeight = FontWeight.SemiBold)
                     Text(
-                        "One global override. Each active camera maps these thresholds only to a range it actually reports.",
+                        "Off uses the camera HAL's normal photo-preview cadence. On applies the custom range only through FPS ranges reported by each active camera.",
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
@@ -324,21 +310,65 @@ private fun ViewfinderFrameRateCard(
                 Switch(
                     checked = overrideEnabled,
                     onCheckedChange = onOverrideChanged,
-                    enabled = availableRanges.isNotEmpty(),
+                    enabled = hasReportedRanges,
                 )
             }
-            SettingValueRow(
-                title = "Lower threshold",
-                value = range?.min?.let { "$it fps" } ?: "Auto",
-                enabled = availableRanges.isNotEmpty(),
-                onClick = onEditLower,
+
+            OutlinedTextField(
+                value = lowerText,
+                onValueChange = { text ->
+                    val digits = text.filter(Char::isDigit).take(10)
+                    lowerText = digits
+                    digits.toIntOrNull()?.takeIf { it > 0 }?.let(onLowerChanged)
+                },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = fieldsEnabled,
+                singleLine = true,
+                label = { Text("Lowest FPS") },
+                suffix = { Text("fps") },
+                supportingText = {
+                    Text(
+                        supportedLowestFps?.let {
+                            "Lowest reported by the discovered camera sensors: $it fps. You can type a custom value."
+                        } ?: "No Camera2 minimum FPS metadata was reported."
+                    )
+                },
+                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                    keyboardType = KeyboardType.Number,
+                ),
             )
-            SettingValueRow(
-                title = "High threshold",
-                value = range?.max?.let { "$it fps" } ?: "Auto",
-                enabled = availableRanges.isNotEmpty(),
-                onClick = onEditHigh,
+
+            OutlinedTextField(
+                value = highText,
+                onValueChange = { text ->
+                    val digits = text.filter(Char::isDigit).take(10)
+                    highText = digits
+                    digits.toIntOrNull()?.takeIf { it > 0 }?.let(onHighChanged)
+                },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = fieldsEnabled,
+                singleLine = true,
+                label = { Text("Highest FPS") },
+                suffix = { Text("fps") },
+                supportingText = {
+                    Text(
+                        supportedHighestFps?.let {
+                            "Highest reported by the discovered camera sensors: $it fps. You can type a custom value."
+                        } ?: "No Camera2 maximum FPS metadata was reported."
+                    )
+                },
+                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                    keyboardType = KeyboardType.Number,
+                ),
             )
+
+            if (!overrideEnabled) {
+                Text(
+                    "Enable Override viewfinder frame rate setting to edit Lowest FPS and Highest FPS.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f),
+                )
+            }
         }
     }
 }
@@ -468,65 +498,6 @@ private fun CameraStreamDialog(
         confirmButton = {},
         dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
     )
-}
-
-@Composable
-private fun ThresholdDialog(
-    title: String,
-    options: List<Int>,
-    selected: Int?,
-    onDismiss: () -> Unit,
-    onSelect: (Int) -> Unit,
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(title) },
-        text = {
-            Column(
-                modifier = Modifier
-                    .heightIn(max = 460.dp)
-                    .verticalScroll(rememberScrollState()),
-            ) {
-                options.forEach { value ->
-                    ChoiceRow(
-                        selected = selected == value,
-                        label = "$value fps",
-                        onClick = { onSelect(value) },
-                    )
-                }
-            }
-        },
-        confirmButton = {},
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
-}
-
-@Composable
-private fun SettingValueRow(
-    title: String,
-    value: String,
-    enabled: Boolean,
-    onClick: () -> Unit,
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
-            .padding(vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(
-            title,
-            modifier = Modifier.weight(1f),
-            color = if (enabled) MaterialTheme.colorScheme.onSurface
-            else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
-        )
-        Text(
-            value,
-            color = if (enabled) MaterialTheme.colorScheme.primary
-            else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
-        )
-    }
 }
 
 @Composable
