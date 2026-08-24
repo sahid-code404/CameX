@@ -5,9 +5,12 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.sahidcode404.camex.core.model.FpsRange
 import com.sahidcode404.camex.core.model.LensFacing
 import com.sahidcode404.camex.core.model.LensPreferenceRecord
 import com.sahidcode404.camex.core.model.LensPreferencesState
+import com.sahidcode404.camex.core.model.PreviewPreference
+import com.sahidcode404.camex.core.model.Size2D
 import java.io.IOException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
@@ -22,9 +25,9 @@ private val Context.lensSettingsDataStore by preferencesDataStore(name = STORE_N
 
 /**
  * Stores one versioned JSON document inside Preferences DataStore. Preferences are keyed only by
- * [com.sahidcode404.camex.core.model.LensFingerprint] values; Camera2 IDs never become durable
- * keys. Unknown or orphaned records survive firmware updates and are simply ignored by the lens
- * resolver until a deterministic migration alias is available.
+ * optical LensFingerprint values; Camera2 IDs never become durable preference keys. A saved preview
+ * choice is a preference, not a promise: if firmware/profile routing changes and the value is no
+ * longer reported, runtime falls back to Auto instead of rejecting the lens.
  */
 class LensSettingsStore(context: Context) {
     private val dataStore = context.applicationContext.lensSettingsDataStore
@@ -45,6 +48,22 @@ class LensSettingsStore(context: Context) {
 
     suspend fun rename(fingerprint: String, label: String?) = updateRecord(fingerprint) {
         it.copy(displayName = label?.trim()?.take(48)?.takeIf(String::isNotEmpty))
+    }
+
+    suspend fun setPreviewSize(fingerprint: String, size: Size2D?) = updateRecord(fingerprint) {
+        it.copy(
+            preview = it.preview.copy(
+                size = size?.takeIf { candidate -> candidate.isValid },
+            ),
+        )
+    }
+
+    suspend fun setPreviewFps(fingerprint: String, fpsRange: FpsRange?) = updateRecord(fingerprint) {
+        it.copy(
+            preview = it.preview.copy(
+                fpsRange = fpsRange?.takeIf { range -> range.isValid && range.max > 0 },
+            ),
+        )
     }
 
     suspend fun setOrder(orderedFingerprints: List<String>) {
@@ -135,6 +154,7 @@ class LensSettingsStore(context: Context) {
                     fingerprint = fingerprint,
                     displayName = record.displayName?.trim()?.take(48)?.takeIf(String::isNotEmpty),
                     position = record.position?.takeIf { it >= 0 },
+                    preview = record.preview.normalized(),
                 )
             }
             .associateBy { it.fingerprint }
@@ -144,6 +164,11 @@ class LensSettingsStore(context: Context) {
         lastSelectedFingerprint = lastSelectedFingerprint.normalizedFingerprintOrNull(),
         lastSelectedRearFingerprint = lastSelectedRearFingerprint.normalizedFingerprintOrNull(),
         lastSelectedFrontFingerprint = lastSelectedFrontFingerprint.normalizedFingerprintOrNull(),
+    )
+
+    private fun PreviewPreference.normalized(): PreviewPreference = PreviewPreference(
+        size = size?.takeIf { it.isValid },
+        fpsRange = fpsRange?.takeIf { it.isValid && it.max > 0 },
     )
 
     private fun String?.normalizedFingerprintOrNull(): String? = this
