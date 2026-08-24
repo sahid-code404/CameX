@@ -146,7 +146,12 @@ class CameraRuntimeCoordinator(
         return topology
     }
 
-    /** Opens cache/seed immediately; advertised and deep discovery continue in a sibling job. */
+    /**
+     * Fast cache-first startup. A valid environment-matched topology cache is authoritative for
+     * normal app opens, so Camera2 preview starts immediately without re-running Java/NDK discovery
+     * on every launch. Discovery is automatically run only when the cache is missing/invalid/empty;
+     * explicit normal/deep rescans remain available for hardware changes.
+     */
     suspend fun start(
         preferredRearFingerprint: String?,
         oneXReferenceFingerprint: String?,
@@ -167,7 +172,16 @@ class CameraRuntimeCoordinator(
         target?.let { openPrimary(it) }
 
         reconciliationJob?.cancel()
-        val runDeep = discovery.snapshot.value.initialDeepScanRequired
+        val snapshot = discovery.snapshot.value
+        val needsStartupReconcile = !snapshot.cacheHit ||
+            snapshot.initialDeepScanRequired ||
+            cached.routes.isEmpty()
+        if (!needsStartupReconcile) {
+            mutablePhase.value = CameraRuntimePhase.Ready
+            return@withLock
+        }
+
+        val runDeep = snapshot.initialDeepScanRequired
         reconciliationJob = scope.launch {
             mutablePhase.value = CameraRuntimePhase.ReconcilingTopology
             try {
