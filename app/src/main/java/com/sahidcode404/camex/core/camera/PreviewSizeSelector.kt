@@ -121,8 +121,18 @@ object PreviewSizeSelector {
     private const val FPS_TOLERANCE = 0.75
 }
 
-/** Selects a live AE FPS range only from ranges reported by the active camera profile. */
+/**
+ * Camera-photo-preview FPS selector.
+ *
+ * Auto is deliberately 30-fps-first rather than "highest FPS wins". That avoids the 60/90/120-fps
+ * preview bias that can increase ISP bandwidth, force smaller streams, shorten exposure and make
+ * vendor/AUX preview look jerky. Explicit user overrides are still honored when the active stream
+ * can sustain them.
+ */
 object PreviewFpsSelector {
+    private const val DEFAULT_PHOTO_PREVIEW_FPS = 30
+    private const val FPS_TOLERANCE = 0.75
+
     fun preferredTargetFps(
         ranges: Collection<FpsRange>?,
         requested: FpsRange? = null,
@@ -131,7 +141,12 @@ object PreviewFpsSelector {
         requested?.let { wanted ->
             valid.firstOrNull { it == wanted }?.let { return it.max.toDouble() }
         }
-        return valid.maxWithOrNull(autoComparator())?.max?.toDouble()
+        val selected = selectAutoRange(valid) ?: return null
+        return if (selected.min > DEFAULT_PHOTO_PREVIEW_FPS) {
+            selected.max.toDouble()
+        } else {
+            min(selected.max, DEFAULT_PHOTO_PREVIEW_FPS).toDouble()
+        }
     }
 
     fun selectForStream(
@@ -155,17 +170,39 @@ object PreviewFpsSelector {
         val pool = if (estimatedMax == null) {
             valid
         } else {
-            // Do not ask a stream to run outside its own advertised minimum-frame-duration bound.
-            // If metadata cannot prove any range is compatible, leave AE unconstrained.
+            // Never force an AE range the selected stream cannot sustain. If the HAL metadata
+            // proves none are compatible, leave AE unconstrained instead of manufacturing a range.
             valid.filter(::compatible).takeIf(List<FpsRange>::isNotEmpty) ?: return null
         }
-        return pool.maxWithOrNull(autoComparator())
+        return selectAutoRange(pool)
     }
 
-    private fun autoComparator(): Comparator<FpsRange> =
-        compareBy<FpsRange> { it.min }
-            .thenBy { it.max }
-            .thenByDescending { it.max - it.min }
+    private fun selectAutoRange(ranges: Collection<FpsRange>): FpsRange? = ranges.minWithOrNull(
+        compareBy<FpsRange> { autoPriority(it) }
+            .thenBy { autoDistance(it) }
+            .thenByDescending { it.min }
+            .thenBy { it.max },
+    )
+
+    private fun autoPriority(range: FpsRange): Int = when {
+        range.min == DEFAULT_PHOTO_PREVIEW_FPS && range.max == DEFAULT_PHOTO_PREVIEW_FPS -> 0
+        range.max == DEFAULT_PHOTO_PREVIEW_FPS -> 1
+        range.min <= DEFAULT_PHOTO_PREVIEW_FPS && range.max >= DEFAULT_PHOTO_PREVIEW_FPS -> 2
+        range.max < DEFAULT_PHOTO_PREVIEW_FPS -> 3
+        else -> 4
+    }
+
+    private fun autoDistance(range: FpsRange): Int = when {
+        range.max == DEFAULT_PHOTO_PREVIEW_FPS ->
+            DEFAULT_PHOTO_PREVIEW_FPS - range.min
+        range.min <= DEFAULT_PHOTO_PREVIEW_FPS && range.max >= DEFAULT_PHOTO_PREVIEW_FPS ->
+            range.max - DEFAULT_PHOTO_PREVIEW_FPS
+        range.max < DEFAULT_PHOTO_PREVIEW_FPS ->
+            DEFAULT_PHOTO_PREVIEW_FPS - range.max
+        else ->
+            abs(range.min - DEFAULT_PHOTO_PREVIEW_FPS) +
+                abs(range.max - DEFAULT_PHOTO_PREVIEW_FPS)
+    }
 
     private fun valid(ranges: Collection<FpsRange>?): List<FpsRange> = ranges
         .orEmpty()
@@ -173,8 +210,6 @@ object PreviewFpsSelector {
         .filter { it.isValid && it.max > 0 }
         .distinct()
         .toList()
-
-    private const val FPS_TOLERANCE = 0.75
 }
 
 /**
