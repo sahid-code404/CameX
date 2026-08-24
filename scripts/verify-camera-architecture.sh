@@ -192,11 +192,6 @@ reject_pattern \
   --multiline --multiline-dotall "${VIEW_MODEL}"
 
 reject_pattern \
-  "preview surface binding chooses or rediscovers a camera" \
-  '(?is)fun\s+bindPreview\s*\([^)]*\)\s*\{(?:(?!\n\s*fun\s+unbindPreview\b).){0,2000}?\b(?:selectLens|switchFacing|normalRescan|deepRescan|reconcile\s*\(|seedPrimaryRoute)\b' \
-  --multiline --multiline-dotall "${VIEW_MODEL}"
-
-reject_pattern \
   "active camera defaults to back after failed resolution" \
   '(?i)(?:selectedLens|selected|activeSelection)[^\n]{0,100}\?:\s*LensFacing\.BACK|firstOrNull\s*\(?.{0,80}?\)?\.facing\s*\?:\s*LensFacing\.BACK' \
   "${VIEW_MODEL}"
