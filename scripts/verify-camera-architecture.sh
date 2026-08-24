@@ -193,7 +193,7 @@ reject_pattern \
 
 reject_pattern \
   "preview surface binding chooses or rediscovers a camera" \
-  '(?is)fun\s+bindPreview\s*\([^)]*\)\s*\{.{0,1600}?\b(?:selectLens|switchFacing|normalRescan|deepRescan|reconcile\s*\(|seedPrimaryRoute)\b' \
+  '(?is)fun\s+bindPreview\s*\([^)]*\)\s*\{(?:(?!\n\s*fun\s+unbindPreview\b).){0,2000}?\b(?:selectLens|switchFacing|normalRescan|deepRescan|reconcile\s*\(|seedPrimaryRoute)\b' \
   --multiline --multiline-dotall "${VIEW_MODEL}"
 
 reject_pattern \
