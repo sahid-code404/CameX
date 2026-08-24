@@ -18,8 +18,8 @@ import com.sahidcode404.camex.core.model.ProbeFailureKind
 import java.io.Closeable
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeout
@@ -147,14 +147,23 @@ internal suspend fun CameraManager.awaitOpenCamera(
     }
 }
 
+/**
+ * Configures the display preview plus an optional already-created live processing surface. RAW is
+ * still admitted only for the bounded shutter transaction. Keeping all outputs in this one helper
+ * prevents a second CameraDevice/session owner from appearing as viewfinder formats evolve.
+ */
 internal suspend fun CameraDevice.awaitCaptureSession(
     surface: Surface,
     physicalCameraId: String?,
     maximumResolution: Boolean = false,
+    additionalPreviewSurface: Surface? = null,
     handler: Handler,
     timeoutMillis: Long,
 ): CaptureSessionLease {
     if (maximumResolution) {
+        require(additionalPreviewSurface == null) {
+            "Maximum-resolution single-output session cannot include an auxiliary viewfinder"
+        }
         return awaitSingleCaptureSession(
             surface = surface,
             physicalCameraId = physicalCameraId,
@@ -164,18 +173,23 @@ internal suspend fun CameraDevice.awaitCaptureSession(
         )
     }
 
+    val previewOutputs = buildList {
+        add(CameraSessionOutput(surface, physicalCameraId))
+        additionalPreviewSurface?.let {
+            add(CameraSessionOutput(it, physicalCameraId))
+        }
+    }
+
     // A live preview must never depend on the device accepting a full-resolution RAW output at the
-    // same time. This is especially important for legacy/AUX/vendor HAL routes. RAW is admitted only
-    // for the bounded shutter transaction that explicitly arms RawSessionMode.
+    // same time. RAW is admitted only for the shutter transaction; rejection falls back to the
+    // exact viewfinder outputs that were already working before the shutter was pressed.
     if (RawSessionMode.isRequested()) {
         val preparedRaw = RawCaptureRegistry.prepareOutput(this, physicalCameraId, handler)
         if (preparedRaw != null) {
             try {
                 val lease = awaitCaptureSession(
-                    outputs = listOf(
-                        CameraSessionOutput(surface, physicalCameraId),
+                    outputs = previewOutputs +
                         CameraSessionOutput(preparedRaw.reader.surface, physicalCameraId),
-                    ),
                     handler = handler,
                     timeoutMillis = timeoutMillis,
                 )
@@ -184,7 +198,7 @@ internal suspend fun CameraDevice.awaitCaptureSession(
             } catch (timeout: TimeoutCancellationException) {
                 RawCaptureRegistry.combinedSessionRejected(
                     preparedRaw,
-                    "Preview + RAW session configuration timed out; preview-only fallback is active",
+                    "Viewfinder + RAW session configuration timed out; viewfinder-only fallback is active",
                 )
             } catch (cancelled: CancellationException) {
                 runCatching { preparedRaw.reader.close() }
@@ -193,14 +207,14 @@ internal suspend fun CameraDevice.awaitCaptureSession(
                 if (error is VirtualMachineError || error is ThreadDeath) throw error
                 RawCaptureRegistry.combinedSessionRejected(
                     preparedRaw,
-                    "Preview + RAW session unsupported; preview-only fallback is active",
+                    "Viewfinder + RAW session unsupported; viewfinder-only fallback is active",
                 )
             }
         }
     }
 
     return awaitCaptureSession(
-        outputs = listOf(CameraSessionOutput(surface, physicalCameraId)),
+        outputs = previewOutputs,
         handler = handler,
         timeoutMillis = timeoutMillis,
     )

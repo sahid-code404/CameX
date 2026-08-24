@@ -3,15 +3,27 @@ package com.sahidcode404.camex.core.model
 import kotlinx.serialization.Serializable
 
 /**
- * Per-canonical-lens live-preview preference. Null fields mean Auto and are intentionally
- * capability-driven at runtime. Values are never camera IDs and stale values fall back safely.
+ * Persisted viewfinder preference.
+ *
+ * Normal optical-lens records use [streamFormat]. The reserved global viewfinder record uses
+ * [fpsRange], [fpsOverrideEnabled], and [highResolutionViewfinder]. [size] is retained only so
+ * schema-v4 installs decode without data loss; the v5 runtime deliberately ignores it because
+ * resolution is no longer a per-lens user setting.
  */
 @Serializable
 data class PreviewPreference(
     val size: Size2D? = null,
     val fpsRange: FpsRange? = null,
+    val streamFormat: StreamFormat? = null,
+    val fpsOverrideEnabled: Boolean = false,
+    val highResolutionViewfinder: Boolean = false,
 ) {
-    val isAuto: Boolean get() = size == null && fpsRange == null
+    val isAuto: Boolean
+        get() = size == null &&
+            fpsRange == null &&
+            streamFormat == null &&
+            !fpsOverrideEnabled &&
+            !highResolutionViewfinder
 }
 
 @Serializable
@@ -34,7 +46,7 @@ data class LensPreferencesState(
     val lastSelectedFrontFingerprint: String? = null,
 ) {
     companion object {
-        const val CURRENT_SCHEMA_VERSION = 4
+        const val CURRENT_SCHEMA_VERSION = 5
     }
 }
 

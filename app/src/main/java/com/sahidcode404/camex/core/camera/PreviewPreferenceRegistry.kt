@@ -5,48 +5,56 @@ import com.sahidcode404.camex.core.model.LensDescriptor
 import com.sahidcode404.camex.core.model.LensPreferenceRecord
 import com.sahidcode404.camex.core.model.PreviewPreference
 import com.sahidcode404.camex.core.model.Size2D
+import com.sahidcode404.camex.core.model.StreamConfiguration
 import com.sahidcode404.camex.core.model.StreamFormat
+import com.sahidcode404.camex.core.model.isLiveViewfinderStream
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-/** Reported stream capability projected for the settings UI without touching the live camera path. */
+/** Reported Camera2 output capability projected for settings without opening a camera. */
 data class ViewfinderFormatCapability(
     val format: StreamFormat,
     val regularSizes: List<Size2D> = emptyList(),
     val maximumResolutionSizes: List<Size2D> = emptyList(),
+    val selectableLiveStream: Boolean = format.isLiveViewfinderStream,
 )
 
 /**
- * Process-local O(1) projection of persisted viewfinder preferences.
+ * O(1) process-local projection of persisted viewfinder preferences.
  *
- * Resolution remains per canonical optical lens. Viewfinder FPS is intentionally one global range,
- * stored in a reserved non-camera preference record so every lens follows one centralized selector.
- * The requested range is mapped only onto FPS ranges actually reported by the active profile;
- * unsupported or stale requests fall back to that profile's normal Auto behavior.
+ * The topology/discovery models remain pristine. A session receives a short-lived descriptor copy
+ * containing only preferences that the exact active profile can satisfy. Stale/unsupported values
+ * always collapse back to the normal Camera2 PRIVATE Auto path.
  */
 object PreviewPreferenceRegistry {
     const val GLOBAL_PREVIEW_FPS_FINGERPRINT = "global_preview_fps"
 
     private val snapshot = AtomicReference<Map<String, PreviewPreference>>(emptyMap())
+    private val mutablePreferences = MutableStateFlow<Map<String, PreviewPreference>>(emptyMap())
     private val mutableGlobalFpsRange = MutableStateFlow<FpsRange?>(null)
+    private val mutableFpsOverrideEnabled = MutableStateFlow(false)
+    private val mutableHighResolutionViewfinder = MutableStateFlow(false)
     private val mutableViewfinderCapabilities =
         MutableStateFlow<Map<String, List<ViewfinderFormatCapability>>>(emptyMap())
     private val capabilityLock = Any()
 
+    val preferences: StateFlow<Map<String, PreviewPreference>> = mutablePreferences.asStateFlow()
     val globalFpsRange: StateFlow<FpsRange?> = mutableGlobalFpsRange.asStateFlow()
+    val fpsOverrideEnabled: StateFlow<Boolean> = mutableFpsOverrideEnabled.asStateFlow()
+    val highResolutionViewfinder: StateFlow<Boolean> =
+        mutableHighResolutionViewfinder.asStateFlow()
     val viewfinderCapabilities: StateFlow<Map<String, List<ViewfinderFormatCapability>>> =
         mutableViewfinderCapabilities.asStateFlow()
 
     fun replace(records: Collection<LensPreferenceRecord>) {
-        val globalRecord = records.firstOrNull {
-            it.fingerprint == GLOBAL_PREVIEW_FPS_FINGERPRINT
-        }
-        mutableGlobalFpsRange.value = globalRecord
+        val global = records.firstOrNull { it.fingerprint == GLOBAL_PREVIEW_FPS_FINGERPRINT }
             ?.preview
-            ?.fpsRange
-            ?.takeIf { it.isValid && it.max > 0 }
+            ?: PreviewPreference()
+        mutableGlobalFpsRange.value = global.fpsRange?.takeIf { it.isValid && it.max > 0 }
+        mutableFpsOverrideEnabled.value = global.fpsOverrideEnabled
+        mutableHighResolutionViewfinder.value = global.highResolutionViewfinder
 
         val next = records.asSequence()
             .filterNot { it.fingerprint == GLOBAL_PREVIEW_FPS_FINGERPRINT }
@@ -55,6 +63,7 @@ object PreviewPreferenceRegistry {
             }
             .toMap()
         snapshot.set(next)
+        mutablePreferences.value = next
     }
 
     fun forLens(lens: LensDescriptor): PreviewPreference = lens.fingerprint
@@ -63,47 +72,44 @@ object PreviewPreferenceRegistry {
         ?: PreviewPreference()
 
     /**
-     * Builds the session-only capability view used by CameraSessionController. The original
-     * discovery/topology metadata stays untouched. Resolution is an exact per-lens PRIVATE override.
-     * Global FPS is translated to one compatible range from this exact profile instead of hardcoding
-     * any device, camera ID, resolution, 30/60 FPS assumption, or vendor behavior.
+     * Builds the descriptor consumed only by the live Camera2 session owner.
+     *
+     * High-resolution viewfinder means the largest *regular* stream configuration the active
+     * profile reports for each live viewfinder format. It intentionally does not force Camera2's
+     * maximum-resolution sensor-pixel mode, because many devices cannot sustain that mode as a
+     * repeating preview and doing so would violate the universal safe-fallback contract.
      */
     fun projectForSession(lens: LensDescriptor): LensDescriptor {
         recordReportedCapabilities(lens)
-
-        val preference = forLens(lens)
         val capabilities = lens.capabilities
+        val preference = forLens(lens)
+        val selectedStream = selectLiveStream(capabilities.streamConfigurations, preference.streamFormat)
 
-        val requestedSize = preference.size
-        val hasRequestedSize = requestedSize != null && capabilities
-            .configurations(StreamFormat.PRIVATE)
-            .any { configuration ->
-                !configuration.maximumResolution && configuration.size == requestedSize
-            }
-        val projectedStreams = if (hasRequestedSize) {
-            capabilities.streamConfigurations?.filter { configuration ->
-                configuration.format != StreamFormat.PRIVATE ||
-                    configuration.maximumResolution ||
-                    configuration.size == requestedSize
-            }
+        val projectedStreams = if (mutableHighResolutionViewfinder.value) {
+            keepHighestRegularLiveStreams(capabilities.streamConfigurations)
         } else {
             capabilities.streamConfigurations
         }
 
-        val requestedGlobalRange = mutableGlobalFpsRange.value
-        val projectedFps = requestedGlobalRange
-            ?.let { requested ->
-                selectReportedRangeForRequest(capabilities.previewFpsRanges, requested)
-            }
-            ?.let(::listOf)
-            ?: capabilities.previewFpsRanges
+        val projectedFps = if (mutableFpsOverrideEnabled.value) {
+            mutableGlobalFpsRange.value
+                ?.let { requested ->
+                    selectReportedRangeForRequest(capabilities.previewFpsRanges, requested)
+                }
+                ?.let(::listOf)
+                ?: capabilities.previewFpsRanges
+        } else {
+            capabilities.previewFpsRanges
+        }
 
         if (projectedStreams == capabilities.streamConfigurations &&
-            projectedFps == capabilities.previewFpsRanges
+            projectedFps == capabilities.previewFpsRanges &&
+            selectedStream == lens.previewStreamFormat
         ) {
             return lens
         }
         return lens.copy(
+            previewStreamFormat = selectedStream,
             capabilities = capabilities.copy(
                 streamConfigurations = projectedStreams,
                 previewFpsRanges = projectedFps,
@@ -111,7 +117,44 @@ object PreviewPreferenceRegistry {
         )
     }
 
-    private fun selectReportedRangeForRequest(
+    private fun selectLiveStream(
+        configurations: Collection<StreamConfiguration>?,
+        requested: StreamFormat?,
+    ): StreamFormat? {
+        val available = configurations.orEmpty()
+            .asSequence()
+            .filter { !it.maximumResolution && it.size.isValid && it.format.isLiveViewfinderStream }
+            .map { it.format }
+            .toSet()
+        if (StreamFormat.PRIVATE !in available) return null
+        return requested
+            ?.takeIf { it.isLiveViewfinderStream && it in available }
+            ?: StreamFormat.PRIVATE
+    }
+
+    private fun keepHighestRegularLiveStreams(
+        configurations: List<StreamConfiguration>?,
+    ): List<StreamConfiguration>? {
+        configurations ?: return null
+        val highest = configurations.asSequence()
+            .filter { !it.maximumResolution && it.size.isValid && it.format.isLiveViewfinderStream }
+            .groupBy { it.format }
+            .mapValues { (_, entries) ->
+                entries.maxWithOrNull(
+                    compareBy<StreamConfiguration> { it.size.area ?: 0L }
+                        .thenBy { it.size.width }
+                        .thenBy { it.size.height },
+                )
+            }
+        if (highest.isEmpty()) return configurations
+        return configurations.filter { configuration ->
+            !configuration.format.isLiveViewfinderStream ||
+                configuration.maximumResolution ||
+                highest[configuration.format] === configuration
+        }
+    }
+
+    internal fun selectReportedRangeForRequest(
         ranges: Collection<FpsRange>?,
         requested: FpsRange,
     ): FpsRange? {
@@ -211,7 +254,10 @@ object PreviewPreferenceRegistry {
 
     internal fun clearForTest() {
         snapshot.set(emptyMap())
+        mutablePreferences.value = emptyMap()
         mutableGlobalFpsRange.value = null
+        mutableFpsOverrideEnabled.value = false
+        mutableHighResolutionViewfinder.value = false
         synchronized(capabilityLock) {
             mutableViewfinderCapabilities.value = emptyMap()
         }

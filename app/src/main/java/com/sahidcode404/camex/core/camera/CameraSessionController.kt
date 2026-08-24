@@ -2,13 +2,13 @@ package com.sahidcode404.camex.core.camera
 
 import android.content.Context
 import android.graphics.SurfaceTexture
-import android.hardware.display.DisplayManager
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
+import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -32,18 +32,18 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -65,24 +65,13 @@ sealed interface CameraSessionState {
 }
 
 sealed interface CameraSessionEvent {
-    data class CameraOpened(
-        val routingKey: String,
-    ) : CameraSessionEvent
-
-    data class SessionConfigured(
-        val routingKey: String,
-    ) : CameraSessionEvent
-
-    data class PreviewVerified(
-        val routingKey: String,
-    ) : CameraSessionEvent
-
+    data class CameraOpened(val routingKey: String) : CameraSessionEvent
+    data class SessionConfigured(val routingKey: String) : CameraSessionEvent
+    data class PreviewVerified(val routingKey: String) : CameraSessionEvent
     data class PreviewFailed(
         val routingKey: String,
         val kind: ProbeFailureKind,
-        /** Only deterministic route/session incompatibilities are structural. */
         val structural: Boolean,
-        /** Sanitized and bounded diagnostic detail. */
         val detail: String,
     ) : CameraSessionEvent
 }
@@ -103,6 +92,7 @@ data class CameraRuntimeSnapshot(
     val lenses: List<LensDescriptor> = emptyList(),
     val selectedRoutingKey: String? = null,
     val activePreviewSize: Size2D? = null,
+    val activePreviewFormat: StreamFormat? = null,
     val lastError: CameraRuntimeError? = null,
     val livePreviewFailureMemory: Map<String, CameraFailureMemoryEntry> = emptyMap(),
 ) {
@@ -116,7 +106,6 @@ data class CameraRuntimeSnapshot(
     }
 }
 
-/** Compose-neutral API intended to be owned by a lifecycle-aware ViewModel. */
 interface CameraSessionController : Closeable {
     val state: StateFlow<CameraSessionState>
     val snapshot: StateFlow<CameraRuntimeSnapshot>
@@ -133,8 +122,10 @@ interface CameraSessionController : Closeable {
 }
 
 /**
- * Serialized Camera2 lifecycle implementation. All open/switch/close operations share one mutex,
- * and camera callbacks run on one owned HandlerThread rather than the UI thread.
+ * Serialized Camera2 lifecycle owner. PRIVATE/SurfaceTexture always remains the display transport.
+ * A user-selected YUV_420_888 viewfinder creates one additional bounded ImageReader stream on this
+ * same CameraDevice/session; unsupported combinations fall back to PRIVATE without poisoning the
+ * optical lens/profile. No camera ID, device, vendor, resolution or FPS is hardcoded here.
  */
 class DefaultCameraSessionController(
     context: Context,
@@ -155,6 +146,7 @@ class DefaultCameraSessionController(
     private val activeDevice = AtomicReference<OpenCameraLease?>(null)
     private val activeSession = AtomicReference<CaptureSessionLease?>(null)
     private val activeSurface = AtomicReference<Surface?>(null)
+    private val activeAuxiliaryViewfinder = AtomicReference<DrainingYuvViewfinderStream?>(null)
     private val activeOpenJob = AtomicReference<Job?>(null)
     private val livePreviewFailures = mutableMapOf<String, LivePreviewFailure>()
     private val pendingTextureFrame = AtomicReference<PreviewFrameGate?>(null)
@@ -189,7 +181,6 @@ class DefaultCameraSessionController(
     }
 
     init {
-        // SurfaceTexture size callbacks are not guaranteed for a 180-degree display rotation.
         displayManager.registerDisplayListener(displayListener, mainHandler)
     }
 
@@ -225,9 +216,6 @@ class DefaultCameraSessionController(
                 mirroredLenses.firstOrNull { it.identity.routingKey == key }
             }
             if (refreshedSelected != null) selectedLens = refreshedSelected
-
-            // Topology reconciliation is observational from the session owner's perspective. It
-            // must not tear down, reopen, or relabel an active preview.
             mutableSnapshot.value = mutableSnapshot.value.copy(
                 lenses = mirroredLenses,
                 selectedRoutingKey = selectedKey,
@@ -243,11 +231,7 @@ class DefaultCameraSessionController(
     override suspend fun clearTransientFailureMemory(routingKey: String?) =
         operationMutex.withLock {
             ensureOpen()
-            if (routingKey == null) {
-                livePreviewFailures.clear()
-            } else {
-                livePreviewFailures.remove(routingKey)
-            }
+            if (routingKey == null) livePreviewFailures.clear() else livePreviewFailures.remove(routingKey)
             publishLivePreviewFailureMemory()
         }
 
@@ -304,9 +288,7 @@ class DefaultCameraSessionController(
     }
 
     override suspend fun switchTo(lens: LensDescriptor) = open(lens)
-
     override suspend fun pause() = applyLifecycleRequest(active = false)
-
     override suspend fun resume() = applyLifecycleRequest(active = true)
 
     override fun close() {
@@ -321,13 +303,12 @@ class DefaultCameraSessionController(
         displayManager.unregisterDisplayListener(displayListener)
         scope.cancel()
         activeSession.getAndSet(null)?.close()
+        activeAuxiliaryViewfinder.getAndSet(null)?.close()
         activeSurface.getAndSet(null)?.let { runCatching { it.release() } }
         activeDevice.getAndSet(null)?.close()
         boundTextureView?.let { view ->
             view.post {
-                if (view.surfaceTextureListener === surfaceListener) {
-                    view.surfaceTextureListener = null
-                }
+                if (view.surfaceTextureListener === surfaceListener) view.surfaceTextureListener = null
                 TexturePreviewTransform.reset(view)
             }
         }
@@ -335,7 +316,10 @@ class DefaultCameraSessionController(
         activeLens = null
         activePreviewConfiguration = null
         callbackThread.close()
-        mutableSnapshot.value = mutableSnapshot.value.copy(activePreviewSize = null)
+        mutableSnapshot.value = mutableSnapshot.value.copy(
+            activePreviewSize = null,
+            activePreviewFormat = null,
+        )
         mutableState.value = CameraSessionState.Closed
     }
 
@@ -350,9 +334,7 @@ class DefaultCameraSessionController(
         }
         val policy = policyFor(lens)
         val rememberedFailure = livePreviewFailures[lens.identity.routingKey]
-        if (rememberedFailure != null &&
-            rememberedFailure.count >= policy.maxAutomaticFailures
-        ) {
+        if (rememberedFailure != null && rememberedFailure.count >= policy.maxAutomaticFailures) {
             closePreviewLocked(updateState = false)
             return setRecoverableError(
                 CameraRuntimeError(
@@ -379,14 +361,19 @@ class DefaultCameraSessionController(
             dimensions,
             orientation.relativeRotationDegrees,
             policy,
+        ) ?: return setRecoverableError(
+            CameraRuntimeError(
+                ProbeFailureKind.INVALID_METADATA,
+                "No TextureView-compatible preview size was reported",
+                lens.identity.routingKey,
+            ),
         )
-            ?: return setRecoverableError(
-                CameraRuntimeError(
-                    ProbeFailureKind.INVALID_METADATA,
-                    "No TextureView-compatible preview size was reported",
-                    lens.identity.routingKey,
-                ),
-            )
+        val auxiliaryConfiguration = selectAuxiliaryViewfinderConfiguration(
+            lens = lens,
+            viewDimensions = dimensions,
+            rotationDegrees = orientation.relativeRotationDegrees,
+            policy = policy,
+        )
         if (lens.identity.streamPhysicalCameraId != null &&
             (Build.VERSION.SDK_INT < Build.VERSION_CODES.P || !policy.allowPhysicalOutputRouting)
         ) {
@@ -404,6 +391,7 @@ class DefaultCameraSessionController(
         var device: OpenCameraLease? = null
         var session: CaptureSessionLease? = null
         var surface: Surface? = null
+        var auxiliary: DrainingYuvViewfinderStream? = null
         var frameGate: PreviewFrameGate? = null
         try {
             ensureOperationActive()
@@ -413,9 +401,6 @@ class DefaultCameraSessionController(
                 CameraSessionState.Opening(lens.identity.routingKey)
             }
             val textureState = withContext(mainDispatcher) {
-                // A TextureView retains its previous transform across producer reconfiguration.
-                // Clear that transform before changing buffer geometry so a lens switch can never
-                // briefly combine the old lens matrix with the new lens dimensions.
                 TexturePreviewTransform.reset(view)
                 view.surfaceTexture?.also {
                     it.setDefaultBufferSize(configuration.size.width, configuration.size.height)
@@ -438,29 +423,47 @@ class DefaultCameraSessionController(
             activeDevice.set(device)
             mutableSessionEvents.tryEmit(CameraSessionEvent.CameraOpened(lens.identity.routingKey))
             ensureOperationActive()
-            session = device.device.awaitCaptureSession(
-                surface = surface,
+
+            auxiliary = auxiliaryConfiguration?.let { selected ->
+                DrainingYuvViewfinderStream.create(selected.size, callbackThread.handler)
+            }
+            session = configureViewfinderSessionWithFallback(
+                device = device,
+                displaySurface = surface,
                 physicalCameraId = lens.identity.streamPhysicalCameraId,
-                handler = callbackThread.handler,
-                timeoutMillis = policy.sessionTimeoutMillis,
-            )
+                auxiliary = auxiliary,
+                policy = policy,
+            ).also { result ->
+                if (!result.auxiliaryAccepted) {
+                    auxiliary?.close()
+                    auxiliary = null
+                }
+            }.lease
+            activeAuxiliaryViewfinder.set(auxiliary)
             activeSession.set(session)
-            mutableSessionEvents.tryEmit(
-                CameraSessionEvent.SessionConfigured(lens.identity.routingKey),
-            )
+            mutableSessionEvents.tryEmit(CameraSessionEvent.SessionConfigured(lens.identity.routingKey))
             ensureOperationActive()
+
             val gate = PreviewFrameGate(
                 expectedTexture = texture,
                 baselineTimestampNs = textureState.second,
             )
             frameGate = gate
             pendingTextureFrame.set(gate)
+            val activeFpsDuration = auxiliaryConfiguration
+                ?.takeIf { auxiliary != null }
+                ?.minFrameDurationNs
+                ?.let { yuvDuration ->
+                    listOfNotNull(configuration.minFrameDurationNs, yuvDuration).maxOrNull()
+                }
+                ?: configuration.minFrameDurationNs
             val previewFpsRange = PreviewFpsSelector.selectForStream(
                 ranges = lens.capabilities.previewFpsRanges,
-                minimumFrameDurationNanos = configuration.minFrameDurationNs,
+                minimumFrameDurationNanos = activeFpsDuration,
             )
             val request = device.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                 addTarget(surface)
+                auxiliary?.surface?.let(::addTarget)
                 set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
                 previewFpsRange?.let { fps ->
                     set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(fps.min, fps.max))
@@ -478,7 +481,7 @@ class DefaultCameraSessionController(
                 object : CameraCaptureSession.CaptureCallback() {
                     override fun onCaptureStarted(
                         session: CameraCaptureSession,
-                        request: android.hardware.camera2.CaptureRequest,
+                        request: CaptureRequest,
                         timestamp: Long,
                         frameNumber: Long,
                     ) {
@@ -487,7 +490,7 @@ class DefaultCameraSessionController(
 
                     override fun onCaptureFailed(
                         session: CameraCaptureSession,
-                        request: android.hardware.camera2.CaptureRequest,
+                        request: CaptureRequest,
                         failure: CaptureFailure,
                     ) {
                         gate.fail(
@@ -500,12 +503,8 @@ class DefaultCameraSessionController(
                 },
                 callbackThread.handler,
             )
-            // Capture-start alone only proves that the HAL accepted a request. Do not publish
-            // Previewing until TextureView has latched a newer frame from this stream as well.
             withTimeout(policy.firstFrameTimeoutMillis) { gate.awaitFrame() }
-            mutableSessionEvents.tryEmit(
-                CameraSessionEvent.PreviewVerified(lens.identity.routingKey),
-            )
+            mutableSessionEvents.tryEmit(CameraSessionEvent.PreviewVerified(lens.identity.routingKey))
             ensureOperationActive()
             activeLens = lens
             selectedLens = lens
@@ -513,6 +512,11 @@ class DefaultCameraSessionController(
             mutableSnapshot.value = mutableSnapshot.value.copy(
                 selectedRoutingKey = lens.identity.routingKey,
                 activePreviewSize = configuration.size,
+                activePreviewFormat = if (auxiliary != null) {
+                    StreamFormat.YUV_420_888
+                } else {
+                    StreamFormat.PRIVATE
+                },
                 lastError = null,
             )
             updateTransformLocked(view)
@@ -526,6 +530,8 @@ class DefaultCameraSessionController(
         } catch (error: TimeoutCancellationException) {
             session?.closeAndAwait(policy.closeSettleTimeoutMillis)
             activeSession.compareAndSet(session, null)
+            auxiliary?.close()
+            activeAuxiliaryViewfinder.compareAndSet(auxiliary, null)
             surface?.let { runCatching { it.release() } }
             activeSurface.compareAndSet(surface, null)
             device?.closeAndAwait(policy.closeSettleTimeoutMillis)
@@ -533,13 +539,12 @@ class DefaultCameraSessionController(
             activeLens = null
             activePreviewConfiguration = null
             rememberLivePreviewFailure(lens, ProbeFailureKind.TIMEOUT, policy)
-            if (!closed.get() && lifecycleActive.get()) {
-                val runtimeError = error.runtimeError(lens)
-                setRecoverableError(runtimeError)
-            }
+            if (!closed.get() && lifecycleActive.get()) setRecoverableError(error.runtimeError(lens))
         } catch (error: CancellationException) {
             session?.close()
             activeSession.compareAndSet(session, null)
+            auxiliary?.close()
+            activeAuxiliaryViewfinder.compareAndSet(auxiliary, null)
             surface?.let { runCatching { it.release() } }
             activeSurface.compareAndSet(surface, null)
             device?.close()
@@ -551,6 +556,8 @@ class DefaultCameraSessionController(
             if (error is VirtualMachineError || error is ThreadDeath) throw error
             session?.closeAndAwait(policy.closeSettleTimeoutMillis)
             activeSession.compareAndSet(session, null)
+            auxiliary?.close()
+            activeAuxiliaryViewfinder.compareAndSet(auxiliary, null)
             surface?.let { runCatching { it.release() } }
             activeSurface.compareAndSet(surface, null)
             device?.closeAndAwait(policy.closeSettleTimeoutMillis)
@@ -567,6 +574,59 @@ class DefaultCameraSessionController(
         }
     }
 
+    /**
+     * An optional YUV stream is a user override, not a structural lens requirement. If the HAL
+     * rejects the PRIVATE+YUV combination, retry PRIVATE once inside the same camera/profile and
+     * keep the optical route healthy.
+     */
+    private suspend fun configureViewfinderSessionWithFallback(
+        device: OpenCameraLease,
+        displaySurface: Surface,
+        physicalCameraId: String?,
+        auxiliary: DrainingYuvViewfinderStream?,
+        policy: CameraOperationPolicy,
+    ): ConfiguredViewfinderSession {
+        if (auxiliary == null) {
+            return ConfiguredViewfinderSession(
+                lease = device.device.awaitCaptureSession(
+                    surface = displaySurface,
+                    physicalCameraId = physicalCameraId,
+                    handler = callbackThread.handler,
+                    timeoutMillis = policy.sessionTimeoutMillis,
+                ),
+                auxiliaryAccepted = false,
+            )
+        }
+        try {
+            return ConfiguredViewfinderSession(
+                lease = device.device.awaitCaptureSession(
+                    surface = displaySurface,
+                    physicalCameraId = physicalCameraId,
+                    additionalPreviewSurface = auxiliary.surface,
+                    handler = callbackThread.handler,
+                    timeoutMillis = policy.sessionTimeoutMillis,
+                ),
+                auxiliaryAccepted = true,
+            )
+        } catch (timeout: TimeoutCancellationException) {
+            auxiliary.close()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            if (error is VirtualMachineError || error is ThreadDeath) throw error
+            auxiliary.close()
+        }
+        return ConfiguredViewfinderSession(
+            lease = device.device.awaitCaptureSession(
+                surface = displaySurface,
+                physicalCameraId = physicalCameraId,
+                handler = callbackThread.handler,
+                timeoutMillis = policy.sessionTimeoutMillis,
+            ),
+            auxiliaryAccepted = false,
+        )
+    }
+
     private suspend fun closePreviewLocked(updateState: Boolean) {
         val closingKey = activeLens?.identity?.routingKey
         if (updateState) mutableState.value = CameraSessionState.Closing(closingKey)
@@ -575,11 +635,15 @@ class DefaultCameraSessionController(
         )
         val policy = activeLens?.let(::policyFor) ?: CameraOperationPolicy()
         activeSession.getAndSet(null)?.closeAndAwait(policy.closeSettleTimeoutMillis)
+        activeAuxiliaryViewfinder.getAndSet(null)?.close()
         activeSurface.getAndSet(null)?.let { runCatching { it.release() } }
         activeDevice.getAndSet(null)?.closeAndAwait(policy.closeSettleTimeoutMillis)
         activeLens = null
         activePreviewConfiguration = null
-        mutableSnapshot.value = mutableSnapshot.value.copy(activePreviewSize = null)
+        mutableSnapshot.value = mutableSnapshot.value.copy(
+            activePreviewSize = null,
+            activePreviewFormat = null,
+        )
         boundTextureView?.let { view ->
             withContext(mainDispatcher) { TexturePreviewTransform.reset(view) }
         }
@@ -597,12 +661,9 @@ class DefaultCameraSessionController(
         closePreviewLocked(updateState = false)
         val target = selectedLens
         mutableState.value = when {
-            !resumed || !lifecycleActive.get() ->
-                CameraSessionState.Paused(target?.identity?.routingKey)
+            !resumed || !lifecycleActive.get() -> CameraSessionState.Paused(target?.identity?.routingKey)
             target != null -> CameraSessionState.AwaitingSurface(target.identity.routingKey)
-            else -> CameraSessionState.Ready(
-                mutableSnapshot.value.lenses.count { it.usability.isSelectable },
-            )
+            else -> CameraSessionState.Ready(mutableSnapshot.value.lenses.count { it.usability.isSelectable })
         }
     }
 
@@ -647,7 +708,7 @@ class DefaultCameraSessionController(
                 setRecoverableError(
                     CameraRuntimeError(
                         error.failureKind,
-                        error.message.orEmpty().take(160),
+                        error.message.orEmpty().take(MAX_VALIDATION_DETAIL_LENGTH),
                         lens.identity.routingKey,
                     ),
                 )
@@ -660,9 +721,40 @@ class DefaultCameraSessionController(
         viewDimensions: Pair<Int, Int>,
         rotationDegrees: Int,
         policy: CameraOperationPolicy,
+    ): StreamConfiguration? = selectConfiguration(
+        candidates = lens.capabilities.configurations(StreamFormat.PRIVATE)
+            .filter { !it.maximumResolution && it.size.isValid },
+        lens = lens,
+        viewDimensions = viewDimensions,
+        rotationDegrees = rotationDegrees,
+        policy = policy,
+    )
+
+    private fun selectAuxiliaryViewfinderConfiguration(
+        lens: LensDescriptor,
+        viewDimensions: Pair<Int, Int>,
+        rotationDegrees: Int,
+        policy: CameraOperationPolicy,
     ): StreamConfiguration? {
-        val candidates = lens.capabilities.configurations(StreamFormat.PRIVATE)
-            .filter { !it.maximumResolution && it.size.isValid }
+        if (lens.previewStreamFormat != StreamFormat.YUV_420_888) return null
+        return selectConfiguration(
+            candidates = lens.capabilities.configurations(StreamFormat.YUV_420_888)
+                .filter { !it.maximumResolution && it.size.isValid },
+            lens = lens,
+            viewDimensions = viewDimensions,
+            rotationDegrees = rotationDegrees,
+            policy = policy,
+        )
+    }
+
+    private fun selectConfiguration(
+        candidates: List<StreamConfiguration>,
+        lens: LensDescriptor,
+        viewDimensions: Pair<Int, Int>,
+        rotationDegrees: Int,
+        policy: CameraOperationPolicy,
+    ): StreamConfiguration? {
+        if (candidates.isEmpty()) return null
         val swapsAxes = rotationDegrees == 90 || rotationDegrees == 270
         val targetWidth = if (swapsAxes) viewDimensions.second else viewDimensions.first
         val targetHeight = if (swapsAxes) viewDimensions.first else viewDimensions.second
@@ -730,8 +822,7 @@ class DefaultCameraSessionController(
             cameraFingerprint = lens.fingerprint?.value,
             opensThroughLogicalParent = lens.identity.streamPhysicalCameraId != null,
             reportsRaw = lens.capabilities.flags.raw == CapabilitySupport.SUPPORTED,
-            reportsBackwardCompatible = lens.capabilities.flags.backwardCompatible ==
-                CapabilitySupport.SUPPORTED,
+            reportsBackwardCompatible = lens.capabilities.flags.backwardCompatible == CapabilitySupport.SUPPORTED,
         ),
     ).policy
 
@@ -740,7 +831,6 @@ class DefaultCameraSessionController(
         kind: ProbeFailureKind,
         policy: CameraOperationPolicy,
     ) {
-        // Runtime permission can change immediately; it must never poison a camera route.
         if (kind == ProbeFailureKind.PERMISSION_DENIED) return
         val key = lens.identity.routingKey
         val prior = livePreviewFailures[key]
@@ -774,22 +864,16 @@ class DefaultCameraSessionController(
         val requestEpoch = lifecycleEpoch.incrementAndGet()
         lifecycleActive.set(active)
         if (!active) {
-            // Preempt long Camera2 waits before joining the serialized state machine. The epoch
-            // check below prevents this older request from overwriting a newer resume/pause.
             activeOpenJob.getAndSet(null)?.cancel(CancellationException("Camera lifecycle paused"))
         }
         operationMutex.withLock {
-            if (closed.get() || requestEpoch != lifecycleEpoch.get() ||
-                lifecycleActive.get() != active
-            ) {
+            if (closed.get() || requestEpoch != lifecycleEpoch.get() || lifecycleActive.get() != active) {
                 return@withLock
             }
             resumed = active
             if (!active) {
                 closePreviewLocked(updateState = true)
-                if (requestEpoch != lifecycleEpoch.get() || lifecycleActive.get()) {
-                    return@withLock
-                }
+                if (requestEpoch != lifecycleEpoch.get() || lifecycleActive.get()) return@withLock
                 mutableState.value = CameraSessionState.Paused(selectedLens?.identity?.routingKey)
                 return@withLock
             }
@@ -804,9 +888,7 @@ class DefaultCameraSessionController(
                     mutableState.value = CameraSessionState.AwaitingSurface(target.identity.routingKey)
                 else -> openPreviewLocked(target, switching = false)
             }
-            if (requestEpoch != lifecycleEpoch.get() || !lifecycleActive.get()) {
-                return@withLock
-            }
+            if (requestEpoch != lifecycleEpoch.get() || !lifecycleActive.get()) return@withLock
         }
     }
 
@@ -816,6 +898,7 @@ class DefaultCameraSessionController(
     ) {
         mutableSnapshot.value = mutableSnapshot.value.copy(
             activePreviewSize = null,
+            activePreviewFormat = null,
             lastError = error,
         )
         mutableState.value = stateFor(error)
@@ -850,7 +933,7 @@ class DefaultCameraSessionController(
         }
         return CameraRuntimeError(
             kind = cameraError.failureKind,
-            detail = cameraError.message.orEmpty().take(160),
+            detail = cameraError.message.orEmpty().take(MAX_VALIDATION_DETAIL_LENGTH),
             routingKey = lens?.identity?.routingKey,
         )
     }
@@ -881,6 +964,11 @@ class DefaultCameraSessionController(
         val sensorOrientationDegrees: Int,
         val displayRotationDegrees: Int,
         val relativeRotationDegrees: Int,
+    )
+
+    private data class ConfiguredViewfinderSession(
+        val lease: CaptureSessionLease,
+        val auxiliaryAccepted: Boolean,
     )
 
     private data class LivePreviewFailure(
