@@ -36,7 +36,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.sahidcode404.camex.core.camera.raw.RawCapturePhase
 import com.sahidcode404.camex.core.camera.raw.RawCaptureState
-import com.sahidcode404.camex.core.camera.raw.RawSupportState
 
 data class LensButtonUiModel(
     val fingerprint: String,
@@ -236,9 +235,8 @@ private fun CameraBottomControls(
     modifier: Modifier = Modifier,
 ) {
     // The runtime owns capability/failover decisions. Keeping the shutter clickable while a
-    // verified preview is live is important: a profile whose combined preview+RAW session was
-    // rejected must be allowed to enter the bounded same-canonical RAW failover path instead of
-    // being silently blocked by UI state. Only an in-flight capture disables the shutter.
+    // verified preview is live is important: a profile whose bounded RAW session is rejected must
+    // still be allowed to enter same-canonical failover. Only an in-flight capture disables it.
     val captureEnabled = previewVisible && !rawState.inProgress
 
     Column(
@@ -335,28 +333,26 @@ private fun CameraBottomControls(
                 )
             }
         }
-        Text(
-            text = rawStatusText(rawState),
-            color = Color.White.copy(alpha = 0.72f),
-            style = MaterialTheme.typography.labelSmall,
-            textAlign = TextAlign.Center,
-            modifier = Modifier.padding(horizontal = 24.dp, vertical = 2.dp),
-        )
+        rawStatusText(rawState)?.let { status ->
+            Text(
+                text = status,
+                color = Color.White.copy(alpha = 0.72f),
+                style = MaterialTheme.typography.labelSmall,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 2.dp),
+            )
+        }
     }
 }
 
-private fun rawStatusText(state: RawCaptureState): String = when (state.phase) {
+/**
+ * Normal preview is intentionally preview-only, so sessionReady=false while idle is expected and
+ * must not be shown as an error under the shutter. Only real capture progress/results are surfaced.
+ */
+private fun rawStatusText(state: RawCaptureState): String? = when (state.phase) {
     RawCapturePhase.CAPTURING -> "Capturing RAW sensor frame…"
     RawCapturePhase.SAVING -> "Saving DNG…"
     RawCapturePhase.SAVED -> "DNG saved"
     RawCapturePhase.FAILED -> state.diagnostics.lastRawError ?: "RAW capture failed"
-    RawCapturePhase.IDLE -> when {
-        state.capability.sessionReady -> state.capability.selectedSize?.let {
-            "RAW DNG · ${it.width}×${it.height}"
-        } ?: "RAW ready"
-        state.capability.support == RawSupportState.UNSUPPORTED -> "RAW unsupported on this profile"
-        state.capability.support == RawSupportState.UNKNOWN ->
-            state.capability.detail ?: "RAW availability unknown"
-        else -> state.capability.detail ?: "RAW session unavailable"
-    }
+    RawCapturePhase.IDLE -> null
 }

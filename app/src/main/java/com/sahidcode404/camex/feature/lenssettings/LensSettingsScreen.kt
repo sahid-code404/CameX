@@ -26,6 +26,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -36,6 +37,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.sahidcode404.camex.core.camera.PreviewPreferenceRegistry
 import com.sahidcode404.camex.core.model.FpsRange
 import com.sahidcode404.camex.core.model.Size2D
 
@@ -49,8 +51,10 @@ data class LensSettingsUiModel(
     val supportsOneXReference: Boolean,
     val advanced: Boolean = false,
     val previewSizes: List<Size2D> = emptyList(),
+    /** Reported ranges are retained here only to build the one centralized FPS selector. */
     val previewFpsRanges: List<FpsRange> = emptyList(),
     val selectedPreviewSize: Size2D? = null,
+    /** Legacy UI projection; FPS selection is now centralized and this is intentionally not shown. */
     val selectedPreviewFpsRange: FpsRange? = null,
 )
 
@@ -69,7 +73,17 @@ fun LensSettingsScreen(
 ) {
     var editing by remember { mutableStateOf<LensSettingsUiModel?>(null) }
     var previewSizeEditing by remember { mutableStateOf<LensSettingsUiModel?>(null) }
-    var previewFpsEditing by remember { mutableStateOf<LensSettingsUiModel?>(null) }
+    var previewFpsEditing by remember { mutableStateOf(false) }
+    val globalFpsTarget by PreviewPreferenceRegistry.globalFpsTarget.collectAsState()
+    val globalFpsOptions = remember(lenses) {
+        lenses.asSequence()
+            .flatMap { it.previewFpsRanges.asSequence() }
+            .filter { it.isValid && it.max > 0 }
+            .map { it.max }
+            .distinct()
+            .sortedDescending()
+            .toList()
+    }
     val indexedLenses = lenses.withIndex().toList()
     val normalLenses = indexedLenses.filterNot { it.value.advanced }
     val advancedLenses = indexedLenses.filter { it.value.advanced }
@@ -90,8 +104,15 @@ fun LensSettingsScreen(
         ) {
             item {
                 Text(
-                    text = "Preview Auto chooses from each lens's own reported stream sizes and FPS ranges. Manual choices are saved per optical lens and fall back to Auto if a ROM or camera profile no longer reports them.",
+                    text = "Preview stream selection is per optical lens. Frame rate is one global target. Every option comes from Camera2 metadata; unsupported or stale choices fall back to Auto instead of breaking a lens.",
                     style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            item {
+                GlobalPreviewFpsCard(
+                    options = globalFpsOptions,
+                    selectedFps = globalFpsTarget,
+                    onEdit = { previewFpsEditing = true },
                 )
             }
             item {
@@ -112,7 +133,6 @@ fun LensSettingsScreen(
                     onSetVisible = { onSetVisible(indexed.value.fingerprint, it) },
                     onEditName = { editing = indexed.value },
                     onEditPreviewSize = { previewSizeEditing = indexed.value },
-                    onEditPreviewFps = { previewFpsEditing = indexed.value },
                     onMoveUp = {
                         onMove(indexed.index, normalLenses[sectionIndex - 1].index)
                     },
@@ -143,7 +163,6 @@ fun LensSettingsScreen(
                     onSetVisible = { onSetVisible(indexed.value.fingerprint, it) },
                     onEditName = { editing = indexed.value },
                     onEditPreviewSize = { previewSizeEditing = indexed.value },
-                    onEditPreviewFps = { previewFpsEditing = indexed.value },
                     onMoveUp = {
                         onMove(indexed.index, advancedLenses[sectionIndex - 1].index)
                     },
@@ -178,15 +197,51 @@ fun LensSettingsScreen(
             },
         )
     }
-    previewFpsEditing?.let { lens ->
-        PreviewFpsDialog(
-            lens = lens,
-            onDismiss = { previewFpsEditing = null },
-            onSelect = { range ->
-                onSetPreviewFps(lens.fingerprint, range)
-                previewFpsEditing = null
+    if (previewFpsEditing) {
+        GlobalPreviewFpsDialog(
+            options = globalFpsOptions,
+            selectedFps = globalFpsTarget,
+            onDismiss = { previewFpsEditing = false },
+            onSelect = { fps ->
+                onSetPreviewFps(
+                    PreviewPreferenceRegistry.GLOBAL_PREVIEW_FPS_FINGERPRINT,
+                    fps?.let { FpsRange(it, it) },
+                )
+                previewFpsEditing = false
             },
         )
+    }
+}
+
+@Composable
+private fun GlobalPreviewFpsCard(
+    options: List<Int>,
+    selectedFps: Int?,
+    onEdit: () -> Unit,
+) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(5.dp),
+        ) {
+            Text("Preview frame rate", fontWeight = FontWeight.SemiBold)
+            val available = selectedFps == null || selectedFps in options
+            Text(
+                when {
+                    selectedFps == null -> "Auto (recommended)"
+                    available -> "$selectedFps fps target"
+                    else -> "Auto · saved $selectedFps fps target is unavailable"
+                },
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Text(
+                "One setting for every lens. Each camera maps the target only to an FPS range it actually reports.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            TextButton(onClick = onEdit, enabled = options.isNotEmpty()) {
+                Text("Choose frame rate")
+            }
+        }
     }
 }
 
@@ -221,7 +276,6 @@ private fun LensPreferenceCard(
     onSetVisible: (Boolean) -> Unit,
     onEditName: () -> Unit,
     onEditPreviewSize: () -> Unit,
-    onEditPreviewFps: () -> Unit,
     onMoveUp: () -> Unit,
     onMoveDown: () -> Unit,
     onSetOneXReference: () -> Unit,
@@ -268,27 +322,19 @@ private fun LensPreferenceCard(
             }
 
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text("Preview resolution", style = MaterialTheme.typography.labelMedium)
+                Text("Preview stream", style = MaterialTheme.typography.labelMedium)
                 Text(
                     lens.selectedPreviewSize?.let(::sizeLabel) ?: "Auto (recommended)",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Text(
+                    "${lens.previewSizes.size} supported Camera2 PRIVATE stream${if (lens.previewSizes.size == 1) "" else "s"}",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 TextButton(
                     onClick = onEditPreviewSize,
                     enabled = lens.previewSizes.isNotEmpty(),
-                ) { Text("Choose resolution") }
-            }
-
-            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text("Preview frame rate", style = MaterialTheme.typography.labelMedium)
-                Text(
-                    lens.selectedPreviewFpsRange?.let(::fpsLabel) ?: "Auto (recommended)",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                TextButton(
-                    onClick = onEditPreviewFps,
-                    enabled = lens.previewFpsRanges.isNotEmpty(),
-                ) { Text("Choose frame rate") }
+                ) { Text("Choose preview stream") }
             }
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -308,13 +354,18 @@ private fun PreviewSizeDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Preview resolution · ${lens.customLabel ?: lens.defaultLabel}") },
+        title = { Text("Preview stream · ${lens.customLabel ?: lens.defaultLabel}") },
         text = {
             Column(
                 Modifier
                     .heightIn(max = 480.dp)
                     .verticalScroll(rememberScrollState()),
             ) {
+                Text(
+                    "Only stream sizes reported for this optical lens are shown.",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(bottom = 8.dp),
+                )
                 ChoiceRow(
                     selected = lens.selectedPreviewSize == null,
                     label = "Auto (recommended)",
@@ -335,30 +386,36 @@ private fun PreviewSizeDialog(
 }
 
 @Composable
-private fun PreviewFpsDialog(
-    lens: LensSettingsUiModel,
+private fun GlobalPreviewFpsDialog(
+    options: List<Int>,
+    selectedFps: Int?,
     onDismiss: () -> Unit,
-    onSelect: (FpsRange?) -> Unit,
+    onSelect: (Int?) -> Unit,
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Preview frame rate · ${lens.customLabel ?: lens.defaultLabel}") },
+        title = { Text("Preview frame rate") },
         text = {
             Column(
                 Modifier
                     .heightIn(max = 480.dp)
                     .verticalScroll(rememberScrollState()),
             ) {
+                Text(
+                    "This is one global target. A lens that cannot report or sustain it automatically uses its own Auto range.",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(bottom = 8.dp),
+                )
                 ChoiceRow(
-                    selected = lens.selectedPreviewFpsRange == null,
+                    selected = selectedFps == null || selectedFps !in options,
                     label = "Auto (recommended)",
                     onClick = { onSelect(null) },
                 )
-                lens.previewFpsRanges.forEach { range ->
+                options.forEach { fps ->
                     ChoiceRow(
-                        selected = lens.selectedPreviewFpsRange == range,
-                        label = fpsLabel(range),
-                        onClick = { onSelect(range) },
+                        selected = selectedFps == fps,
+                        label = "$fps fps",
+                        onClick = { onSelect(fps) },
                     )
                 }
             }
@@ -412,10 +469,10 @@ private fun RenameLensDialog(
     )
 }
 
-private fun sizeLabel(size: Size2D): String = "${size.width}×${size.height}"
-
-private fun fpsLabel(range: FpsRange): String = if (range.min == range.max) {
-    "${range.max} fps"
-} else {
-    "${range.min}–${range.max} fps"
+private fun sizeLabel(size: Size2D): String {
+    val divisor = greatestCommonDivisor(size.width, size.height).coerceAtLeast(1)
+    return "${size.width}×${size.height} · ${size.width / divisor}:${size.height / divisor}"
 }
+
+private tailrec fun greatestCommonDivisor(a: Int, b: Int): Int =
+    if (b == 0) kotlin.math.abs(a) else greatestCommonDivisor(b, a % b)

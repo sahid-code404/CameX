@@ -71,7 +71,7 @@ class FailoverCameraSessionController(
     override suspend fun updateAvailableLenses(lenses: List<LensDescriptor>) {
         failoverMutex.withLock {
             // Keep pristine discovered profile metadata for failover decisions. Only the delegate's
-            // session-facing projection receives validated per-optical-lens preview preferences.
+            // session-facing projection receives validated preview preferences.
             val rankedProfiles = lenses.distinctBy { it.identity.routingKey }
             availableProfiles = rankedProfiles
             delegate.updateAvailableLenses(projectForSession(rankedProfiles))
@@ -86,6 +86,13 @@ class FailoverCameraSessionController(
     }
 
     override suspend fun bindPreview(textureView: TextureView) {
+        // Settings can change while the Camera composable is unbound. Refresh the lightweight
+        // session projection immediately before binding so a per-lens stream choice or centralized
+        // FPS target takes effect on the next preview without discovery, CameraCharacteristics IO,
+        // or a stale LensDescriptor surviving the settings screen.
+        failoverMutex.withLock {
+            delegate.updateAvailableLenses(projectForSession(availableProfiles))
+        }
         delegate.bindPreview(textureView)
     }
 
@@ -239,7 +246,7 @@ class FailoverCameraSessionController(
         }
         if (!stillCurrent || closed.get()) return
 
-        delegate.open(lens)
+        delegate.open(PreviewPreferenceRegistry.projectForSession(lens))
         // Keep transient errors immediately visible and structural errors suppressed as Switching
         // only while this same generation has an untried sibling profile.
         mutableState.value = projectDelegateState(delegate.state.value)
